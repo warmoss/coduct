@@ -1,0 +1,372 @@
+== 大模型MCP原理讲解
+
+大模型虽然能力强大, 但存在一个天然局限: 模型本身是**信息孤岛**——它无法直接访问外部数据库、调用API、读写文件或与工具交互. 每次对话, 模型都只能依靠训练时学到的知识(可能有截止日期)和用户提供的上下文. MCP(Model Context Protocol, 模型上下文协议) 正是为解决这一问题而生.
+
+参考: <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>>, <<大模型/大模型记忆原理讲解.adoc#, 大模型记忆原理讲解>>
+
+=== 什么是 MCP
+
+MCP(Model Context Protocol):: Anthropic 在 2024 年 11 月提出的**开放协议标准**, 定义了 AI 应用程序(如聊天助手、IDE 插件)与外部工具和数据源之间的标准化通信方式. 其目标是成为"AI 应用的 USB-C 接口"——让任意 AI 应用都能通过统一协议连接任意工具和数据源.
+
+在 MCP 出现之前, 让 AI 模型使用外部工具的方式是碎片化的: 每个 AI 平台(OpenAI、LangChain、自定义Agent框架)都定义了自己的工具调用格式, 开发者需要为每个平台单独编写集成代码.
+
+[cols="2,5"]
+|===
+| 对比项 | 传统方式
+
+| 集成模式
+| **点对点** - 每个 AI 平台需要独立开发与每个工具的集成
+| 接口标准
+| 各平台定义私有格式
+| 可移植性
+| 工具绑定特定平台, 无法复用
+| 开发成本
+| 每增加一个工具, 需为每个平台编写适配代码
+
+|===
+
+MCP 的核心价值: **一次开发, 处处可用**. 工具开发者只需按照 MCP 协议实现一个 Server, 任何支持 MCP 的 AI 客户端都能自动发现和使用该工具.
+
+=== MCP 的核心架构
+
+MCP 采用经典的 **客户端-服务器(Client-Server)** 架构, 包含三个核心角色:
+
+MCP Client:: 发起请求的 AI 应用程序, 如 Claude Desktop、VS Code 中的 AI 插件. 它负责发现可用的 MCP Server、管理连接、转发用户的工具调用请求.
+
+MCP Server:: 实现特定能力的工具服务, 如文件系统操作、数据库查询、Git 操作、Web 搜索等. 每个 Server 对外暴露一组工具(Tool)和资源(Resource).
+
+Transport Layer:: Client 与 Server 之间的通信通道, 定义了消息的编码、传输和路由方式.
+
+[[mcp-architecture]]
+[plantuml, "MCP 架构概览", format=png]
+----
+@startuml
+actor 用户 as User
+rectangle "AI 客户端" {
+  (MCP Client) as Client
+  (大模型) as LLM
+}
+rectangle "MCP 生态" {
+  (文件系统 Server) as FS
+  (数据库 Server) as DB
+  (Web搜索 Server) as Web
+  (Git Server) as Git
+  (自定义 Server) as Custom
+}
+
+User -> LLM: 提出问题
+LLM -> Client: 需要外部信息/工具
+Client -> FS: 请求文件操作
+Client -> DB: 请求查询数据
+Client -> Web: 请求搜索信息
+FS --> Client: 返回结果
+DB --> Client: 返回数据
+Web --> Client: 返回搜索结果
+Client -> LLM: 注入上下文
+LLM --> User: 生成回答
+@enduml
+----
+
+==== 传输层: STDIO 与 SSE
+
+MCP 支持两种传输模式, 分别适用于不同场景:
+
+STDIO(标准输入输出):: Client 以子进程方式启动 Server, 通过标准输入(stdin)发送请求, 从标准输出(stdout)读取响应. 适用于**本地工具**——Server 与 Client 运行在同一台机器上. 如 VS Code 中的本地插件通过子进程启动 MCP Server.
+
+SSE(Server-Sent Events):: 通过 HTTP 长连接进行通信, Client 发送请求到 Server 的 HTTP 端点, Server 通过 SSE 推送响应. 适用于**远程服务**——Server 可以部署在云端, 多个 Client 共享同一 Server 实例.
+
+[cols="2,3,3"]
+|===
+| 特性 | STDIO | SSE
+
+| 通信方式
+| 子进程标准流
+| HTTP + SSE 长连接
+
+| 部署位置
+| 本地(同机)
+| 远程(云端)
+
+| 生命周期
+| 随 Client 启动/停止
+| 独立运行
+
+| 适用场景
+| 本地文件操作、代码分析
+| 数据库查询、API 调用
+
+|===
+
+==== MCP 的数据模型
+
+MCP 定义了四种核心数据类型, Client 和 Server 通过它们进行交互:
+
+工具(Tool):: Server 对外暴露的可调用能力. 每个工具有一个名称、描述和输入参数 schema(遵循 JSON Schema). Client 可以根据描述自动选择调用哪个工具. 示例: `read_file(path: string)`, `search_web(query: string)`.
+
+资源(Resource):: Server 提供的数据源, 类似 RESTful API 中的资源. 每个资源有唯一的 URI 标识, Client 可以读取资源内容. 资源可以是文件、数据库记录、API 响应等. 示例: `file:///config/settings.json`, `db://users/123`.
+
+提示(Prompt):: 预定义的提示模板. Server 可以提供特定领域的 prompt 模板, Client 可以获取并应用到对话中. 这允许工具不仅提供数据和功能, 还能指导 AI 如何更好地使用它们.
+
+采样(Sampling):: Server 向 Client 请求生成文本的能力. 这允许工具在需要时"反向"请求 AI 生成内容, 实现双向交互.
+
+[plantuml, "MCP 数据模型交互", format=png]
+----
+@startuml
+actor "MCP Client" as Client
+actor "MCP Server" as Server
+
+== 工具调用 ==
+Client -> Server: tools/list (发现可用工具)
+Server --> Client: 返回工具列表
+Client -> Server: tools/call (调用指定工具)
+Server --> Client: 返回工具执行结果
+
+== 资源访问 ==
+Client -> Server: resources/list (发现可用资源)
+Server --> Client: 返回资源列表
+Client -> Server: resources/read (读取资源内容)
+Server --> Client: 返回资源数据
+
+== 提示获取 ==
+Client -> Server: prompts/list (获取提示模板)
+Server --> Client: 返回提示列表
+Client -> Server: prompts/get (获取指定提示)
+Server --> Client: 返回提示内容
+
+== 采样请求 ==
+Server -> Client: sampling/createMessage (请求生成)
+Client --> Server: 返回生成结果
+@enduml
+----
+
+=== MCP 的工作流程
+
+一个典型 MCP 交互流程可以分为以下几步:
+
+. **发现阶段:** Client 启动后, 向所有已配置的 MCP Server 发送 `tools/list` 和 `resources/list` 请求, 获取 Server 的能力清单. Server 返回每个工具的 name、description 和 inputSchema.
+
+. **意图识别:** 用户输入问题后, AI 模型分析用户意图, 判断是否需要调用外部工具. 如果模型决定需要调用工具, 它会输出一个符合 Server 定义的函数调用.
+
+. **代理执行:** Client 拦截到模型的工具调用请求, 将其转换为 MCP 协议消息 `tools/call`, 发送给对应的 MCP Server. Server 执行实际操作(如查询数据库、读取文件), 并返回结果.
+
+. **上下文注入:** Client 将工具执行结果作为上下文注入到模型的对话窗口中. 模型基于包含外部信息的完整上下文生成最终回答.
+
+. **持续会话:** 后续对话中, 上述步骤可能重复多次, 每次调用结果都会累加到上下文窗口中, 供模型参考.
+
+[[mcp-workflow]]
+[plantuml, "MCP 工作流程时序图", format=png]
+----
+@startuml
+participant 用户 as User
+participant "AI 模型" as LLM
+participant "MCP Client" as Client
+participant "MCP Server" as Server
+
+User -> LLM: "读取 /config.json 并修改端口号"
+LLM -> Client: 需要调用 read_file 工具
+Client -> Server: tools/list (发现工具)
+Server --> Client: 返回 [read_file, write_file]
+Client -> Server: tools/call (read_file, path=/config.json)
+Server --> Client: 返回文件内容
+Client -> LLM: 注入文件内容到上下文
+LLM -> User: "当前的配置是 port=8080, 要改成多少?"
+User -> LLM: "改成 9090"
+LLM -> Client: 需要调用 write_file 工具
+Client -> Server: tools/call (write_file, path=/config.json, content=...)
+Server --> Client: 返回写入成功
+Client -> LLM: 注入写入结果
+LLM -> User: "端口已修改为 9090"
+@enduml
+----
+
+=== MCP 的协议规范
+
+MCP 协议基于 **JSON-RPC 2.0**, 使用 JSON 格式编码消息. 每条消息包含 `jsonrpc`, `id`, `method` 和 `params` 字段.
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "read_file",
+    "arguments": {
+      "path": "/home/user/config.json"
+    }
+  }
+}
+----
+
+Server 的成功响应:
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "port: 8080\nhost: localhost"
+      }
+    ],
+    "isError": false
+  }
+}
+----
+
+MCP 协议定义了以下核心方法:
+
+[cols="2,3,3"]
+|===
+| 方法 | 方向 | 说明
+
+| `tools/list`
+| Client -> Server
+| 获取 Server 提供的工具列表
+
+| `tools/call`
+| Client -> Server
+| 调用指定工具, 传入参数
+
+| `resources/list`
+| Client -> Server
+| 获取 Server 提供的资源列表
+
+| `resources/read`
+| Client -> Server
+| 读取指定资源的内容
+
+| `prompts/list`
+| Client -> Server
+| 获取 Server 提供的提示模板
+
+| `prompts/get`
+| Client -> Server
+| 获取指定提示模板的详细内容
+
+| `sampling/createMessage`
+| Server -> Client
+| Server 请求 Client 生成文本
+
+| `initialize`
+| Client -> Server
+| 初始化连接, 协商协议版本
+
+| `ping`
+| Client -> Server
+| 连接健康检查
+
+|===
+
+=== MCP 的配置方式
+
+MCP Server 的配置通过 JSON 或 JSONC 格式的配置文件实现. 以 VS Code 为例, 在 `.vscode/mcp.json` 中配置:
+
+[source,json]
+----
+{
+  "servers": {
+    "file-system": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-filesystem", "/workspace"]
+    },
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-github"]
+    },
+    "database": {
+      "type": "sse",
+      "url": "https://mcp-server.example.com/sse"
+    }
+  }
+}
+----
+
+每个 Server 配置包含:
+
+`type`:: 传输类型, `stdio` 或 `sse`(Server-Sent Events).
+`command` + `args`:: (STDIO 模式) 启动 Server 子进程的命令和参数.
+`url`:: (SSE 模式) Server 的 HTTP 端点地址.
+`env`:: (可选) 传递给 Server 的环境变量.
+
+=== MCP vs 传统插件/API
+
+[cols="2,4,4"]
+|===
+| 对比维度 | 传统插件/API | MCP
+
+| 集成标准
+| 各平台各自定义, 无统一标准
+| **统一开放协议**, 客户端和服务端各自实现标准接口
+
+| 开发成本
+| 为每个平台独立开发集成
+| **一次开发**, 任何 MCP 客户端都能使用
+
+| 工具发现
+| 硬编码, 开发者需手动注册
+| **自动发现**, Client 在初始化时自动获取 Server 的能力清单
+
+| 响应格式
+| 各平台自行定义格式
+| **统一 JSON-RPC**, 结构化 Content 类型
+
+| 生命周期
+| 通常随应用一起部署
+| **独立运行**, Server 可以独立升级和部署
+
+| 可组合性
+| 平台定制, 难以混用
+| **自由组合**, 一个 Client 可同时连接多个 Server
+
+| 安全性
+| 各平台自己实现认证
+| 灵活的权限控制, Server 可定义自己的安全策略
+
+|===
+
+=== 生态与应用
+
+MCP 发布后, 生态系统发展迅速:
+
+**官方 Server 集合:**
+
+* `server-filesystem` - 文件系统的读写访问
+* `server-github` - GitHub API 集成(Issues, PRs, Code Review)
+* `server-postgres` - PostgreSQL 数据库查询
+* `server-sqlite` - SQLite 数据库操作
+* `server-puppeteer` - 浏览器自动化
+* `server-markdown` - Markdown 文档处理
+* `server-memory` - 持久化记忆存储
+
+**社区扩展:**
+
+* `server-elasticsearch` - Elasticsearch 全文搜索
+* `server-redis` - Redis 缓存操作
+* `server-kubernetes` - Kubernetes 集群管理
+* `server-aws` - AWS 资源管理
+* `server-s3` - S3 兼容对象存储
+
+**支持的客户端:**
+
+* Claude Desktop - MCP 的首个客户端, 原生支持
+* VS Code - 通过 GitHub Copilot 的 agent 模式支持 MCP
+* Cursor - 支持配置 MCP Server
+* Windsurf - 支持配置 MCP Server
+* Continue.dev - 开源 IDE 插件, 支持 MCP
+
+=== 总结
+
+MCP 通过定义一个**开放、标准化的协议**, 将 AI 模型从"信息孤岛"中解放出来, 使其能够灵活地与外部世界交互.
+
+* **标准化** - 统一了 AI 应用调用工具的方式, 结束了碎片化
+* **可发现** - Server 自动暴露能力, Client 动态发现并调用
+* **可组合** - 任意 Client 可以组合多个 Server 的能力
+* **可扩展** - 任何人都可以实现自己的 MCP Server
+
+MCP 的出现标志着 AI 应用开发从"封闭平台的插件生态"迈向"开放协议的互联生态", 是 AI tool-using 能力走向工程化和标准化的重要里程碑.

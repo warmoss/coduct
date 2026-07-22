@@ -1,0 +1,386 @@
+== 大模型工作流原理讲解
+
+大模型虽然在单次推理中展现了强大的语言理解和生成能力, 但在真实应用中, 仅靠一次 LLM 调用往往难以完成复杂任务. 无论是多步推理、工具调用, 还是多 Agent 协作, 都需要将多个 LLM 调用与其他处理步骤编排成一个**工作流(Workflow)**. 本文系统讲解大模型工作流的核心概念、常见模式及选型原则.
+
+参考: <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>>, <<大模型/大模型记忆原理讲解.adoc#, 大模型记忆原理讲解>>, <<大模型/LangGraph原理讲解.adoc#, LangGraph原理讲解>>
+
+=== 什么是大模型工作流
+
+大模型工作流:: 将多个 LLM 调用、工具执行、条件判断、数据处理等步骤按特定拓扑结构(链、图、树等)编排而成的**执行流程**, 目的是让 LLM 的输出可控、可复现且能处理多步复杂任务.
+
+大模型工作流解决的核心问题:
+
+* **单一 LLM 调用能力有限** - 一次推理无法完成需要多步推理的长任务
+* **结果不可控** - 单次 LLM 输出存在随机性和幻觉, 需要验证和修正机制
+* **缺乏外部交互** - 模型本身无法调用工具、查询数据库或执行代码
+* **上下文窗口限制** - 长任务的信息无法在一次推理中完整容纳
+
+WARNING: 工作流并非总是必要的. 对于简单任务(如翻译、摘要、分类), 单次 LLM 调用即可满足需求. 工作流的主要成本是增加了延迟和复杂性, 应根据任务复杂度权衡取舍.
+
+=== 核心工作流模式
+
+Anthropic 在其 Best Practices 中总结了几种经典的工作流模式. 以下逐一讲解其原理、适用场景和实现要点.
+
+==== 链式调用 (Chain)
+
+链式调用是最基础的工作流模式: 将一个大任务拆解为多个顺序执行的步骤, 每步的输出作为下一步的输入.
+
+[plantuml, "链式调用流程", format=png]
+----
+@startuml
+start
+:步骤1: 大纲生成;
+:步骤2: 章节撰写;
+:步骤3: 润色校对;
+:步骤4: 格式检查;
+stop
+@enduml
+----
+
+链式调用的**适用场景**: 任务可以自然地分解为线性的前后依赖步骤.
+
+* 文档生成: 先写大纲 -> 逐章展开 -> 润色
+* 数据处理: 先清洗 -> 转换 -> 分析 -> 报告
+* 翻译流程: 源语言 -> 直译 -> 本地化润色 -> 格式对齐
+
+[source,python]
+----
+def chain_workflow(topic: str) -> str:
+    # 步骤1: 生成大纲
+    outline = llm.invoke(f"为'{topic}'写一份大纲")
+    # 步骤2: 撰写内容
+    content = llm.invoke(f"根据以下大纲撰写:\n{outline}")
+    # 步骤3: 润色
+    polished = llm.invoke(f"润色以下内容:\n{content}")
+    return polished
+----
+
+[[chain-vs-graph]]
+.链式与图式对比
+[cols="2,3,3"]
+|===
+|特性 |链式(Chain) |图式(Graph)
+
+|拓扑结构
+|线性序列
+|有向图, 支持分支和循环
+
+|状态管理
+|隐式传递(函数返回值)
+|显式共享状态对象
+
+|适用复杂度
+|简单线性任务
+|需要条件分支、循环、多 Agent 协作
+
+|代表框架
+|LangChain LCEL
+|LangGraph
+
+|===
+
+==== 路由 (Routing)
+
+路由模式根据输入的特征**动态选择**不同的处理路径, 每个路径执行专化的处理逻辑.
+
+[plantuml, "路由模式", format=png]
+----
+@startuml
+start
+:分析输入;
+if (输入类型?) then (技术问题)
+  :技术专家 LLM;
+else if (客服问题)
+  :客服 LLM;
+else (一般咨询)
+  :通用 LLM;
+endif
+stop
+@enduml
+----
+
+* **适用场景:** 输入类型多样且每类需要差异化处理.
+* **实现关键:** 分类器的准确率直接影响整体效果, 可用一个轻量 LLM 或传统分类模型做路由决策.
+
+[source,python]
+----
+def route_workflow(user_input: str) -> str:
+    # 先用一个快速分类器决定路由
+    category = classifier.invoke(f"将此问题分类: [技术, 客服, 其他]\n{user_input}")
+
+    if category == "技术":
+        prompt = TECH_PROMPT + user_input
+    elif category == "客服":
+        prompt = CS_PROMPT + user_input
+    else:
+        prompt = GENERAL_PROMPT + user_input
+
+    return llm.invoke(prompt)
+----
+
+==== 并行化 (Parallelization)
+
+当子任务之间没有依赖关系时, 可以同时调用多个 LLM 并行处理, 提升效率.
+
+. **扇出(Fan-out):** 同一输入分发给多个 LLM, 每个执行不同任务.
+. **扇入(Fan-in):** 将多个并行结果汇聚, 由另一个 LLM 或聚合逻辑合并.
+
+[plantuml, "并行化模式", format=png]
+----
+@startuml
+start
+:用户输入;
+fork
+  :情感分析;
+fork again
+  :关键词提取;
+fork again
+  :摘要生成;
+end fork
+:合并结果;
+stop
+@enduml
+----
+
+* **适用场景:**
+** **投票式(Voting):** 多个 LLM 执行相同任务, 取多数结果, 提升准确性.
+** **分治式(Sectioning):** 将输入分段, 多个 LLM 各自处理一段, 汇总后输出.
+
+[source,python]
+----
+def parallel_workflow(text: str) -> dict:
+    # 并行执行三个分析任务
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor() as ex:
+        fut_sentiment = ex.submit(llm.invoke, f"分析情感:\n{text}")
+        fut_keywords = ex.submit(llm.invoke, f"提取关键词:\n{text}")
+        fut_summary = ex.submit(llm.invoke, f"生成摘要:\n{text}")
+
+    return {
+        "sentiment": fut_sentiment.result(),
+        "keywords": fut_keywords.result(),
+        "summary": fut_summary.result(),
+    }
+----
+
+==== 编排器 (Orchestrator)
+
+编排器模式引入一个**中央控制器(Orchestrator LLM)**, 它负责分析任务、拆分子任务、分派给子 LLM 或工具执行, 并汇总最终结果.
+
+[plantuml, "编排器模式", format=png]
+----
+@startuml
+actor 用户 as User
+participant "编排器 LLM" as Orch
+participant "子任务1" as Sub1
+participant "子任务2" as Sub2
+participant "子任务3" as Sub3
+
+User -> Orch: 复杂任务请求
+Orch -> Orch: 拆解为子任务
+Orch -> Sub1: 执行子任务1
+Orch -> Sub2: 执行子任务2
+Orch -> Sub3: 执行子任务3
+Sub1 --> Orch: 返回结果1
+Sub2 --> Orch: 返回结果2
+Sub3 --> Orch: 返回结果3
+Orch -> Orch: 汇总与整合
+Orch --> User: 最终输出
+@enduml
+----
+
+* **适用场景:** 复杂任务无法用固定流程表达, 需要动态规划和自适应调度.
+* **实现关键:**
+** 编排器需要有良好的任务拆解能力, 通常使用更强的模型(GPT-4、Claude 3.5 Sonnet 等).
+** 子任务可以并行或串行执行, 取决于依赖关系.
+** 编排器的指令中应包含清晰的目标、约束条件和输出格式.
+
+[source,python]
+----
+def orchestrator_workflow(project_request: str) -> str:
+    # 1. 编排器拆解任务
+    plan = orchestrator_llm.invoke(
+        f"将以下项目任务拆分为子任务:\n{project_request}"
+    )
+    tasks = parse_plan(plan)
+
+    # 2. 执行每个子任务
+    results = {}
+    for task in tasks:
+        # 子任务可以并行或串行
+        result = worker_llm.invoke(
+            f"任务: {task['description']}\n上下文: {task['context']}"
+        )
+        results[task['name']] = result
+
+    # 3. 编排器汇总
+    final = orchestrator_llm.invoke(
+        f"汇总以下结果:\n{results}"
+    )
+    return final
+----
+
+==== 评估-优化 (Evaluator-Optimizer)
+
+评估-优化模式是一个**循环反馈**结构: 生成器(Generator)产生候选输出, 评估器(Evaluator)检查质量, 如果未达到标准则反馈给生成器改进, 直至达标或达到最大轮次.
+
+[plantuml, "评估-优化循环", format=png]
+----
+@startuml
+start
+:生成候选输出;
+repeat
+  :评估质量;
+  if (符合标准?) then (是)
+    break
+  else (否)
+    :生成改进反馈;
+    :生成器根据反馈优化;
+  endif
+repeat while (未达最大轮次?)
+:输出最终结果;
+stop
+@enduml
+----
+
+* **适用场景:** 输出质量要求高且可以自动评估的任务.
+** **代码生成:** 生成代码 -> 运行测试 -> 根据错误信息修复
+** **翻译优化:** 翻译 -> 回译对比 -> 优化表达
+** **内容创作:** 生成文案 -> 审核规则校验 -> 修改
+
+[source,python]
+----
+def eval_optimizer_workflow(code_task: str, max_iter=3) -> str:
+    prompt = code_task
+
+    for i in range(max_iter):
+        # 生成
+        code = generator.invoke(prompt)
+
+        # 评估
+        feedback = evaluator.invoke(f"评估以下代码正确性:\n{code}")
+
+        if "PASS" in feedback:
+            return code
+
+        # 优化: 将反馈加入提示继续改进
+        prompt = f"{code_task}\n\n之前的尝试:\n{code}\n\n改进建议:\n{feedback}"
+
+    return code  # 达到最大轮次后返回最佳结果
+----
+
+==== Agent (智能体)
+
+Agent 模式是最高级的工作流形式: LLM 作为**自主决策者**, 在一个循环中反复执行"思考 -> 行动 -> 观察"的回路, 动态决定下一步操作.
+
+Agent 的核心能力:
+
+* **工具调用(Tool Calling):** 自主决定何时调用什么工具, 包括搜索、代码执行、API 调用等.
+* **环境感知:** 观察工具执行结果, 判断是否达成目标.
+* **自适应计划:** 根据中间结果动态调整计划, 而非遵循固定路径.
+
+[plantuml, "Agent 循环", format=png]
+----
+@startuml
+start
+:用户输入;
+repeat
+  :LLM 思考(当前状态 + 可用工具);
+  if (需要调用工具?) then (是)
+    :选择并执行工具;
+    :观察结果;
+  else (否)
+    break
+  endif
+repeat while (任务未完成?)
+:生成最终回答;
+stop
+@enduml
+----
+
+* **适用场景:**
+** **复杂问答:** 需要多轮搜索和推理才能回答的问题
+** **代码开发:** 自主编写代码、运行、调试、提交的循环
+** **数据分析和报告生成:** 查询数据库 -> 分析 -> 可视化 -> 报告
+
+[source,python]
+----
+def agent_loop(user_query: str, max_steps=10) -> str:
+    messages = [{"role": "user", "content": user_query}]
+
+    for _ in range(max_steps):
+        response = agent_llm.invoke(messages)
+
+        if not response.tool_calls:
+            return response.content
+
+        # 执行工具调用
+        for tool_call in response.tool_calls:
+            tool_result = execute_tool(tool_call)
+            messages.append(tool_result)
+
+    return "已达最大步数"
+----
+
+=== 工作流模式选型指南
+
+选择合适的模式取决于任务的**复杂度、确定性需求和延迟容忍度**.
+
+[cols="2,3,3,3"]
+|===
+|模式 |适用任务 |复杂度 |延迟
+
+|单次 LLM 调用
+|分类、翻译、摘要
+|低
+|低
+
+|Chain(链式)
+|文档生成、数据处理流水线
+|中
+|中
+
+|Routing(路由)
+|多类型输入分流
+|中
+|低
+
+|Parallelization(并行)
+|多维度分析、投票验证
+|中
+|中(并发)
+
+|Orchestrator(编排)
+|复杂项目、动态规划
+|高
+|高
+
+|Evaluator-Optimizer(评估-优化)
+|代码生成、高质量翻译
+|高
+|高
+
+|Agent(智能体)
+|自主任务、多步推理
+|最高
+|高
+
+|===
+
+选型原则:
+
+* **能不用的模式就不用.** 单次 LLM 调用能解决的, 不要用 Chain.
+* **从简单开始.** 先用 Chain, 不行再升级到 Orchestrator 或 Agent.
+* **人类监督不能少.** 对于高风险的 Agent 场景, 应加入**人工审批节点**(Human-in-the-Loop).
+* **可观测性是基础.** 工作流越复杂, 越需要日志、追踪和监控手段.
+
+=== 总结
+
+大模型工作流是将 LLM 从"单次问答工具"升级为"可编排任务引擎"的关键手段. 核心要点:
+
+* 工作流的本质是将多步 LLM 调用和工具执行编排为可控流程.
+* 六种核心模式(Chain、Routing、Parallelization、Orchestrator、Evaluator-Optimizer、Agent)各有适用场景.
+* 模式选择遵循"够用即可"原则, 避免过度设计.
+* Agent 模式是能力最强的模式, 但也是控制和可靠性最难的, 需要审慎使用.
+* LangGraph 等框架提供了从 Chain 到 Graph 的升级路径, 让复杂工作流的构建更加系统化.

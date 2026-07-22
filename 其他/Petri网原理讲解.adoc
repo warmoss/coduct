@@ -1,0 +1,265 @@
+== Petri网原理讲解
+
+=== 什么是Petri网
+
+定义::
+**Petri网**(Petri Net)是一种用于描述**分布式系统**的**数学建模语言**, 由德国数学家Carl Adam Petri于1962年在其博士论文中提出. 它兼具**图形化表示**和**严格数学基础**的双重特性, 特别适合建模并发(concurrency), 同步(synchronization), 资源共享(resource sharing)和冲突(conflict)等行为.
+
+Petri网的核心思想是: 用**库所**(Place)表示系统状态(资源可用, 条件成立), 用**变迁**(Transition)表示事件或操作, 用**有向弧**(Arc)连接它们, 用**托肯**(Token)在库所中的分布表示系统的**当前标记**(Marking).
+
+[plantuml, "Petri网基本元素", format=png]
+----
+@startuml
+!define place circle
+!define transition rectangle
+
+place "P1" as p1
+place "P2" as p2
+rectangle "T1" as t1
+
+p1 --> t1
+t1 --> p2
+@enduml
+----
+
+=== 基本组成元素
+
+库所(Place)::
+用**圆圈**表示, 代表系统可能处于的**局部状态**或**条件**. 例如"缓冲区有空位", "打印机空闲". 库所中可以包含托肯.
+
+变迁(Transition)::
+用**矩形**或**粗线段**表示, 代表系统中发生的**事件**或**动作**. 变迁的**触发**(firing)会导致系统状态的变化.
+
+有向弧(Arc)::
+用**带箭头的线段**表示, 连接库所和变迁(反之亦然), 指明流的方向. 弧上可以标注**权重**(weight), 表示一次触发消耗或产生托肯的数量.
+
+托肯(Token)::
+用**小黑点**表示, 存在于库所中, 代表**资源**或**数据项**. 所有库所中托肯的分布构成系统的**标记**(marking), 即系统的全局状态.
+
+标记(Marking)::
+Petri网的**全局状态**由各库所中托肯的数量组成, 通常用向量 `stem:[M = (m_1, m_2, ..., m_n)]` 表示, 其中 `stem:[m_i]` 是第 `stem:[i]` 个库所中的托肯数. **初始标记**(initial marking) `stem:[M_0]` 定义了系统的初始状态.
+
+[cols="2*", options="header"]
+|===
+| 元素 | 图形表示
+| 库所(Place) | 圆圈
+| 变迁(Transition) | 矩形或粗线段
+| 有向弧(Arc) | 带箭头的线段
+| 托肯(Token) | 小黑点
+|===
+
+=== 触发规则
+
+变迁的**触发**(firing)是Petri网动态行为的基本单元. 一个变迁能否触发取决于其**输入库所**中托肯的数量是否满足弧权重要求.
+
+. **使能条件(Enabling Condition):**
+* 对于变迁 `stem:[t]`, 若其每个输入库所 `stem:[p_i]` 中的托肯数 `stem:[m_i]` 均不小于连接弧的权重 `stem:[w_i]`, 即 `stem:[m_i \geq w_i]`, 则变迁 `stem:[t]` 处于**使能**(enabled)状态.
+* 数学表达: 对任意 `stem:[p_i \in \bullet t]`, 有 `stem:[M(p_i) \geq W(p_i, t)]`, 其中 `stem:[\bullet t]` 表示 `stem:[t]` 的前置集.
+
+. **触发过程(Firing):**
+* 从每个输入库所中移除 `stem:[w_i]` 个托肯.
+* 向每个输出库所中添加 `stem:[w_j]` 个托肯, 其中 `stem:[w_j]` 是输出弧 `stem:[(t, p_j)]` 的权重.
+* 触发是一个**原子操作**, 不可中断.
+
+. **触发结果:**
+* 系统从当前标记 `stem:[M]` 转移到新标记 `stem:[M']`.
+* 数学表达:
++
+stem:[[
+M'(p) = M(p) - W(p, t) + W(t, p), \quad \forall p \in P
+]]
+
+[plantuml, "变迁触发前后对比", format=png]
+----
+@startuml
+!define place circle
+
+place "P1(2)" as p1
+place "P2" as p2
+rectangle "T1" as t1
+
+p1 --> t1 : 2
+t1 --> p2 : 1
+
+note right of t1 : 触发前 P1 有2个托肯\n触发后消耗2个, 产生1个到 P2
+@enduml
+----
+
+=== 核心性质
+
+Petri网的形式化分析主要关注以下几类性质:
+
+可到达性(Reachability)::
+给定初始标记 `stem:[M_0]`, 能否通过一系列变迁触发到达目标标记 `stem:[M_k]`. 所有从 `stem:[M_0]` 可达的标记集合称为**可达集**(Reachability Set) `stem:[R(M_0)]`.
+
+有界性(Boundedness)::
+任一库所中的托肯数是否存在**上限**. 若所有库所的托肯数上限均为 `stem:[k]`, 则该网是 **`stem:[k]`-有界的**. **安全性**(safeness)是 `stem:[1]`-有界的特例, 即任何库所中至多只有一个托肯.
+
+活性(Liveness)::
+从任意可达标记出发, 是否存在一个触发序列能使某一变迁最终使能. 若所有变迁都是活的, 则系统**无死锁**.
+
+公平性(Fairness)::
+两个变迁交替触发的**机会是否均等**. 强公平性要求若一个变迁无限次使能, 则必须无限次触发.
+
+守恒性(Conservativeness)::
+系统在运行过程中**托肯总数**是否保持不变(或加权后不变), 常用于建模资源总量固定的系统.
+
+=== 经典建模模式
+
+Petri网通过不同拓扑结构可以建模多种并发系统的基本行为模式.
+
+顺序(Sequence)::
+两个变迁依次触发, 前一个变迁的输出库所是后一个变迁的输入库所.
+
+[plantuml, "顺序执行", format=png]
+----
+@startuml
+!define place circle
+
+place "Ready" as p1
+place "Done" as p2
+rectangle "Task1" as t1
+rectangle "Task2" as t2
+
+p1 --> t1
+t1 --> p2
+p2 --> t2
+@enduml
+----
+
+并发(Concurrency)::
+一个变迁触发后同时在多个库所中产生托肯, 使多个后续变迁可以**独立且同时**使能.
+
+[plantuml, "并发分支", format=png]
+----
+@startuml
+!define place circle
+
+place "Start" as p1
+place "A_ready" as p2
+place "B_ready" as p3
+rectangle "Fork" as t1
+rectangle "TaskA" as t2
+rectangle "TaskB" as t3
+
+p1 --> t1
+t1 --> p2
+t1 --> p3
+p2 --> t2
+p3 --> t3
+@enduml
+----
+
+同步(Synchronization)::
+多个变迁触发后在同一个库所中消耗托肯, 表示多个并发分支的**汇合点** -- 只有所有前置分支都完成后同步变迁才能触发.
+
+冲突(Conflict)::
+两个变迁共享同一个输入库所, 但该库所中的托肯数只够触发其中之一, 体现**资源竞争**.
+
+[plantuml, "资源冲突", format=png]
+----
+@startuml
+!define place circle
+
+place "Resource" as p1
+place "ResultA" as p2
+place "ResultB" as p3
+rectangle "UseA" as t1
+rectangle "UseB" as t2
+
+p1 --> t1
+p1 --> t2
+t1 --> p2
+t2 --> p3
+@enduml
+----
+
+=== 经典示例: 生产者-消费者问题
+
+生产者-消费者问题是并发编程的经典场景, 用Petri网建模非常直观.
+
+[plantuml, "生产者-消费者模型", format=png]
+----
+@startuml
+!define place circle
+
+place "空闲缓冲区" as buffer
+place "空位" as empty
+place "已用" as full
+place "就绪" as ready
+place "完成" as done
+rectangle "生产" as produce
+rectangle "消费" as consume
+
+empty --> produce
+produce --> buffer
+buffer --> consume
+consume --> full
+
+note right of empty : 初始 N 个空位
+note right of full : 初始 0 个已用
+@enduml
+----
+
+该模型保证了:
+* 缓冲区满时生产者阻塞(变迁 `produce` 因 `empty` 中无托肯而不可触发).
+* 缓冲区空时消费者阻塞(变迁 `consume` 因 `buffer` 中无托肯而不可触发).
+* 生产者和消费者可以**异步并发**执行.
+
+=== Petri网的分类
+
+根据表达能力与应用场景, Petri网可分为多个层次.
+
+基本Petri网(Ordinary Petri Net / Place/Transition Net)::
+弧权重为 `stem:[1]`, 所有弧的权重相同. 这是最基础的Petri网模型.
+
+加权Petri网(Weighted Petri Net)::
+弧上可以标注任意正整数权重, 表示一次触发消耗或产生多个托肯.
+
+着色Petri网(Colored Petri Net, CPN)::
+托肯带有**颜色**(即数据值), 使得一个库所可以表示多种不同类型的资源. 变迁的触发规则可以依赖托肯的颜色, 大大增强了模型的表达能力.
+
+时间Petri网(Timed Petri Net)::
+为变迁或库所附加**时间延迟**, 用于建模**实时系统**或**性能分析**. 时间可以确定(deterministic)或随机(stochastic).
+
+随机Petri网(Stochastic Petri Net, SPN)::
+变迁的触发延迟服从**指数分布**, 可转化为**连续时间马尔可夫链**(CTMC)进行性能分析.
+
+层次Petri网(Hierarchical Petri Net)::
+允许将子网封装为一个**超级节点**(substitution transition), 支持**自顶向下**的建模和**模块化**设计.
+
+[cols="3*", options="header"]
+|===
+| 类型 | 扩展特性 | 典型用途
+| 基本Petri网 | 弧权为1 | 概念验证, 教学
+| 加权Petri网 | 弧上带权重 | 资源批量处理
+| 着色Petri网 | 托肯带颜色(数据) | 协议验证, 工作流
+| 时间Petri网 | 附加时间延迟 | 实时系统, 性能建模
+| 随机Petri网 | 指数分布延迟 | 可靠性分析, 排队系统
+| 层次Petri网 | 子网封装 | 大型系统建模
+|===
+
+=== 应用领域
+
+工作流建模(Workflow)::
+用Petri网描述业务流程中活动的顺序, 分支, 并发和同步, 是工作流管理系统(WfMS)的理论基础 -- **WF-net**(Workflow Net)即是为此专门定义的Petri网子类.
+
+协议验证(Protocol Verification)::
+用着色Petri网建模通信协议的状态机交互, 通过**可达性分析**检测死锁, 活锁和协议违规.
+
+硬件设计(Hardware Design)::
+用Petri网建模异步电路的控制逻辑, 验证信号同步的正确性.
+
+业务过程管理(BPM)::
+Petri网的可达图和状态空间分析帮助企业发现流程中的瓶颈, 死路和冗余环节.
+
+性能评价(Performance Evaluation)::
+随机Petri网通过对时间参数进行**随机化**, 可计算出系统的吞吐量, 平均响应时间和资源利用率等指标.
+
+=== 总结与注意事项
+
+* Petri网是**图形化与数学化兼具**的形式化工具, 擅长建模并发, 同步, 冲突和资源共享.
+* **可达性分析**是Petri网最核心的分析手段, 但状态空间爆炸(state space explosion)是实际应用中的主要挑战 -- 系统状态数随库所和托肯数**指数增长**.
+* 基本Petri网表达能力有限(不能建模非确定性选择中的概率权重), 实际应用中通常使用着色Petri网或随机Petri网等扩展模型.
+* 工具支持: CPN Tools(着色Petri网), PIPE(基本网分析), GreatSPN(随机Petri网), Tina(时间Petri网)等.
+* 建模时应遵循**模块化原则**: 将大网拆分为层次子网, 降低分析复杂度.

@@ -1,0 +1,138 @@
+== sleep原理讲解
+
+=== 核心概念: 它是什么?
+**Thread.sleep** 是一个静态方法, 它的作用是让**当前正在执行的线程**暂停(进入休眠状态)一段指定的时间.
+
+方法签名::
++
+[source, java, linenums]
+----
+public static native void sleep(long millis) throws InterruptedException
+public static void sleep(long millis, int nanos) throws InterruptedException
+----
+
+核心目的:: 主动放弃 CPU, 在一段时间内不参与 CPU 竞争.
+
+=== 工作原理(深入底层)
+Thread.sleep 的原理涉及 Java 线程状态、JVM 和操作系统调度的交互. 我们可以从以下几个层面来理解:
+
+==== 线程状态转换
+当一个线程调用 Thread.sleep(millis) 时, 它会经历以下状态变化:
+
+. **RUNNABLE(可运行) -> TIMED_WAITING(限时等待)**
++
+调用 sleep 后, 线程会立即从 RUNNABLE 状态进入 TIMED_WAITING 状态. 处于这个状态的线程不会被 CPU 调度, 即不会消耗 CPU 时间片.
+
+. **TIMED_WAITING -> RUNNABLE**
++
+当指定的休眠时间 millis 毫秒(加上可选的 nanos 纳秒)过去后, 线程会从 TIMED_WAITING 状态返回到 RUNNABLE 状态. 注意: 这并不意味着它会立即开始执行, 只是表示它重新具备了被 CPU 调度的资格, 需要等待操作系统的调度器再次分配 CPU 时间片给它.
+
+==== JVM 与操作系统交互
+sleep 是一个 native 方法, 它的具体实现是由 JVM 调用底层操作系统的 API 来完成的.
+
+* **JVM 的角色:** JVM 接收到 sleep 调用后, 会将其转换为对操作系统线程调度器的一个请求.
+
+* **操作系统的角色:** 操作系统的调度器会将当前线程挂起, 并设置一个定时器. 当定时器超时(指定的休眠时间到了), 调度器会将该线程重新放入就绪队列中, 等待被 CPU 执行.
+
+**简单来说, Thread.sleep 的本质是: 当前线程主动向操作系统发出信号——"请在未来 X 毫秒内不要调度我".**
+
+==== 中断处理
+Thread.sleep 声明抛出了 InterruptedException. 这是它的一个关键特性.
+
+* **如果线程在休眠期间被其他线程调用了 interrupt() 方法**, 休眠会被立即打断.
+
+* 线程会清除其中断状态(即 Thread.interrupted() 会返回 true, 但随后标志被清除), 然后抛出 InterruptedException 异常.
+
+* 这为线程提供了一种优雅的、被外部唤醒的机制.
+
+=== 重要特性与注意事项
+
+==== 不释放锁
+**这是最关键的一点**. 如果休眠的线程正持有某个对象锁(例如, 在 synchronized 方法或代码块中调用 sleep), 它**不会释放**这个锁. 其他需要获取该锁的线程会被阻塞. 这与 Object.wait() 方法不同, wait() 会释放锁.
+
+==== 精度问题
+Thread.sleep 的休眠时间并**不精确**. 它只能保证线程休眠的**时间不少于**指定的时间. 实际的休眠时间可能会更长, 原因包括:
+
+* **操作系统调度器的精度:** 不同操作系统(如 Windows, Linux, macOS)的计时器粒度不同.
+
+* **系统负载:** 当休眠时间结束, 线程变为 RUNNABLE 后, 如果 CPU 正在处理其他更高优先级的任务, 该线程可能需要等待一段时间才能被真正执行.
+
+==== CPU 资源
+它的主要作用是让线程**主动让出 CPU**. 在休眠期间, 该线程不消耗任何 CPU 资源, 这对于节能、控制执行频率或模拟耗时操作非常有用.
+
+=== 与 Object.wait() 和 yield() 的对比
+
+[cols="2,3,5,5"]
+|===
+|特性|sleep|wait|yield
+
+|**作用**
+|让当前线程休眠指定时间
+|让当前线程等待, 直到被通知或超时
+|建议调度器让出当前线程的 CPU
+
+|**锁处理**
+|**不释放**已持有的锁
+|**释放**已持有的锁
+|不涉及(通常不持有锁时调用)
+
+|**唤醒条件**
+|时间到期或被中断
+|时间到期、被 notify()/notifyAll() 或被中断
+|立即重新参与竞争
+
+|**方法归属**
+|Thread 类(静态)
+|Object 类(实例)
+|Thread 类(静态)
+
+|**线程状态**
+|TIMED_WAITING
+|TIMED_WAITING 或 WAITING
+|RUNNABLE -> RUNNABLE
+
+|===
+
+=== 代码示例
+
+[source, java, linenums]
+----
+public class SleepDemo {
+
+    public static void main(String[] args) {
+        Runnable task = () -> {
+            String threadName = Thread.currentThread().getName();
+            System.out.println(threadName + " 开始执行, 准备休眠 2 秒");
+
+            // 模拟在同步代码块中休眠
+            synchronized (SleepDemo.class) {
+                try {
+                    Thread.sleep(2000); // 休眠2秒, 但不会释放 SleepDemo.class 锁
+                } catch (InterruptedException e) {
+                    System.out.println(threadName + " 的休眠被中断了! ");
+                    return; // 优雅地处理中断
+                }
+            }
+
+            System.out.println(threadName + " 休眠结束, 继续执行");
+        };
+
+        Thread t1 = new Thread(task, "线程-1");
+        Thread t2 = new Thread(task, "线程-2");
+
+        t1.start();
+        t2.start(); // 你会看到 t2 必须等 t1 完全走出同步块(包括休眠)后才能进入
+    }
+}
+----
+
+=== 总结
+Java 中 Thread.sleep 的原理可以概括为:
+
+* **行为:** 使当前线程从 RUNNABLE 状态进入 TIMED_WAITING 状态, 主动放弃 CPU.
+
+* **实现:** 通过 JVM 调用操作系统调度器, 由操作系统进行精确的定时和线程唤醒.
+
+* **关键点:** **不释放锁**, 但会**响应中断**.
+
+* **用途:** 常用于延迟执行、轮询操作中的间隔等待, 或者模拟耗时任务.

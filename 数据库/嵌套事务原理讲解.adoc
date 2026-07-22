@@ -1,0 +1,230 @@
+== 嵌套事务原理讲解
+
+=== 什么是嵌套事务?
+顾名思义, 嵌套事务就是在一个已经存在的事务(父事务)内部, 又开始了另一个新的事务(子事务). 从代码结构上看, 它通常表现为事务控制语句的嵌套.
+
+[source, java, linenums]
+----
+// 伪代码示例
+beginTransaction(); // 开始父事务
+try {
+    // 一些数据库操作 A
+    insertIntoTableA(...);
+
+    beginTransaction(); // 开始子事务(嵌套事务)
+    try {
+        // 一些数据库操作 B
+        updateTableB(...);
+        commitTransaction(); // 提交子事务
+    } catch (Exception e) {
+        rollbackTransaction(); // 回滚子事务
+        throw e;
+    }
+
+    // 更多数据库操作 C
+    deleteFromTableC(...);
+    commitTransaction(); // 提交父事务
+} catch (Exception e) {
+    rollbackTransaction(); // 回滚父事务
+}
+----
+
+=== 核心问题: 子事务的行为是什么?
+
+这是理解嵌套事务原理的关键. 当子事务被提交或回滚时, 会发生什么? 主要有两种模型:
+
+. **表面嵌套 / 扁平化事务**
+
+. **保存点模式**
+
+==== 模型一: 表面嵌套 / 扁平化事务
+在这种模型下, **数据库并不真正支持嵌套事务**. 大多数关系型数据库(如 MySQL 的 InnoDB、PostgreSQL)默认采用这种行为.
+
+**原理:**
+
+* **只有第一个 BEGIN(或 START TRANSACTION)才真正启动一个物理事务**.
+
+* 后续在事务内部遇到的 BEGIN 会被忽略, 或者只是作为一个"标记", 并不开启新的事务.
+
+* **内层的 COMMIT 和 ROLLBACK 通常具有不同的语义:**
+
+** COMMIT: 在嵌套事务中, 内层的提交**通常没有任何效果**. 它不会真正将更改持久化到磁盘, 只是可能释放一些锁或完成内部检查. 真正的提交只发生在最外层的父事务.
+
+** ROLLBACK: 内层的回滚通常是**灾难性**的. 它会回滚整个父事务(从最外层开始的所有操作), 而不仅仅是回滚内层事务开始后的操作.
+
+**为什么这么设计?**
+
+这主要是为了与 SQL 标准兼容, 并且实现简单. 在应用程序中, 我们可能使用一个事务管理框架(如 Spring @Transactional), 它可能会在多个层级的方法调用中自动开启事务. 如果每个内层事务都独立提交, 会破坏事务的原子性.
+
+**示例分析(扁平化模型):**
+
+. 假设我们执行以下操作:
+
+. 开始父事务
+
+. 操作 A: 账户A扣款100元.
+
+. 开始子事务(被忽略)
+
+. 操作 B: 账户B收款100元.
+
+. **提交子事务(无效, 无实际作用)**
+
+. 操作 C: 记录日志.
+
+. **提交父事务(此时A、B、C操作才被真正提交)**
+
+如果在第4步之后、第5步之前发生了异常, 并且我们在子事务中捕获并**回滚子事务**, 那么结果将是: **操作A(扣款)也被回滚了**. 因为内层的 ROLLBACK 回滚了整个事务.
+
+**结论:** 在这种模型下, **嵌套事务实际上并不存在**. 整个代码块是一个原子性的扁平事务.
+
+==== 模型二: 保存点模式
+这是一种真正的嵌套事务支持. 数据库(如 Oracle、SQL Server、PostgreSQL(使用保存点功能)、MySQL InnoDB(使用保存点功能))通过**保存点** 来实现.
+
+**原理:**
+
+. 当开始最外层的父事务时, 数据库启动一个物理事务.
+
+. 当在事务内部遇到 BEGIN(表示嵌套事务开始时), 数据库会在当前事务中**创建一个保存点**. 保存点就像一个"书签", 记录了当前事务的状态.
+
+. **内层 COMMIT:** 同样, 在内层提交通常**没有实际效果**, 它可能只是释放了从该保存点之后获取的锁, 但不会持久化数据. 真正的提交仍在最外层.
+
+. **内层 ROLLBACK:** 这是关键! 内层的回滚**不是回滚整个事务**, 而是回滚到创建子事务时建立的**那个保存点**. 也就是说, 它只撤销该子事务内的所有操作, 而父事务和之前的操作不受影响.
+
+**保存点的SQL语法:**
+
+你可以直接使用SQL来模拟嵌套事务:
+
+[source, sql, linenums]
+----
+BEGIN; -- 开始父事务(物理事务)
+
+INSERT INTO accounts (id, balance) VALUES (1, 100); -- 操作A
+
+SAVEPOINT nested_transaction_1; -- 相当于 BEGIN NESTED TRANSACTION
+
+INSERT INTO accounts (id, balance) VALUES (2, 200); -- 操作B
+
+-- 假设这里发生了错误, 我们只想回滚操作B
+ROLLBACK TO SAVEPOINT nested_transaction_1; -- 相当于回滚嵌套事务
+
+-- 此时, 操作A还在, 操作B被回滚了.
+
+INSERT INTO accounts (id, balance) VALUES (3, 300); -- 操作C
+
+COMMIT; -- 最终提交, 操作A和操作C被持久化.
+----
+
+**示例分析(保存点模型):**
+
+. 开始父事务
+
+. 操作 A
+
+. 创建保存点 SP1(相当于开始子事务)
+
+. 操作 B
+
+. **回滚到保存点 SP1**(相当于回滚子事务) -> 仅操作B被撤销, 操作A保留.
+
+. 操作 C
+
+. 提交父事务 -> 操作A和操作C被持久化.
+
+**结论:** 使用保存点, 可以实现**部分回滚**, 这为嵌套事务提供了真正有用的语义.
+
+=== 在编程框架中的使用(以 Spring 为例)
+
+Spring 框架的 @Transactional 注解极大地简化了事务管理, 它支持嵌套事务.
+
+* PROPAGATION_REQUIRED (**默认行为**):
+
+** 如果当前没有事务, 就新建一个.
+
+** 如果当前已经存在事务, 就**加入**这个事务.
+
+** 在这种情况下, 所有方法都在同一个物理事务中. 内层方法的回滚会标记事务为"仅回滚", 导致最外层提交时实际执行的是回滚. 或者, 如果内层抛出异常, 整个事务都会回滚. 这对应了**扁平化模型**.
+
+* PROPAGATION_NESTED:
+
+** 如果当前存在事务, 则**在保存点之上启动一个嵌套事务**.
+
+** 如果当前没有事务, 则行为同 PROPAGATION_REQUIRED.
+
+** 内层事务的回滚只会回滚到保存点, 不会影响外层事务. 这对应了**保存点模型**.
+
+**代码示例对比:**
+
+[source, java, linenums]
+----
+// Service 类
+@Transactional
+public void outerMethod() {
+    userRepository.save(new User("Alice")); // 操作 A
+    try {
+        innerService.innerMethod();
+    } catch (Exception e) {
+        // 处理异常
+    }
+    userRepository.save(new User("Bob")); // 操作 C
+    // 外层提交
+}
+
+// InnerService 类
+public class InnerService {
+    
+    // 场景1: 使用 REQUIRED (默认)
+    @Transactional(propagation = Propagation.REQUIRED)
+    public void innerMethod() {
+        userRepository.save(new User("Charlie")); // 操作 B
+        throw new RuntimeException("Boom!"); // 抛出异常
+    }
+
+    // 场景2: 使用 NESTED
+    @Transactional(propagation = Propagation.NESTED)
+    public void innerMethod() {
+        userRepository.save(new User("Charlie")); // 操作 B
+        throw new RuntimeException("Boom!"); // 抛出异常
+    }
+}
+----
+
+* **场景1 (REQUIRED):** 当 innerMethod 抛出异常时, 整个 outerMethod 的事务都会被标记为回滚. 最终, **操作A和操作C都不会被保存**.
+
+* **场景2 (NESTED):** 当 innerMethod 抛出异常时, Spring 会回滚到进入 innerMethod 之前建立的保存点. 最终, **操作A和操作C会被保存, 只有操作B被回滚**.
+
+=== 总结
+
+[cols="1,3,3"]
+|===
+|特性|表面嵌套 / 扁平化事务|保存点模式(真嵌套事务)
+
+|**实现方式**
+|忽略内层 BEGIN
+|使用 SAVEPOINT
+
+|**内层提交**
+|通常无效
+|通常无效
+
+|**内层回滚**
+|回滚**整个**事务
+|回滚到**保存点**(仅子事务)
+
+|**原子性**
+|整个嵌套结构是原子的
+|父事务是原子的, 子事务可独立回滚
+
+|**适用场景**
+|大多数默认情况, 确保ACID
+|复杂业务, 需要部分回滚(如"尝试性"操作)
+
+|**代表**
+|MySQL InnoDB (默认), PostgreSQL (默认)
+|Oracle, SQL Server, PostgreSQL/MySQL (用SAVEPOINT)
+
+|===
+
+**核心要点:**
+
+理解嵌套事务的关键在于明确你使用的数据库和事务管理器(如Spring)采用的是哪种模型. 在大多数情况下, 我们使用的是扁平化模型, 以确保数据一致性. 而在需要更精细控制的场景下, 则可以通过显式使用保存点或配置 PROPAGATION_NESTED 来获得真正的嵌套事务能力.

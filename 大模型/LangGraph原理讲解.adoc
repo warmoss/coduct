@@ -1,0 +1,257 @@
+== LangGraph原理讲解
+
+LangGraph 是一个构建**有状态、多步骤 LLM 应用**的图框架, 由 LangChain 团队开发. 它解决了标准 LangChain 链式调用难以表达复杂分支、循环和状态共享的问题, 让开发者能以**有向图(Directed Graph)** 的方式编排 LLM 调用、工具交互和决策逻辑.
+
+传统 LLM 应用通常是线性的链式调用: 输入 -> Prompt -> LLM -> 输出. 但真实场景往往需要条件分支(如判断是否需要调用工具)、循环(如反复检索直到满意)、以及多 agent 协作(如两个 agent 交替发言). LangGraph 正是为这些场景而生.
+
+=== 核心概念
+
+LangGraph 的核心抽象是一张**有向图**, 由几个关键元素构成:
+
+节点(Node):: 图中的一个**处理单元**, 可以是 LLM 调用、函数调用、工具执行或任何可运行逻辑. 每个节点接收当前状态, 执行操作, 返回更新后的状态.
+
+边(Edge):: 连接两个节点的**有向路径**, 定义执行流的走向. 边可以是**普通边**(固定路径)或**条件边**(根据当前状态动态选择下一节点).
+
+状态(State):: 在图执行过程中**共享的数据容器**, 是所有节点的输入和输出. 状态是**类型化**的, 通常用 `TypedDict` 或 Pydantic `BaseModel` 定义.
+
+状态图(StateGraph):: LangGraph 的核心图类, 管理节点、边以及状态的类型和流转规则.
+
+=== 核心原理: 以图为执行引擎
+
+LangGraph 的本质是将 LLM 应用的执行逻辑建模为一个**状态机**, 每个节点是状态转换函数, 边定义转换条件.
+
+==== 状态管理与传递
+
+LangGraph 的状态遵循**单一事实源(Source of Truth)** 原则:
+
+* 整个图共享一个状态对象, 所有节点读写同一状态.
+* 每个节点可以指定**哪些字段可读、哪些字段可写**, 通过 `NodeConfig` 或节点函数签名控制.
+* 节点执行后返回的更新会**合并**到当前状态中, 而非替换整个状态.
+
+[source,python]
+----
+from typing import TypedDict, Annotated
+from operator import add
+
+# 定义状态结构
+class GraphState(TypedDict):
+    messages: Annotated[list, add]  # 使用 add 操作符实现追加合并
+    next_action: str
+    final_answer: str
+----
+
+上述代码中, `messages` 字段使用 `Annotated[list, add]` 标注, 表示每次更新时是**追加合并**而非覆盖. 这是 LangGraph 状态管理的重要特性: 开发者可为每个字段指定自定义的**归约操作(Reducer)**, 决定当多个节点写入同一字段时如何合并.
+
+==== 节点: 可运行单元
+
+节点是图的基本执行单元, 可以是一个 Python 函数、一个可调用对象, 或一个 LangChain `Runnable`:
+
+[source,python]
+----
+def call_model(state: GraphState) -> dict:
+    """调用 LLM 并返回结果"""
+    response = llm.invoke(state["messages"])
+    return {"messages": [response], "next_action": "tool" if response.tool_calls else "respond"}
+
+def execute_tool(state: GraphState) -> dict:
+    """执行工具调用"""
+    tool_result = tools[state["messages"][-1].tool_calls[0]["name"]].invoke(...)
+    return {"messages": [tool_result], "next_action": "continue"}
+----
+
+每个节点函数接收当前 `State`, 返回一个字典, 字典中的键值对会被**合并**到当前状态中.
+
+==== 条件边: 动态路由
+
+条件边是 LangGraph 最强大的特性之一, 它让执行流可以根据当前状态动态决定下一步走向:
+
+[source,python]
+----
+def router(state: GraphState) -> str:
+    """根据状态决定下一步路由到哪个节点"""
+    if state["next_action"] == "respond":
+        return "generate_answer"
+    elif state["next_action"] == "tool":
+        return "execute_tool"
+    else:
+        return "end"
+
+# 添加条件边: 从 call_model 出发, 根据 router 函数返回值路由
+graph.add_conditional_edges(
+    "call_model",          # 源节点
+    router,                # 路由函数, 返回目标节点名称
+    {                      # 显式映射(可选)
+        "generate_answer": "generate_answer",
+        "execute_tool": "execute_tool",
+        "end": END,
+    }
+)
+----
+
+路由函数接收当前状态, 返回一个字符串, 该字符串匹配图中某个节点的名称. 如果返回 `END`, 则图执行终止.
+
+==== 图的构建与执行流程
+
+. **定义状态类型:** 用 `TypedDict` 或 `BaseModel` 定义状态结构.
+
+. **创建 StateGraph 实例:** `workflow = StateGraph(GraphState)`.
+
+. **添加节点:** `workflow.add_node("node_name", node_function)`.
+
+. **添加边:**
+
+.. **入口边:** `workflow.set_entry_point("first_node")` 指定起始节点.
+
+.. **普通边:** `workflow.add_edge("node_a", "node_b")` 指定固定执行流.
+
+.. **条件边:** `workflow.add_conditional_edges(...)` 指定动态路由.
+
+. **编译图:** `app = workflow.compile()` 将图编译为可调用对象.
+
+. **执行图:** `result = app.invoke({"messages": [user_message]})` 传入初始状态并执行.
+
+=== 完整示例: 带工具调用的问答 Agent
+
+以下示例展示一个简单的问答 Agent, 它可以根据用户问题决定是否调用搜索工具:
+
+[source,python]
+----
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Annotated
+from operator import add
+from langchain_openai import ChatOpenAI
+
+# 1. 定义状态
+class AgentState(TypedDict):
+    messages: Annotated[list, add]
+    need_search: bool
+
+# 2. 初始化 LLM
+llm = ChatOpenAI(model="gpt-4")
+tools = [search_tool]
+llm_with_tools = llm.bind_tools(tools)
+
+# 3. 定义节点函数
+def decide_action(state: AgentState) -> dict:
+    last_msg = state["messages"][-1].content
+    # 判断是否需要搜索
+    if "search" in last_msg.lower():
+        return {"need_search": True}
+    return {"need_search": False}
+
+def call_llm(state: AgentState) -> dict:
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+
+def execute_search(state: AgentState) -> dict:
+    result = search_tool.invoke({"query": state["messages"][-1].content})
+    return {"messages": [result]}
+
+# 4. 构建图
+workflow = StateGraph(AgentState)
+workflow.add_node("decide", decide_action)
+workflow.add_node("llm", call_llm)
+workflow.add_node("search", execute_search)
+
+workflow.set_entry_point("decide")
+
+# 条件边: 根据 need_search 路由
+workflow.add_conditional_edges(
+    "decide",
+    lambda s: "search" if s["need_search"] else "llm",
+    {"search": "search", "llm": "llm"}
+)
+
+workflow.add_edge("search", "llm")   # 搜索完成后调用 LLM
+workflow.add_edge("llm", END)        # LLM 回答后终止
+
+# 5. 编译图
+app = workflow.compile()
+
+# 6. 执行
+result = app.invoke({"messages": [("human", "帮我搜索今天北京的天气")]})
+print(result["messages"][-1].content)
+----
+
+=== 高级特性
+
+==== Agent 循环
+
+LangGraph 天然支持 **Agent 循环**(Agent Loop): agent 反复执行"思考-行动-观察"的循环, 直到满足终止条件. 典型实现是一个**有环图**:
+
+* `agent` 节点决定下一步行动.
+* `action` 节点执行工具.
+* 条件边判断是否继续循环或结束.
+
+[plantuml, "Agent 循环流程图", format=png]
+----
+@startuml
+start
+:用户输入;
+repeat
+  :Agent 思考(LLM);
+  if (需要调用工具?) then (是)
+    :执行工具;
+  else (否)
+    break
+  endif
+repeat while (继续?)
+:生成最终回答;
+stop
+@enduml
+----
+
+==== 并行执行
+
+LangGraph 支持节点的**扇出(Fan-out) 和扇入(Fan-in) 模式**, 即一个节点可以同时触发多个下游节点, 多个节点完成后汇聚到一个节点:
+
+[source,python]
+----
+# 扇出: 同时执行多个分析
+workflow.add_edge("analyze", "sentiment_analysis")
+workflow.add_edge("analyze", "keyword_extraction")
+workflow.add_edge("analyze", "summary")
+
+# 扇入: 所有结果汇聚到 combine
+workflow.add_edge("sentiment_analysis", "combine")
+workflow.add_edge("keyword_extraction", "combine")
+workflow.add_edge("summary", "combine")
+----
+
+LangGraph 内置了对并行节点的支持, 当节点间没有依赖关系时会自动并行执行.
+
+==== 多 Agent 协作
+
+通过将多个子图组合, LangGraph 可以构建复杂的多 Agent 系统:
+
+* **Supervisor Agent:** 一个主 agent 协调多个子 agent, 决定哪个子 agent 下一个执行.
+* **Debate/讨论模式:** 多个 agent 轮流发言, 互相质疑和改进.
+* **层级结构:** agent 可以嵌套, 子 agent 内部可以有自己独立的图.
+
+=== LangGraph 与 LangChain 的关系
+
+[cols="2,5"]
+|===
+|概念 |关系
+
+|LangChain
+|提供 LLM 调用抽象、工具接口、Prompt 模板、输出解析器等基础组件.
+
+|LangGraph
+|在 LangChain 之上提供**图执行引擎**管理组件间的编排、状态和流程控制.
+
+|使用方式
+|用 LangChain 定义 LLM、tools、retrievers 等组件, 用 LangGraph 将它们编排为有状态图.
+
+|===
+
+=== 总结
+
+LangGraph 的核心贡献是将 LLM 应用的编排从**线性链**升级为**有状态图**, 使得复杂的多步推理、条件分支、循环和多 agent 协作成为可能.
+
+* 以 **StateGraph** 为执行引擎, 状态在所有节点间共享, 每个节点只关注自己的读写字段.
+* **条件边**是实现动态决策的关键, 让执行流不再固定.
+* **归约操作(Reducer)** 让状态合并行为可定制, 避免字段冲突.
+* 天然支持 Agent 循环、并行执行和多 Agent 协作.
+
+当你的 LLM 应用需要条件判断、循环、状态共享或多 agent 交互时, LangGraph 是比纯 LangChain 链式调用更合适的选择.

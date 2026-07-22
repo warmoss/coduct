@@ -1,0 +1,181 @@
+== 极坐标原理讲解
+
+极坐标是一种用**距离**和**角度**来描述平面中点位置的坐标系统. 与笛卡尔坐标用 stem:[(x, y)] 表示"横走多少、纵走多少"不同, 极坐标用 stem:[(r, \theta)] 表示"走多远、朝哪个方向". 这种描述方式在处理旋转、圆形轨迹和周期性问题时天然简洁.
+
+=== 概念定义
+
+==== 极坐标系的构成
+
+极坐标系由以下要素组成:
+
+* **极点 (Pole)**: 坐标原点, 相当于笛卡尔坐标系中的 stem:[(0, 0)].
+* **极轴 (Polar Axis)**: 从极点出发向右的水平射线, 相当于笛卡尔坐标系的正 `x` 轴.
+* **极径 (Radial Coordinate) `r`**: 点到极点的距离, 取值范围 stem:[r \ge 0] (也可取负值, 表示反向延长).
+* **极角 (Angular Coordinate) stem:[\theta]**: 从极轴逆时针旋转到点所在射线方向的角度, 通常以弧度为单位, 取值范围 stem:[\theta \in [0, 2\pi)] 或 stem:[(-\infty, +\infty)].
+
+平面上任意一点 `P` 对应唯一一对极坐标 stem:[(r, \theta)]. 但反过来, 一个点对应无穷多对极坐标: stem:[(r, \theta + 2k\pi)] (k为整数) 都表示同一点.
+
+极坐标 stem:[(r, \theta)] 与笛卡尔坐标 stem:[(x, y)] 的关系:
+
+* 从极坐标到笛卡尔: stem:[x = r \cos\theta], stem:[y = r \sin\theta].
+* 从笛卡尔到极坐标: stem:[r = \sqrt{x^2 + y^2}], stem:[\theta = \arctan2(y, x)].
+
+[NOTE]
+====
+stem:[arctan2(y, x)] 是 stem:[arctan(y/x)] 的增强版, 能根据 stem:[x] 和 stem:[y] 的符号自动确定角度所在的象限, 返回 stem:[(-\pi, \pi]] 范围内的值.
+====
+
+==== 为什么需要极坐标?
+
+有些问题在笛卡尔坐标下描述非常复杂, 但在极坐标下却出奇简洁:
+
+* **圆形**: 笛卡尔坐标需要 stem:[(x - a)^2 + (y - b)^2 = R^2], 极坐标下圆心在原点的圆仅为 stem:[r = R].
+* **螺旋**: 阿基米德螺旋在笛卡尔坐标下难以表达, 极坐标下仅为 stem:[r = a + b\theta].
+* **旋转运动**: 物理中圆周运动的角速度、角加速度在极坐标下有天然的表达形式.
+
+=== 核心性质
+
+==== 极坐标的周期性和多值性
+
+极坐标中同一个物理点可以对应多组坐标值:
+
+* stem:[\theta] 增加 stem:[2\pi] 回到同一射线: stem:[(r, \theta)] 与 stem:[(r, \theta + 2\pi)] 同一点.
+* stem:[r] 取负值时表示反向延长: stem:[(-r, \theta)] 与 stem:[(r, \theta + \pi)] 同一点.
+
+这种多值性在求解方程和绘图时需要留意, 通常约定主值范围 stem:[r \ge 0], stem:[\theta \in [0, 2\pi)] 来消除歧义.
+
+==== 极坐标下的距离公式
+
+两点 stem:[(r_1, \theta_1)] 和 stem:[(r_2, \theta_2)] 之间的直线距离:
+
+stem:[d = \sqrt{r_1^2 + r_2^2 - 2 r_1 r_2 \cos(\theta_1 - \theta_2)}]
+
+这是余弦定理的直接应用, 相当于笛卡尔坐标下距离公式在极坐标中的等价形式.
+
+==== 极坐标下的面积公式
+
+由极坐标曲线 stem:[r = f(\theta)] 从 stem:[\theta = \alpha] 到 stem:[\theta = \beta] 围成的扇形面积:
+
+stem:[S = \frac{1}{2} \int_{\alpha}^{\beta} [f(\theta)]^2 \, d\theta]
+
+这是因为微元扇形的面积近似于 stem:[\frac{1}{2} r^2 d\theta]. 这一公式在计算极坐标曲线围成区域的面积时极为常用.
+
+==== 极坐标下的切线斜率
+
+极坐标曲线 stem:[r = f(\theta)] 在点 stem:[(r, \theta)] 处的切线斜率可以通过参数方程求得:
+
+stem:[\frac{dy}{dx} = \frac{\frac{dr}{d\theta} \sin\theta + r \cos\theta}{\frac{dr}{d\theta} \cos\theta - r \sin\theta}]
+
+推导思路: 将 stem:[x = r \cos\theta], stem:[y = r \sin\theta] 视为以 stem:[\theta] 为参数的参数方程, 然后应用参数方程求导法则.
+
+=== 常见极坐标曲线
+
+极坐标下可以简洁表达许多优美的曲线.
+
+==== 圆 (Circle)
+
+* **圆心在极点**: stem:[r = a] -- 半径为 `a` 的圆, 是最简单的极坐标方程.
+* **圆心在极轴上**: stem:[r = 2a \cos\theta] -- 半径为 `a`, 圆心在 `(a, 0)` 的圆.
+* **圆心在 `y` 轴上**: stem:[r = 2a \sin\theta] -- 半径为 `a`, 圆心在 `(0, a)` 的圆.
+
+==== 玫瑰线 (Rose Curve)
+
+stem:[r = a \cos(k\theta)] 或 stem:[r = a \sin(k\theta)]
+
+* 当 `k` 为**奇数**时, 曲线有 `k` 个花瓣.
+* 当 `k` 为**偶数**时, 曲线有 `2k` 个花瓣.
+
+例如, stem:[r = 2 \cos(3\theta)] 绘制出三叶玫瑰线, stem:[r = 2 \cos(2\theta)] 绘制出四叶玫瑰线.
+
+==== 心形线 (Cardioid)
+
+stem:[r = a(1 + \cos\theta)] 或 stem:[r = a(1 + \sin\theta)]
+
+心形线是心脏形状的曲线, 通过调整正负号和三角函数类型可以改变心形的朝向. 它的名字源自希腊语 kardia (心脏).
+
+==== 双纽线 (Lemniscate)
+
+stem:[r^2 = a^2 \cos(2\theta)] 或 stem:[r^2 = a^2 \sin(2\theta)]
+
+双纽线形状如无限符号 `∞`, 是伯努利双纽线在极坐标下的标准形式.
+
+==== 阿基米德螺线 (Archimedean Spiral)
+
+stem:[r = a + b\theta]
+
+螺线随角度增大而均匀向外扩展, 相邻两圈之间的径向距离恒为 stem:[2\pi b]. 这种螺线在凸轮设计和唱片槽纹中有实际应用.
+
+==== 对数螺线 (Logarithmic Spiral)
+
+stem:[r = ae^{b\theta}]
+
+螺线的扩展速度随角度指数增长. 对数螺线在自然界中广泛存在: 鹦鹉螺壳、旋涡星系、飓风云图都呈现对数螺线形态. 它有一个独特性质: 任意一点处的切线与向径的夹角恒定.
+
+=== 极坐标与笛卡尔坐标的互换示例
+
+下面通过 Python 演示如何在两种坐标系之间转换:
+
+[source,python]
+----
+import math
+
+def polar_to_cartesian(r, theta):
+    """极坐标转笛卡尔坐标"""
+    x = r * math.cos(theta)
+    y = r * math.sin(theta)
+    return (x, y)
+
+def cartesian_to_polar(x, y):
+    """笛卡尔坐标转极坐标"""
+    r = math.sqrt(x**2 + y**2)
+    theta = math.atan2(y, x)
+    return (r, theta)
+
+# 示例: 点 (3, 4) 在笛卡尔坐标下
+x, y = 3, 4
+r, theta = cartesian_to_polar(x, y)
+print(f"笛卡尔 ({x}, {y}) -> 极坐标 ({r:.2f}, {theta:.2f} rad)")
+
+# 极坐标 (5, 0.9273 rad) 转回笛卡尔
+r, theta = 5, 0.9273
+x, y = polar_to_cartesian(r, theta)
+print(f"极坐标 ({r}, {theta} rad) -> 笛卡尔 ({x:.2f}, {y:.2f})")
+----
+
+=== 应用场景
+
+==== 物理: 圆周运动与天体力学
+
+描述圆周运动时, 极坐标是自然的选择:
+
+* *位置*: stem:[r = R], stem:[\theta = \omega t + \phi_0] -- 匀速圆周运动.
+* *速度*: 切向速度 stem:[v_t = r \dot{\theta}], 径向速度 stem:[v_r = \dot{r}].
+* *加速度*: 法向(向心)加速度 stem:[a_n = r \dot{\theta}^2], 切向加速度 stem:[a_t = r \ddot{\theta}].
+
+开普勒行星运动定律在极坐标下有简洁表达: 行星轨道为椭圆, 太阳位于一个焦点, 极坐标方程 stem:[r = \frac{p}{1 + e \cos\theta}] 描述圆锥曲线轨道(stem:[e] 为离心率).
+
+==== 工程: 雷达与导航
+
+雷达系统用极坐标天然描述目标位置: **距离**和**方位角**. 导航系统中的方位指示("东北方向10海里")本质上是极坐标思维.
+
+==== 数学: 复数的几何表示
+
+复数 stem:[z = a + bi] 可以用极坐标形式表示:
+
+stem:[z = r(\cos\theta + i \sin\theta) = re^{i\theta}]
+
+其中 stem:[r = |z|] 是模长, stem:[\theta = \arg(z)] 是辐角. 复数的乘法、除法和幂运算在极坐标形式下极为简便:
+
+* *乘法*: stem:[r_1 e^{i\theta_1} \cdot r_2 e^{i\theta_2} = r_1 r_2 e^{i(\theta_1 + \theta_2)}].
+* *幂运算*(棣莫弗公式): stem:[(re^{i\theta})^n = r^n e^{i n \theta}].
+
+=== 总结
+
+极坐标的核心价值在于: **用距离和角度描述位置**, 在处理旋转、圆形和周期性问题时比笛卡尔坐标更简洁自然.
+
+* 点用 stem:[(r, \theta)] 表示, 关系为 stem:[x = r \cos\theta], stem:[y = r \sin\theta].
+* 常见曲线: 圆、心形线、玫瑰线、双纽线、阿基米德螺线、对数螺线.
+* 关键公式: 面积 stem:[S = \frac{1}{2} \int r^2 d\theta], 弧长 stem:[L = \int \sqrt{r^2 + (\frac{dr}{d\theta})^2} d\theta].
+* 应用: 圆周运动、天体力学、雷达导航、复数表示.
+
+WARNING: 极坐标的多值性(infinite representations)是初学者最常见的混淆点. 牢记一个物理点对应无穷多组 stem:[(r, \theta)] 坐标, 而同一组坐标只对应唯一一个点.

@@ -1,0 +1,309 @@
+== Kafka 原理讲解
+
+Kafka 是由 LinkedIn 于 2010 年开源、后捐给 Apache 基金会的分布式事件流平台. 它以**高吞吐、持久化、可水平扩展**的发布/订阅系统闻名, 单机可达百万条/秒的吞吐量, 是现代数据管道和流式处理的事实标准. Kafka 并非传统消息队列, 而是一个**分布式提交日志 (Distributed Commit Log)**.
+
+=== 核心概念
+
+主题 (Topic):: 消息的逻辑分类, 类似数据库中的表. 每条消息写入一个 Topic, 消费者按 Topic 订阅消息
+
+分区 (Partition):: 每个 Topic 分成若干分区, 分区是 Kafka 并行和扩展的基本单位. 每个分区是一个**有序、不可变**的消息序列, 消息在分区内以 Offset 唯一标识
+
+偏移量 (Offset):: 分区内每条消息的唯一序号, 单调递增, 消费者通过 Offset 追踪消费进度
+
+Broker:: Kafka 集群中的每台服务器节点. 通常建议集群至少 3 个 Broker
+
+生产者 (Producer):: 消息的发布者, 将消息写入指定 Topic 的某个 Partition
+
+消费者 (Consumer):: 消息的订阅者, 从 Topic 的 Partition 拉取消息
+
+消费者组 (Consumer Group):: 一组消费者协同消费同一个 Topic, 每个分区在同一时刻只由一个消费者消费, 实现**并行消费**和**水平伸缩**
+
+副本 (Replica):: 每个 Partition 的冗余拷贝, 用于容错. 副本分为 Leader 和 Follower
+
+ISR (In-Sync Replicas):: 与 Leader 保持同步的副本集合, Kafka 只从 ISR 中选新 Leader
+
+=== 核心特性
+
+==== 分区与并行度
+
+分区是 Kafka 吞吐的关键. 一个 Topic 的 N 个分区可被 N 个消费者(同一组)并行消费:
+
+[plantuml, "Kafka 分区与消费者组", format=png]
+----
+@startuml
+@startuml
+left to right direction
+
+rectangle "Topic-A" {
+  rectangle "Partition-0" as P0
+  rectangle "Partition-1" as P1
+  rectangle "Partition-2" as P2
+}
+
+rectangle "Consumer Group G1" {
+  rectangle "Consumer-1" as C1
+  rectangle "Consumer-2" as C2
+}
+
+P0 --> C1
+P1 --> C2
+P2 --> C2
+@enduml
+----
+
+分区数量决定了最大并行度: 消费者组内最多 N 个消费者同时消费 N 个分区. 分区内消息有序, 分区之间不保证全局有序.
+
+==== 消息分布策略
+
+生产者决定消息写入哪个分区的规则:
+
+* **轮询 (Round-Robin)**: 无 Key 时均匀分布到各分区
+* **Key 哈希 (Key Hashing)**: 指定 Key 时, `partition = hash(key) % numPartitions`, 相同 Key 消息进入同一分区, 保证局部有序
+* **自定义分区器**: 实现 `Partitioner` 接口自定义路由逻辑
+
+[source,java]
+----
+// Key 哈希分区默认实现
+public int partition(String topic, Object key, byte[] keyBytes) {
+    // murmur2 哈希, 相同 key 进入同一分区
+    return Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
+}
+----
+
+==== 副本机制与 Leader 选举
+
+每个分区有多个副本, 其中一个为 Leader, 其余为 Follower:
+
+* **Leader**: 负责处理所有读写请求
+* **Follower**: 被动从 Leader 同步数据, 不提供服务
+* **ISR**: 与 Leader 同步未落后的副本列表
+
+Leader 宕机时, Controller (集群控制器) 从 ISR 中选出新 Leader:
+
+[plantuml, "Leader 选举流程", format=png]
+----
+@startuml
+participant "Controller" as C
+participant "Leader (Broker 1)" as L
+participant "Follower (Broker 2)" as F
+participant "Follower (Broker 3)" as F2
+
+L -> F: 复制数据
+L -> F2: 复制数据
+note over L: Leader 宕机
+C -> F: 选举为新的 Leader
+F --> C: 确认成为 Leader
+note over C: 更新元数据, 通知所有 Broker
+@enduml
+----
+
+副本放置策略遵循**机架感知 (Rack Awareness)**: 同一分区的副本尽量分布在不同的物理机架, 防止机架整体故障导致数据丢失.
+
+==== 消息传递语义
+
+Kafka 提供三种消息保证等级:
+
+[cols="1,2,2"]
+|===
+| 等级 | 生产者 (acks) | 消费者
+
+| At most once
+| `acks=0`, 发完即忘, 可能丢消息
+| 先提交 Offset 再处理消息
+
+| At least once
+| `acks=1` 或 `acks=all`, 等待确认
+| 先处理消息再提交 Offset, 可能重复
+
+| Exactly once
+| `acks=all` + 幂等生产者 `enable.idempotence=true`
+| 事务性消费者或幂等性下游处理
+|===
+
+[WARNING]
+====
+`acks=all` 配合 `min.insync.replicas` 可保证写入强一致性, 但会增加延迟. 建议生产环境设置 `acks=all` + `min.insync.replicas=2`.
+====
+
+==== 存储与日志结构
+
+Kafka 使用**分段日志 (Segmented Log)** 存储消息, 每个 Partition 对应一个物理目录:
+
+[source,shell]
+----
+/tmp/kafka-logs/
+  topic-a-0/               # Partition 0
+    00000000000000000000.log      # Segment 文件, 存储消息数据
+    00000000000000000000.index    # 偏移量索引, 映射 Offset -> 物理位置
+    00000000000000000000.timeindex # 时间索引, 映射时间戳 -> Offset
+    00000000000000100000.log      # 下一个 Segment
+    00000000000000100000.index
+    00000000000000100000.timeindex
+----
+
+Segment 的滚动条件: 达到 `segment.bytes` (默认 1 GB) 或 `segment.ms` (默认 7 天).
+
+**索引文件**采用稀疏存储, 每写入约 4 KB 数据记录一条索引项, 通过**二分查找**快速定位消息.
+
+==== 日志清理策略
+
+Kafka 支持两种日志清理模式:
+
+* **删除 (delete)**: 默认策略. 根据时间 (`retention.ms`, 默认 7 天) 或大小 (`retention.bytes`) 删除旧 Segment
+* **压缩 (compact)**: 保留每个 Key 的最新消息, 适用于变更数据捕获 (CDC) 等场景
+
+[plantuml, "日志压缩示意", format=png]
+----
+@startuml
+title "Log Compaction 前后对比"
+
+rectangle "压缩前" {
+  (1: K1->V1)
+  (2: K2->V2)
+  (3: K1->V3)
+  (4: K3->V4)
+  (5: K1->V5)
+}
+
+rectangle "压缩后" {
+  (2: K2->V2)
+  (4: K3->V4)
+  (5: K1->V5)
+}
+
+"压缩前" --> "压缩后": Compact
+@enduml
+----
+
+[NOTE]
+====
+日志压缩并非实时的, 由后台 Cleaner 线程异步执行. 压缩后相同 Key 只保留最新值, 因此消费者从头消费可获取**每个 Key 的最新状态**.
+====
+
+=== 工作流程
+
+==== 消息写入流程
+
+[plantuml, "消息写入流程", format=png]
+----
+@startuml
+actor "Producer" as P
+participant "Partition Leader" as L
+database "OS PageCache" as C
+database "Disk Log" as D
+
+P -> L: 发送消息
+L -> C: 追加到 PageCache
+note over L: acks=0 直接返回
+note over L: acks=1 写入 PageCache 即返回
+L -> D: 后台刷盘 (flush)
+note over L: acks=all 等待所有 ISR 确认
+L --> P: 返回确认
+@enduml
+----
+
+Kafka 高效写入的关键:
+
+* **顺序 I/O**: 消息追加到 Segment 末尾, 利用磁盘顺序写入性能
+* **零拷贝 (Zero Copy)**: 消费时使用 `sendfile` 系统调用, 数据从 PageCache 直接发送到 Socket, 无需经过用户态
+* **PageCache 利用**: 消息先写入操作系统的页缓存, 后台异步刷盘, 读写共用缓存
+
+==== 消息消费流程
+
+[plantuml, "消费者拉取流程", format=png]
+----
+@startuml
+participant "Consumer" as C
+participant "Group Coordinator" as G
+participant "Partition Leader" as L
+
+C -> G: JoinGroup (加入消费者组)
+G --> C: 分配分区
+C -> L: FetchRequest (指定 Offset)
+L --> C: 返回消息批次
+note over C: 处理消息
+C -> L: CommitOffset (提交偏移量)
+@enduml
+----
+
+消费者采用**拉模式 (Pull)**, 主动向 Broker 拉取数据, 而非 Broker 推送. 拉模式的优势:
+
+* 消费者自主控制消费速率, 防止被慢消费者压垮
+* 支持批量拉取, 提高吞吐
+* 可实现回溯消费和重试
+
+==== 消费者再均衡
+
+当消费者加入、离开或分区数变化时, 触发**再均衡 (Rebalance)**:
+
+. 消费者向 Group Coordinator 发送 Heartbeat
+. Coordinator 发现成员变化, 通知组内所有消费者
+. 消费者停止消费, 撤销已分配的分区
+. Coordinator 重新分配分区给存活消费者
+. 消费者开始消费新分区
+
+[WARNING]
+====
+Rebalance 会导致短暂的**全组停止消费** (Stop-The-World). 频繁 Rebalance 会严重影响吞吐, 建议合理设置 `session.timeout.ms` (默认 45 秒) 和 `heartbeat.interval.ms` (默认 3 秒) 避免假失联.
+====
+
+=== 高可用设计
+
+==== 副本放置
+
+创建 Topic 时, Kafka 通过**机架感知算法**将副本分布在不同的 Broker 和机架上. 例如 3 副本、4 个 Broker:
+
+[cols="1,1,1,1,1"]
+|===
+| 分区 | Leader | Follower 1 | Follower 2 | 说明
+
+| Partition 0 | Broker 1 | Broker 2 | Broker 3 | 跨 3 个 Broker
+| Partition 1 | Broker 2 | Broker 3 | Broker 4 | 轮换起始位置
+| Partition 2 | Broker 3 | Broker 4 | Broker 1 | 负载均衡
+|===
+
+这种设计确保任何单节点故障不影响整体可用性.
+
+==== 控制器 (Controller)
+
+集群中的某个 Broker 充当 Controller, 负责:
+
+* 管理 Partition 的 Leader 选举
+* 监听 Broker 上下线并触发 Rebalance
+* 管理 Topic 创建、删除等元数据变更
+
+Controller 通过 ZooKeeper (或 KRaft 模式下的 Raft 共识) 选主, 宕机后自动切换.
+
+==== 故障恢复
+
+[plantuml, "Broker 故障恢复流程", format=png]
+----
+@startuml
+participant "Controller" as C
+participant "Broker 1 (Leader)" as B1
+participant "Broker 2 (Follower)" as B2
+participant "Broker 3 (Follower)" as B3
+
+B1 -> C: 心跳超时
+note over C: 检测到 Broker 1 下线
+C -> B2: LeaderAndISR (选举 Partition 的 Leader)
+C -> B3: LeaderAndISR (选举 Partition 的 Leader)
+B2 --> C: 确认成为 Leader
+B3 --> C: 确认成为 Leader
+note over C: 更新元数据, 广播给所有 Broker
+@enduml
+----
+
+[NOTE]
+====
+故障期间写入 Leader 分区但尚未同步到 Follower 的消息会丢失, 丢失量等于 Leader 与 Follower 之间的同步延迟. 设置 `min.insync.replicas=2` 可确保至少 2 个副本确认后才返回成功, 降低丢消息风险.
+====
+
+=== 总结
+
+* Kafka 是一个**分布式提交日志**, 而非传统消息队列, 其核心是持久化、高吞吐、可回放的有序日志
+* **分区**是并行和扩展的基本单位, 分区内有序, 分区间不保证全局有序
+* **ISR 机制**保证了强一致性语义, `acks=all` + `min.insync.replicas` 可做到不丢消息
+* 性能关键在于**顺序 I/O、零拷贝和 PageCache**, 使其单机吞吐远超传统消息中间件
+* 消费者组通过**分区再均衡**实现弹性伸缩, 但频繁 Rebalance 会影响稳定性
+* Kafka 支持**日志压缩**和**时间/大小保留策略**, 可同时满足事件流和状态存储两类需求

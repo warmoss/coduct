@@ -1,0 +1,351 @@
+== LongAdder原理讲解
+
+LongAdder 是 Java 8 引入的并发计数器, 位于 `java.util.concurrent.atomic` 包中. 它解决了高并发场景下 `AtomicLong` 因 CAS 竞争激烈导致的性能瓶颈问题, 通过空间换时间和拆分竞争域的策略大幅提升写性能.
+
+=== 核心特性
+
+**分段计数(Cell Stripping)**
+
+* 将单一计数变量拆分为一个基础值(`base`)和一组单元(`Cell[]`), 降低多线程间的竞争粒度
+* 每个线程优先更新自己的 Cell, 减少 CAS 冲突
+
+**高并发优化**
+
+* 低竞争时退化为类似 AtomicLong 的单值 CAS 操作, 无额外开销
+* 高竞争时自动扩容 Cell 数组, 将竞争分散到多个槽位
+
+**最终一致性**
+
+* `sum()` 返回的值是多个 Cell 之和, 调用时各 Cell 仍在变化, 因此不保证强一致性
+* 适合计数器、指标统计等对最终一致性敏感的场景
+
+=== 实现原理
+
+==== 内部结构
+
+[source,java]
+----
+public class LongAdder extends Striped64 implements Serializable {
+    // 核心逻辑全部继承自 Striped64
+}
+
+// Striped64 的内部结构
+abstract class Striped64 extends Number {
+    // 基础计数值, 竞争不激烈时直接 CAS 更新
+    transient volatile long base;
+
+    // Cell 数组, 高竞争时扩容使用
+    transient volatile Cell[] cells;
+
+    // cellsBusy: 用于 Cell 数组扩容和初始化的自旋锁(0: 未锁定, 1: 锁定)
+    transient volatile int cellsBusy;
+}
+----
+
+**Cell 类设计** - 使用 `@sun.misc.Contended` 注解避免伪共享(False Sharing):
+
+[source,java]
+----
+@sun.misc.Contended  // 避免伪共享: 填充缓存行至 64 字节
+static final class Cell {
+    volatile long value;
+
+    Cell(long x) { value = x; }
+
+    // CAS 更新 value
+    final boolean cas(long cmp, long val) {
+        return UNSAFE.compareAndSwapLong(this, valueOffset, cmp, val);
+    }
+}
+----
+
+关键设计点:
+
+* `@sun.misc.Contended` 注解会让 JVM 在 Cell 对象前后填充 128 字节的空白, 确保每个 Cell 独占一个 CPU 缓存行(Cache Line, 通常 64 字节), 避免不同 Cell 因竞争同一缓存行导致的**伪共享(False Sharing)** 问题
+* `Cell` 使用 `volatile` 修饰 `value` 保证可见性, 通过 `UNSAFE.compareAndSwapLong` 执行原子更新
+
+==== 伪共享问题
+
+伪共享是多核 CPU 环境下的性能陷阱:
+
+* CPU 以缓存行为单位加载数据(通常 64 字节)
+* 当两个 Cell 对象落在同一缓存行时, 线程 A 更新 Cell[0] 会导致线程 B 的 Cell[1] 缓存行失效
+* 即使 Cell[0] 和 Cell[1] 在逻辑上完全独立, 物理上仍相互干扰
+* `@Contended` 注解通过填充额外的字节, 让每个 Cell 独占缓存行, 彻底消除伪共享
+
+==== 核心机制: 分段累加
+
+[source,java]
+----
+public void add(long x) {
+    Cell[] cs; long b, v; Cell c; int n;
+
+    // 条件1: cells 数组为 null, 尝试 CAS 更新 base
+    // 条件2: cells 数组不为 null, 尝试 CAS 更新对应 Cell
+    // 两个条件任一 CAS 失败则进入 longAccumulate 逻辑
+    if ((cs = cells) != null
+        || !casBase(b = base, b + x)) {
+        // 当前线程是否应竞争更新 Cell
+        boolean uncontended = true;
+
+        // 判断是否需要进入完整累加逻辑
+        if (cs == null                    // cells 未初始化
+            || (n = cs.length) < 1        // cells 长度为 0
+            || (c = cs[getProbe() & (n - 1)]) == null  // 线程对应的 Cell 为 null
+            || !(uncontended = c.cas(v = c.value, v + x))) {
+            // 完整累加逻辑: 初始化 Cell、扩容、重试
+            longAccumulate(x, null, uncontended);
+        }
+    }
+}
+----
+
+`longAccumulate` 的完整逻辑:
+
+. 当前线程未分配到 Cell, 尝试创建新 Cell 并初始化
+. Cell 槽位被占用, 尝试通过 CAS 更新
+. CAS 更新失败(`uncontended == false`), 尝试**扩容** Cell 数组(上限为 CPU 核数)
+. 扩容后通过**重新哈希(probe)** 为线程分配新的 Cell 槽位, 继续重试
+
+=== 关键方法解析
+
+==== 构造与累加
+
+[source,java]
+----
+// 初始值均为 0
+LongAdder adder = new LongAdder();
+
+// 原子地增加指定值
+adder.add(5);
+
+// 等价于 add(1)
+adder.increment();
+
+// 等价于 add(-1)
+adder.decrement();
+----
+
+==== 获取与重置
+
+[source,java]
+----
+// 读取当前总和(遍历 base + 所有 Cell)
+long sum = adder.sum();
+
+// 读取总和后重置为 0, 适用于周期性的指标采集
+long sum = adder.sumThenReset();
+----
+
+`sum()` 的遍历实现:
+
+[source,java]
+----
+public long sum() {
+    Cell[] cs = cells;
+    long sum = base;
+    if (cs != null) {
+        for (Cell c : cs) {
+            if (c != null) {
+                sum += c.value;
+            }
+        }
+    }
+    return sum;
+}
+----
+
+注意: `sum()` 在遍历过程中, 其他线程可能正在修改 Cell 的值, 因此多次调用 `sum()` 可能得到不同结果. 如果需要强一致性快照, 应使用 `synchronized` 等同步手段.
+
+==== 转换为其他类型
+
+[source,java]
+----
+// 返回 sum() 的 long 值
+long value = adder.longValue();
+
+// 返回 sum() 的 int 值(可能溢出)
+int value = adder.intValue();
+
+// 返回 sum() 的 float 值
+float value = adder.floatValue();
+
+// 返回 sum() 的 double 值
+double value = adder.doubleValue();
+----
+
+=== 与 AtomicLong 的对比
+
+|===
+|特性|AtomicLong|LongAdder
+
+|**底层机制**|单个 volatile long + CAS|base + Cell[] 分段计数
+|**低竞争性能**|优秀(单 CAS)|优秀(Cell 数组为空时退化到 CAS base)
+|**高竞争性能**|差(CAS 大量自旋失败)|优(分散到多个 Cell)
+|**内存占用**|小(1 个 long)|较大(数组 + 对象头 + 填充字节)
+|**sum() 一致性**|强一致(CAS 保证)|弱一致(遍历时可能变化)
+|**适用场景**|读多写少或低竞争|写多读少的高竞争场景
+|**适合频率**|低频更新, 高频读取|高频更新, 低频读取
+|===
+
+=== 使用示例
+
+==== 高并发请求计数器
+
+[source,java]
+----
+public class RequestCounter {
+    private final LongAdder totalRequests = new LongAdder();
+    private final LongAdder successRequests = new LongAdder();
+
+    public void recordRequest() {
+        totalRequests.increment();
+    }
+
+    public void recordSuccess() {
+        successRequests.increment();
+    }
+
+    // 周期性采集指标, 采集后重置避免累积过大
+    public RequestStat snapshotAndReset() {
+        return new RequestStat(
+            totalRequests.sumThenReset(),
+            successRequests.sumThenReset()
+        );
+    }
+
+    // 总请求数
+    public long getTotal() {
+        return totalRequests.sum();
+    }
+
+    // 成功率
+    public double successRate() {
+        long total = totalRequests.sum();
+        return total == 0 ? 0.0 :
+            (double) successRequests.sum() / total;
+    }
+}
+----
+
+==== 热点商品的浏览量统计
+
+[source,java]
+----
+public class HotProductViewCounter {
+    // 每个商品一个 LongAdder, 适合商品数量固定的场景
+    private final ConcurrentHashMap<Long, LongAdder> viewCounts
+        = new ConcurrentHashMap<>();
+
+    public void incrementView(Long productId) {
+        // computeIfAbsent 确保线程安全地创建 LongAdder
+        viewCounts.computeIfAbsent(productId,
+            k -> new LongAdder()).increment();
+    }
+
+    public long getViewCount(Long productId) {
+        LongAdder adder = viewCounts.get(productId);
+        return adder == null ? 0L : adder.sum();
+    }
+
+    // 定期将内存中的计数持久化到数据库
+    public void flushToDatabase() {
+        viewCounts.forEach((productId, adder) -> {
+            long count = adder.sumThenReset();
+            // 写入数据库...
+            System.out.printf("Product %d: +%d views%n",
+                productId, count);
+        });
+    }
+}
+----
+
+==== 性能对比实验
+
+[source,java]
+----
+public class PerformanceCompare {
+    static final int THREAD_COUNT = 8;
+    static final int ITERATIONS = 10_000_000;
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("AtomicLong: " + testAtomicLong() + " ms");
+        System.out.println("LongAdder:  " + testLongAdder() + " ms");
+    }
+
+    static long testAtomicLong() throws Exception {
+        AtomicLong counter = new AtomicLong();
+        long start = System.currentTimeMillis();
+
+        CountDownLatch latch = new CountDownLatch(THREAD_COUNT);
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            new Thread(() -> {
+                for (int j = 0; j < ITERATIONS; j++) {
+                    counter.incrementAndGet();
+                }
+                latch.countDown();
+            }).start();
+        }
+        latch.await();
+        return System.currentTimeMillis() - start;
+    }
+
+    static long testLongAdder() throws Exception {
+        LongAdder counter = new LongAdder();
+        long start = System.currentTimeMillis();
+
+        CountDownLatch latch = new CountDownLatch(THREAD_COUNT);
+        for (int i = 0; i < THREAD_COUNT; i++) {
+            new Thread(() -> {
+                for (int j = 0; j < ITERATIONS; j++) {
+                    counter.increment();
+                }
+                latch.countDown();
+            }).start();
+        }
+        latch.await();
+        return System.currentTimeMillis() - start;
+    }
+}
+----
+
+=== 注意事项
+
+==== 何时使用 LongAdder
+
+* **高竞争写操作** - 大量线程频繁更新同一个计数器
+* **低频读取** - 统计指标、监控数据等不需要实时强一致读取的场景
+* **周期性汇总** - 适合与 `sumThenReset()` 搭配的周期性聚合任务
+
+==== 何时使用 AtomicLong
+
+* **低竞争** - 少量线程操作计数器
+* **高频读取** - 需要频繁调用 `get()` 或需要强一致性的场景
+* **生成序列** - 如 ID 生成器, 需要严格单调递增的值
+
+==== LongAdder 的局限性
+
+* `sum()` 不保证强一致性, 多次调用可能得到不同值
+* 内存开销大(Cell 数组 + 缓存行填充), 不适合大量实例化
+* `intValue()` 和 `longValue()` 通过 `sum()` 实现, 同样不保证一致性
+
+=== 总结
+
+**LongAdder 的设计哲学:**
+
+. **空间换时间** - 用 Cell 数组分散竞争, 牺牲内存换取高并发下的写性能
+. **自适应策略** - 低竞争时退化为单 CAS, 高竞争时自动扩容 Cell 数组
+. **消除伪共享** - 通过 `@Contended` 注解避免缓存行竞争
+
+**核心优势:**
+
+* 高竞争场景下写性能远超 AtomicLong
+* 与 `ConcurrentHashMap` 配合实现细粒度的分布式计数
+* 提供 `sumThenReset()` 方法, 适合指标采集场景
+
+**适用场景:**
+
+* 热词统计、API 调用计数、流量监控等高频写、低频读的场景
+* 性能基准测试和系统指标收集
+
+当需要高并发下的计数器时, LongAdder 通常是比 AtomicLong 更优的选择, 但需要理解其弱一致性的特性, 避免在需要强一致读的场景下误用.

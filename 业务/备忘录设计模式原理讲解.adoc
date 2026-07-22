@@ -1,0 +1,303 @@
+== 备忘录设计模式原理讲解
+
+备忘录模式(Memento Pattern)是一种**行为型设计模式**, 用于在不破坏封装的前提下捕获并外部化一个对象的内部状态, 以便在将来某个时刻将该对象恢复到之前的状态. 当需要实现**撤销(Undo)**、**快照(Snapshot)** 或**历史记录**功能时, 备忘录模式提供了一种优雅的解决方案.
+
+=== 概念定义
+
+*发起人(Originator):: 需要保存和恢复状态的对象; 负责创建备忘录以记录当前状态, 并能从备忘录中恢复状态
+*备忘录(Memento):: 存储发起人内部状态的对象; 对外部(除发起人外)不可见, 防止状态泄露
+*管理者(Caretaker):: 负责保存和管理备忘录, 但**不能**修改备忘录内容; 管理者只关心备忘录的存储和生命周期
+
+备忘录模式的核心思想是**将状态存储与状态使用分离**: 只有发起人能够访问和操作备忘录中的状态细节, 其他对象(包括管理者)只能持有备忘录的引用而无法查看或修改其内容.
+
+=== 核心原理
+
+备忘录模式通过**三道访问边界**来保护封装性:
+
+[plantuml,"备忘录模式类图",format=png]
+----
+@startuml
+class Originator {
+  - state: String
+  + createMemento(): Memento
+  + restore(m: Memento): void
+}
+
+class Memento {
+  - state: String
+  - getState(): String
+  - setState(s: String): void
+}
+
+class Caretaker {
+  - mementos: List<Memento>
+  + add(m: Memento): void
+  + get(index: int): Memento
+}
+
+Originator --> Memento: 创建/恢复
+Caretaker --> Memento: 存储/管理
+note bottom of Memento
+  仅 Originator 可访问
+  Memento 的内部状态
+end note
+@enduml
+----
+
+核心访问规则:
+
+* 备忘录的 `getState`/`setState` 方法只能被发起人访问(在 Java 中通过**包级访问权限**或**内部类**实现)
+* 管理者只调用备忘录的公开方法(通常是空接口), 无法触及内部状态
+* 客户端只与发起人和管理者交互, 对备忘录的存在无感知
+
+[plantuml,"备忘录模式访问控制示意",format=png]
+----
+@startuml
+rectangle "Client" as Client
+rectangle "Caretaker" as Caretaker {
+  rectangle "Memento" as Memento
+}
+rectangle "Originator" as Originator
+
+Client --> Caretaker: 保存/获取备忘录
+Client --> Originator: 执行业务操作
+Originator ..> Memento: 读写内部状态(私有接口)
+Caretaker ..> Memento: 仅持有引用(公开接口)
+note right of Memento
+  公开接口: 空接口或仅 getter
+  私有接口: 状态读写方法
+end note
+@enduml
+----
+
+=== 工作流程
+
+备忘录模式的典型工作流程如下:
+
+. **业务操作** - 发起人执行某个业务操作(如编辑文本、修改配置)
+. **创建快照** - 在操作前或操作后, 发起人创建备忘录, 将当前状态存入其中
+. **存储备忘录** - 管理者接收备忘录并保存(如放入列表或栈中)
+. **触发恢复** - 当需要撤销时, 客户端请求管理者返回指定的备忘录
+. **恢复状态** - 发起人从备忘录中读取状态, 恢复到历史时刻
+
+[plantuml,"备忘录模式时序图",format=png]
+----
+@startuml
+actor Client
+participant Originator
+participant Caretaker
+
+Client -> Originator: doSomething()
+Originator -> Caretaker: createMemento()
+Caretaker --> Originator: 保存快照
+Originator --> Client: 完成
+
+...
+
+Client -> Caretaker: getMemento(index)
+Caretaker --> Client: memento
+Client -> Originator: restore(memento)
+Originator --> Client: 状态已恢复
+@enduml
+----
+
+=== 代码示例
+
+以**文本编辑器**的撤销功能为例:
+
+[source,java]
+----
+// 备忘录: 存储编辑器状态
+class EditorMemento {
+    private final String content;                          // <1>
+    private final int cursorPosition;
+
+    EditorMemento(String content, int cursorPosition) {
+        this.content = content;
+        this.cursorPosition = cursorPosition;
+    }
+
+    String getContent() {
+        return content;
+    }
+
+    int getCursorPosition() {
+        return cursorPosition;
+    }
+}
+
+// 发起人: 文本编辑器
+class Editor {
+    private String content = "";
+    private int cursorPosition = 0;
+
+    public void write(String text) {
+        content += text;
+        cursorPosition = content.length();
+    }
+
+    public void delete(int chars) {                        // <2>
+        if (chars > content.length()) {
+            chars = content.length();
+        }
+        content = content.substring(0, content.length() - chars);
+        cursorPosition = content.length();
+    }
+
+    // 创建快照
+    public EditorMemento createMemento() {
+        return new EditorMemento(content, cursorPosition);
+    }
+
+    // 恢复快照
+    public void restore(EditorMemento memento) {
+        this.content = memento.getContent();
+        this.cursorPosition = memento.getCursorPosition();
+    }
+
+    public void print() {
+        System.out.println("内容: " + content);
+        System.out.println("光标: " + cursorPosition);
+    }
+}
+
+// 管理者: 历史记录
+class History {
+    private Stack<EditorMemento> mementos = new Stack<>(); // <3>
+
+    public void push(EditorMemento memento) {
+        mementos.push(memento);
+    }
+
+    public EditorMemento pop() {
+        if (mementos.isEmpty()) {
+            throw new IllegalStateException("没有历史记录");
+        }
+        return mementos.pop();
+    }
+
+    public boolean hasHistory() {
+        return !mementos.isEmpty();
+    }
+}
+
+// 客户端使用
+public class Client {
+    public static void main(String[] args) {
+        Editor editor = new Editor();
+        History history = new History();
+
+        // 第一次编辑并保存
+        editor.write("Hello");
+        history.push(editor.createMemento());                // <4>
+        editor.print();
+
+        // 第二次编辑并保存
+        editor.write(" World");
+        history.push(editor.createMemento());
+        editor.print();
+
+        // 第三次编辑, 然后撤销
+        editor.write("!!!");
+        System.out.println("--- 已添加!!! ---");
+        editor.print();
+
+        // 撤销: 恢复到第二次编辑后的状态
+        if (history.hasHistory()) {
+            editor.restore(history.pop());                   // <5>
+        }
+        System.out.println("--- 撤销一次 ---");
+        editor.print();
+
+        // 再次撤销: 恢复到第一次编辑后的状态
+        if (history.hasHistory()) {
+            editor.restore(history.pop());
+        }
+        System.out.println("--- 再撤销一次 ---");
+        editor.print();
+    }
+}
+----
+<1> 备忘录中的状态通常设为 `final`, 保证不可变性
+<2> 发起人可以在业务方法内外创建快照
+<3> 管理者使用 `Stack` 实现"后进先出"的撤销顺序
+<4> 每次修改后保存快照
+<5> 从管理者获取备忘录并恢复到历史状态
+
+输出结果:
+
+[source,shell]
+----
+内容: Hello
+光标: 5
+内容: Hello World
+光标: 11
+--- 已添加!!! ---
+内容: Hello World!!!
+光标: 14
+--- 撤销一次 ---
+内容: Hello World
+光标: 11
+--- 再撤销一次 ---
+内容: Hello
+光标: 5
+----
+
+=== 封装性保证
+
+在 Java 中, 备忘录模式通常通过**内部类**或**包级访问权限**来保证封装性:
+
+[source,java]
+----
+class Originator {
+    private String state;
+
+    // 备忘录作为内部类, 只有 Originator 可访问其私有成员
+    private class MementoImpl implements Memento {
+        private final String snapshot;
+
+        MementoImpl(String state) {
+            this.snapshot = state;
+        }
+
+        private String getSnapshot() {
+            return snapshot;
+        }
+    }
+
+    // 公开接口暴露的是窄接口, 不包含状态访问方法
+    public Memento createMemento() {
+        return new MementoImpl(state);
+    }
+
+    public void restore(Memento memento) {
+        this.state = ((MementoImpl) memento).getSnapshot(); // <1>
+    }
+}
+
+// 窄接口: 对外部只暴露空接口, 隐藏所有状态操作
+interface Memento {}
+----
+<1> 只有 `Originator` 能强制转换并访问 `MementoImpl` 的内部状态
+
+=== 适用场景
+
+* **撤销/重做功能** - 文本编辑器、绘图工具、IDE 等需要回退操作的场景
+* **快照/归档** - 需要保存对象某个时刻的完整状态, 以便后续分析或恢复
+* **事务管理** - 数据库或业务操作中, 需要回滚到操作前的状态
+* **游戏存档** - 保存玩家进度, 允许读档继续游戏
+* **配置管理** - 保存和切换多组配置参数, 支持配置回滚
+
+=== 注意事项
+
+* **内存开销** - 频繁创建备忘录可能导致大量内存消耗; 可采用增量快照或压缩存储优化
+* **深拷贝 vs 浅拷贝** - 若发起人持有引用类型字段, 备忘录应做**深拷贝**, 否则状态可能被意外修改
+* **序列化问题** - 备忘录取代了部分序列化场景, 但跨进程状态恢复仍需序列化机制
+* **与命令模式结合** - 撤销功能常与命令模式(Command Pattern)配合使用, 各自负责不同职责: 命令记录操作, 备忘录保存状态
+
+=== 总结
+
+* 备忘录模式通过**三道访问边界**(发起人-备忘录-管理者)在保存状态的同时不破坏封装
+* 核心机制是**窄接口与宽接口分离**: 外部只能看到窄接口, 发起人通过宽接口操作状态
+* Java 中推荐使用**内部类**或**包级权限**实现访问控制
+* 使用时需注意**内存开销**和**深拷贝**问题, 避免状态泄露或意外修改

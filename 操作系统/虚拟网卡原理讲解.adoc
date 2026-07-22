@@ -1,0 +1,282 @@
+== 虚拟网卡原理讲解
+
+虚拟网卡(Virtual Network Interface Card, Virtual NIC)是纯软件实现的网络接口, 它不像物理网卡那样有真实的硬件电路, 但在操作系统看来, 它和一张真实网卡几乎没有区别. 理解虚拟网卡是掌握容器网络、虚拟机网络、云网络和 VPN 等技术的基石.
+
+=== 什么是虚拟网卡
+
+虚拟网卡:: 由操作系统或虚拟机管理器(VMM/Hypervisor)在软件层面模拟的网络接口设备. 它拥有自己的 MAC 地址和 IP 地址, 能够收发数据包, 但所有数据传输都在内存中完成, 无需经过物理硬件.
+
+物理网卡 vs 虚拟网卡:
+
+[cols="2,2,2"]
+|===
+|特性 |物理网卡 |虚拟网卡
+
+|实现方式
+|专用硬件芯片 + 电路
+|纯软件(内核模块或用户态程序)
+
+|数据传输
+|通过 PCIe 总线与 DMA
+|通过内存拷贝或共享内存
+
+|性能
+|受硬件限制, 有物理瓶颈
+|仅受 CPU 和内存带宽限制
+
+|灵活性
+|固定, 更换需硬件操作
+|可动态创建/删除, 配置灵活
+|===
+
+=== 为什么需要虚拟网卡
+
+虚拟化技术需要对网络资源做"切分"和"隔离", 物理网卡无法直接满足这些需求:
+
+* **资源切分:** 一台物理机上运行多台虚拟机或多个容器, 每台都需要独立的网络接口.
+* **网络隔离:** 不同租户或应用的流量必须互不干扰.
+* **灵活组网:** 需要在不改变物理拓扑的前提下, 创建虚拟网络拓扑(如 VPC、Overlay 网络).
+* **快速迁移:** 虚拟网卡的配置可以随虚拟机或容器一起迁移.
+
+=== 核心原理
+
+虚拟网卡的核心机制是 **将内核网络协议栈的数据包处理路径, 从物理硬件重定向到软件逻辑**.
+
+==== 在内核中的位置
+
+无论是物理网卡还是虚拟网卡, 在 Linux 内核中都用 `net_device` 结构体表示. 操作系统对它们一视同仁:
+
+. **注册机制:** 通过 `register_netdev()` 向内核注册一个 `net_device` 实例.
+. **操作函数集:** 每个 `net_device` 都挂载一组操作函数(`net_device_ops`), 如 `ndo_open`, `ndo_start_xmit`. 物理网卡指向硬件驱动函数, 虚拟网卡指向软件处理函数.
+. **内核路由:** 当 IP 路由决策后, 内核根据目标地址选择合适的 `net_device` 发送数据包. 它不关心这个设备是物理的还是虚拟的.
+
+[plantuml, "虚拟网卡在内核网络栈中的位置", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+package "用户空间" {
+  [应用程序]
+}
+
+package "内核网络协议栈" {
+  [Socket 层]
+  [传输层 TCP/UDP]
+  [网络层 IP + 路由]
+}
+
+database "路由表" as routing
+
+package "网络设备层" {
+  [物理网卡 eth0\n(real net_device_ops)]
+  [虚拟网卡 tun0\n(virtual net_device_ops)]
+  [虚拟网卡 docker0\n(virtual net_device_ops)]
+}
+
+[应用程序] --> [Socket 层] : 系统调用
+[Socket 层] --> [传输层 TCP/UDP]
+[传输层 TCP/UDP] --> [网络层 IP + 路由]
+[网络层 IP + 路由] --> routing : 查询路由
+routing --> [物理网卡 eth0\n(real net_device_ops)] : 物理路径
+routing --> [虚拟网卡 tun0\n(virtual net_device_ops)] : 虚拟路径
+routing --> [虚拟网卡 docker0\n(virtual net_device_ops)] : 虚拟路径
+
+@enduml
+----
+
+==== 数据包收发路径
+
+**发送路径:**
+
+. 应用程序通过 `send()` 将数据写入 socket.
+. 数据经 TCP/IP 协议栈处理后到达网络层.
+. 内核查询路由表, 确定目标设备为某虚拟网卡.
+. 内核调用该虚拟网卡的 `ndo_start_xmit` 函数.
+. 该函数将 SKB 数据包传递给另一端(如桥接设备、用户态程序、veth 对端), 整个过程在内存中完成.
+
+**接收路径:**
+
+. 某外部来源(如桥接设备、veth 对端、用户态程序)将数据包写入虚拟网卡.
+. 唤醒虚拟网卡的接收处理逻辑, 构造 SKB.
+. 触发软中断或类似机制, 将 SKB 送入内核网络协议栈.
+. 协议栈处理完毕后传递给上层应用程序.
+
+=== 常见的虚拟网卡类型
+
+不同的虚拟化场景催生了多种虚拟网卡实现, 各有侧重.
+
+==== TUN/TAP 设备
+
+TUN/TAP:: Linux 内核提供的一对虚拟网络设备, 用于连接**内核协议栈**和**用户空间程序**.
+
+* **TUN (tunnel):** 工作在网络层(L3), 处理 IP 数据包, 常用于 VPN 隧道.
+* **TAP:** 工作在链路层(L2), 处理以太网帧, 常用于虚拟机网桥.
+
+[source,c]
+----
+struct tun_struct {
+    struct net_device *dev;        // 关联的网络设备
+    struct socket *socket;         // 对端用户态 socket
+    struct file *file;             // 关联的设备文件 (/dev/net/tun)
+};
+----
+
+用户态程序通过 `/dev/net/tun` 字符设备读写数据包:
+
+[source,shell]
+----
+# 创建一个 TUN 设备
+ip tuntap add dev mytun mode tun
+ip addr add 10.0.0.1/24 dev mytun
+ip link set mytun up
+----
+
+**典型用途:** OpenVPN, OpenSSH 的 tun 模式, WireGuard.
+
+==== veth 设备对
+
+veth (Virtual Ethernet):: 一对"网线"式的虚拟设备, 总是成对出现. 一端发送的数据直接由内核交付给另一端.
+
+[source,shell]
+----
+# 创建一对 veth
+ip link add veth0 type veth peer name veth1
+
+# 将一端放入容器网络命名空间
+ip link set veth1 netns container1
+ip addr add 172.17.0.2/24 dev veth0
+ip link set veth0 up
+----
+
+**典型用途:** Docker/Kubernetes 中连接宿主机和容器网络的"虚拟网线".
+
+==== Linux Bridge
+
+Linux Bridge:: 软件实现的虚拟交换机, 将多个网络设备(物理网卡或虚拟网卡)桥接在一起, 转发二层以太网帧.
+
+[source,shell]
+----
+# 创建网桥并添加设备
+ip link add name br0 type bridge
+ip link set dev eth0 master br0
+ip link set dev veth0 master br0
+ip link set br0 up
+----
+
+**典型用途:** 虚拟机网络(KVM/QEMU 的默认网桥), Docker 默认网络模式.
+
+==== Bridge 与 veth 组合的完整流程
+
+下面以 Docker 容器访问外网为例, 展示虚拟网卡是如何协同工作的:
+
+[plantuml, "Docker 容器网络数据流", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+actor "容器 A\neth0@10.0.0.2" as container
+participant "veth pair\ndocker-eth0 <-> eth0" as veth
+participant "docker0\n(Linux Bridge)" as bridge
+participant "物理网卡\neth0" as phys
+actor "互联网" as internet
+
+container -> veth: 数据包从容器 eth0 发出
+veth -> bridge: 数据从 veth 端到达 docker0 网桥
+bridge -> bridge: 查询 MAC 地址表, 决定转发端口
+bridge -> phys: 转发到物理网卡(如果目标在外网)
+phys -> internet: 经 NAT 后发往外网
+internet -> phys: 响应数据包到达
+phys -> bridge: 数据包到达网桥
+bridge -> veth: 根据 MAC 表找到对应 veth 口
+veth -> container: 数据到达容器
+
+@enduml
+----
+
+==== 多队列虚拟网卡 (virtio-net)
+
+virtio-net:: 半虚拟化 I/O 框架下的虚拟网卡规范, 用于虚拟机与宿主机之间高效传输网络数据.
+
+传统虚拟网卡通过完全模拟硬件来工作, 每次 I/O 都需要陷入 Hypervisor, 性能较差. virtio-net 通过以下设计大幅提升性能:
+
+. **共享环形缓冲区(virtqueue):** 虚拟机和宿主机共享一段内存, 使用环形队列传递数据包描述符, 减少 VM-Exit 次数.
+. **多队列支持:** 每个 vCPU 可拥有独立的发送/接收队列, 实现并行处理.
+. **Offload 卸载:** 支持 TSO, GSO, GRO 等硬件卸载功能, 减少协议栈处理开销.
+
+[source,shell]
+----
+# 查看虚拟机中 virtio-net 设备
+ethtool -i eth0
+# driver: virtio_net
+# version: 1.0
+# bus-info: virtio0
+----
+
+**典型用途:** KVM/QEMU 虚拟机的默认高性能网卡.
+
+=== VPN 中的虚拟网卡
+
+VPN 是虚拟网卡的典型应用场景. 以 WireGuard 为例:
+
+. 操作系统创建一个 TUN 虚拟网卡(如 `wg0`).
+. 配置路由: 目标为远端内网的流量, 路由到 `wg0`.
+. WireGuard 用户态进程从 `/dev/net/tun` 读取 IP 数据包.
+. WireGuard 加密数据包并通过物理网卡发往 VPN 服务器.
+. 对端解密后写入本地 TUN 设备, 送入内核网络栈.
+
+[plantuml, "VPN 隧道中的数据流", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+participant "应用进程" as app
+participant "内核协议栈" as kernel
+participant "TUN 设备\n(wg0)" as tun
+participant "WireGuard\n用户态进程" as wg
+participant "物理网卡\n(eth0)" as phys
+participant "VPN 服务器" as server
+
+app -> kernel: 发送数据包\n目标: 10.0.0.2
+kernel -> kernel: 查询路由\n下一跳指向 wg0
+kernel -> tun: 写入 IP 数据包
+tun -> wg: 用户态读取 /dev/net/tun
+wg -> wg: 加密数据包\n封装为 UDP
+wg -> phys: 通过 UDP 发送
+phys -> server: 加密隧道数据
+server -> server: 解密, 转发
+server -> ...: 到达目标内网
+
+@enduml
+----
+
+=== 性能考量
+
+虚拟网卡虽然灵活, 但数据包需要额外经过软件路径, 存在性能开销:
+
+[cols="3*"]
+|===
+|开销来源 |原因 |优化方案
+
+|上下文切换
+|用户态与内核态间切换(如 TUN/TAP)
+|使用 AF_XDP, DPDK 等旁路技术
+
+|内存拷贝
+|数据包在内核与用户空间间拷贝
+|零拷贝技术(virtio, vhost)
+
+|中断处理
+|虚拟设备触发软中断
+|NAPI 轮询, 多队列分发
+
+|锁竞争
+|多核同步访问共享队列
+|每个 vCPU 独立队列(virtio-net)
+|===
+
+=== 总结
+
+* **虚拟网卡** 是操作系统层面模拟的网络接口, 让软件进程、虚拟机、容器拥有独立的网络能力.
+* 其核心原理是将内核网络协议栈的数据路径从物理硬件重定向到软件逻辑, 通过标准的 `net_device` 接口与内核交互.
+* 不同的虚拟网卡类型服务于不同场景: **TUN/TAP** 用于 VPN, **veth** 用于容器网络, **Bridge** 用于二层交换, **virtio-net** 用于高性能虚拟机网络.
+* 虚拟网卡是现代云原生基础设施的基石, 从 Docker 容器到 Kubernetes 集群, 从云虚拟网络到 VPN 隧道, 背后都是虚拟网卡在发挥作用.

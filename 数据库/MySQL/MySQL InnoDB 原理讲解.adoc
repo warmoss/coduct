@@ -1,0 +1,78 @@
+== MySQL InnoDB 原理讲解
+
+=== 体系架构
+
+InnoDB 的架构主要分为内存结构和磁盘结构两大部分:
+
+内存结构::
+
+* **Buffer Pool(缓冲池):** 数据页的缓存区域
+
+* **Change Buffer(变更缓冲区):** 非唯一索引的变更缓存
+
+* **Adaptive Hash Index(自适应哈希索引):** 自动建立的哈希索引
+
+* **Log Buffer(日志缓冲区):** redo log 的缓冲区
+
+磁盘结构::
+
+* **表空间:** 包括系统表空间、独立表空间等
+
+* **数据文件:** .ibd 文件存储数据和索引
+
+* **日志文件:** redo log 文件
+
+=== 事务与 ACID 特性
+
+==== 原子性(Atomicity)
+
+通过 Undo Log 实现:
+
+[source, sql]
+----
+-- 事务执行过程
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+-- 如果失败, 使用 Undo Log 回滚
+COMMIT;
+----
+
+==== 持久性(Durability)
+
+通过 Redo Log 实现:
+
+[source, sql]
+----
+-- 数据修改流程
+1. 数据页加载到 Buffer Pool
+2. 修改数据页(脏页)
+3. 写入 Redo Log(保证持久性)
+4. 定期刷脏页到磁盘
+----
+
+==== 隔离性(Isolation)
+
+通过 **锁机制** 和 **MVCC** 实现.
+
+=== 锁机制
+
+行级锁类型::
+
+[source, sql]
+----
+-- 共享锁(S Lock)
+SELECT * FROM table WHERE id = 1 LOCK IN SHARE MODE;
+
+-- 排他锁(X Lock)  
+SELECT * FROM table WHERE id = 1 FOR UPDATE;
+UPDATE table SET column = value WHERE id = 1;
+----
+
+锁的算法::
+
+* **Record Lock:** 记录锁, 锁定单行
+
+* **Gap Lock:** 间隙锁, 锁定范围
+
+* **Next-Key Lock:** 记录锁+间隙锁, 解决幻读

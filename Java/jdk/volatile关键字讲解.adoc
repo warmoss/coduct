@@ -1,0 +1,221 @@
+== volatile关键字讲解
+
+=== 核心概念: 什么是 volatile?
+**volatile** 是一个关键字, 用于修饰变量. 它的主要作用是**确保变量的可见性和禁止指令重排序**, 但它**不保证原子性**.
+
+你可以把它理解为一个轻量级的 synchronized, 它在某些场景下比 synchronized 开销更小, 但能力也更有限.
+
+=== 它要解决什么问题? (JMM 背景)
+要理解 volatile, 必须先了解 Java 内存模型(JMM). JMM 规定了线程如何以及何时可以看到其他线程修改过的共享变量, 以及如何同步地访问共享变量.
+
+在没有同步的情况下, 可能会出现两种问题:
+
+==== 可见性问题
+
+**问题描述:** 在多核 CPU 环境下, 每个线程都有自己的工作内存(缓存), 线程操作变量时, 通常先从主内存拷贝到工作内存, 操作后再刷新回主内存. 如果一个线程修改了共享变量的值, 但另一个线程看不到这个修改, 这就产生了**可见性**问题.
+
+**例子:**
+
+[source, java, linenums]
+----
+public class VisibilityProblem {
+    private static /*volatile*/ boolean flag = true; // 没有 volatile
+
+    public static void main(String[] args) throws InterruptedException {
+        new Thread(() -> {
+            while (flag) { // 线程1可能永远看不到主线程将flag改为false
+                // 循环体
+            }
+            System.out.println("Thread 1 finished.");
+        }).start();
+
+        Thread.sleep(1000); // 等待线程1启动并运行
+        flag = false; // 主线程修改flag
+        System.out.println("Main thread set flag to false.");
+    }
+}
+----
+
+在上面的例子中, 你很可能会发现程序无法终止. 因为线程1一直从自己的**工作内存**中读取 flag 的值(一直是 true), 它"看不到"主线程已经将主内存中的 flag 改为了 false.
+
+**使用 volatile 的解决方案:**
+
+[source, java, linenums]
+----
+private static volatile boolean flag = true; // 添加 volatile
+----
+
+当变量被 volatile 修饰后:
+
+. 当**写**一个 volatile 变量时, JMM 会立即将该线程工作内存中的新值**强制刷新到主内存**中.
+
+. 当**读**一个 volatile 变量时, JMM 会使该线程工作内存中的缓存失效, 从而**强制从主内存中重新读取**该变量的最新值.
+
+这就保证了, 一个线程对 volatile 变量的修改, 对其他所有线程都是**立即可见**的.
+
+==== 指令重排序问题
+**问题描述:** 为了优化性能, 编译器和处理器常常会对指令进行重排序. 在单线程环境下, 这不会影响最终结果. 但在多线程环境下, 可能会导致意想不到的问题.
+
+**经典例子: 双重检查锁定(DCL)的单例模式**
+
+[source, java, linenums]
+----
+public class Singleton {
+    private static Singleton instance; // 没有 volatile, 旧版DCL有问题
+
+    public static Singleton getInstance() {
+        if (instance == null) { // 第一次检查
+            synchronized (Singleton.class) {
+                if (instance == null) { // 第二次检查
+                    instance = new Singleton(); // 问题所在!
+                }
+            }
+        }
+        return instance;
+    }
+}
+----
+
+**instance = new Singleton();** 这行代码在 JVM 中并不是一个原子操作, 它大致分为三步:
+
+. 为 Singleton 对象分配内存空间.
+
+. 初始化 Singleton 对象(调用构造函数等).
+
+. 将 instance 引用指向这块内存地址.
+
+如果步骤 2 和 3 被**重排序**, 那么可能发生:
+
+. 线程 A 执行到 **instance = new Singleton();**, JVM 先分配了内存, 并让 instance 指向了这块内存(但对象还未初始化).
+
+. 此时线程 B 进入 **getInstance()**, 进行第一次检查 if (instance == null), 发现 instance 不为 null(但它指向的是一个未初始化的对象! ), 于是直接返回了这个不完整的 instance 并使用, 导致程序出错.
+
+**使用 volatile 的解决方案:**
+
+[source, java, linenums]
+----
+public class Singleton {
+    private static volatile Singleton instance; // 添加 volatile
+
+    public static Singleton getInstance() {
+        if (instance == null) {
+            synchronized (Singleton.class) {
+                if (instance == null) {
+                    instance = new Singleton();
+                }
+            }
+        }
+        return instance;
+    }
+}
+----
+
+volatile 关键字通过插入**内存屏障**来禁止 JVM 和处理器对指令进行重排序. 它确保了 **instance = new Singleton();** 这行代码之前的指令不会被排到它之后, 之后的指令也不会被排到它之前. 这样就保证了对象的初始化一定在 instance 引用指向内存地址之前完成, 从而解决了 DCL 问题.
+
+=== volatile 的局限性: 不保证原子性
+这是 volatile 最容易让人误解的地方. 它不能用于保证复合操作的原子性.
+
+**例子:**
+
+[source, java, linenums]
+----
+public class AtomicityProblem {
+    private static volatile int count = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 10000; i++) {
+                count++; // 这不是一个原子操作
+            }
+        });
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 10000; i++) {
+                count++; // 这不是一个原子操作
+            }
+        });
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Final count: " + count); // 结果很可能小于 20000
+    }
+}
+----
+
+`count++` 看上去是一行代码, 但实际上它包含了三个步骤:
+
+. 从主内存读取 `count` 的当前值到工作内存.
+
+. 在工作内存中给 `count` 加 `1`.
+
+. 将新的 `count` 值写回主内存.
+
+即使 `count` 是 `volatile` 的, 两个线程仍然可能**交错执行**这三个步骤. 例如:
+
+. 线程 A 读取 `count=0`.
+
+. 线程 B 也读取 `count=0`.
+
+. 线程 A 执行 `0+1=1`, 并写回 `count=1`.
+
+. 线程 B 执行 `0+1=1`, 并写回 `count=1`.
+
+最终结果变成了 1, 而不是预期的 2. `volatile` 只保证了它们读取和写入时值的可见性, 但无法阻止整个"读-改-写"操作序列被中断.
+
+**保证原子性的解决方案:**
+
+* 使用 `synchronized` 关键字.
+
+* 使用 `java.util.concurrent.atomic` 包下的原子类, 如 `AtomicInteger`.
+
+[source, java, linenums]
+----
+private static AtomicInteger count = new AtomicInteger(0);
+// ...
+count.incrementAndGet(); // 原子性的自增
+----
+
+=== 总结: volatile 的使用场景
+你应该在以下场景中使用 `volatile`:
+
+* **状态标志:** 作为一个布尔状态标志, 用于完成某个重要操作或请求优雅停止. 就像我们最初的 `flag` 例子.
+
+* **一次性安全发布:** 在 DCL 单例模式中, 确保对象的引用在被完全构造之后才对其他线程可见.
+
+* **独立观察:** 定期"发布"观察结果供程序其他部分使用. 例如, 一个线程收集 metrics, 另一个线程读取它. 因为 `volatile` 保证了可见性.
+
+* **"读-写锁"的轻量级形式:** 当读远多于写时, 你可以结合使用 `volatile` 读和 `synchronized` 写. `volatile` 保证写的可见性, `synchronized` 保证写的原子性.
+
+=== volatile 与 synchronized 的对比
+
+[cols="1,4,4"]
+|===
+|特性|volatile|synchronized
+
+|**本质**
+|变量修饰符
+|方法或代码块修饰符
+
+|**可见性**
+|**保证**
+|**保证**
+
+|**原子性**
+|**不保证**(对单个读/写是原子的, 但复合操作不是)
+|**保证**(互斥锁)
+
+|**有序性**
+|**保证**(禁止指令重排序)
+|**保证**(一个线程 unlock 前发生的操作, 对另一个线程 lock 后可见)
+
+|**阻塞**
+|不会造成线程阻塞
+|可能会造成线程阻塞
+
+|**性能**
+|轻量级, 开销小
+|重量级, 开销相对大
+
+|===

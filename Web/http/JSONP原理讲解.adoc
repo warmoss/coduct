@@ -1,0 +1,171 @@
+== JSONP原理讲解
+
+=== 什么是 JSONP?
+
+**JSONP(JSON with Padding)** 是一种利用 `<script>` 标签绕过浏览器同源策略, 实现跨域数据请求的非标准方案. 在 CORS 成为官方标准之前, JSONP 是前端跨域请求的主要手段.
+
+关于同源策略的详细说明, 可参考 <<cors原理讲解.adoc, CORS 原理讲解>>.
+
+JSONP 的核心思想是: 浏览器对 `<script>` 标签的 `src` 属性发起的请求不做同源检查, 且服务端返回的 JavaScript 代码会被浏览器直接执行. 利用这一特性, 将数据"填充"(padding)到回调函数中返回, 从而实现跨域数据传输.
+
+=== JSONP 的工作原理
+
+JSONP 的工作流程分为三个角色配合完成:
+
+. **客户端:** 动态创建一个 `<script>` 标签, 其 `src` 指向目标跨域 URL, 并在 URL 中携带一个回调函数名参数(通常名为 `callback` 或 `jsonp`)
+. **服务端:** 接收请求后, 将数据作为参数传入回调函数, 返回一段可执行的 JavaScript 代码
+. **浏览器:** 将服务端返回的代码当作普通 `<script>` 标签内容执行, 触发预先定义的回调函数, 从而获取跨域数据
+
+[plantuml, "JSONP 工作流程", format=png]
+----
+@startuml
+actor 浏览器
+participant 服务端
+
+浏览器 -> 浏览器: 动态创建 script 标签\nsrc = https://api.example.com/data?callback=handleData
+浏览器 -> 服务端: GET /data?callback=handleData
+服务端 --> 浏览器: handleData({"name": "Alice", "age": 30})
+note right of 浏览器: 浏览器执行返回的 JS 代码\n调用 handleData 函数
+浏览器 -> 浏览器: handleData() 处理数据
+@enduml
+----
+
+=== 客户端实现
+
+以下是一个完整的 JSONP 客户端示例:
+
+[source, javascript]
+----
+function jsonp(url, callbackName, callback) {
+    // 将回调函数挂载到全局对象上
+    window[callbackName] = function(data) {
+        callback(data);
+        // 请求完成后清理 script 标签和全局函数
+        document.body.removeChild(script);
+        delete window[callbackName];
+    };
+
+    // 动态创建 script 标签
+    var script = document.createElement('script');
+    script.src = url + '?callback=' + callbackName;
+    document.body.appendChild(script);
+}
+
+// 使用示例
+jsonp('https://api.example.com/user', 'handleData', function(data) {
+    console.log('收到数据:', data);
+});
+----
+
+**关键说明:**
+
+* 回调函数必须挂载在全局对象(`window`)上, 因为服务端返回的代码在全局作用域执行
+* 请求完成后应及时清理 `script` 标签和全局回调函数, 避免内存泄漏和命名冲突
+* URL 中携带的回调函数名需要与服务端约定一致(常见参数名有 `callback`、`jsonp`、`jsonpcallback` 等)
+
+=== 服务端实现
+
+==== Node.js 示例
+
+[source, javascript]
+----
+var http = require('http');
+var url = require('url');
+
+http.createServer(function(req, res) {
+    var query = url.parse(req.url, true).query;
+    var callbackName = query.callback;  // 获取回调函数名
+
+    var data = { name: 'Alice', age: 30 };
+
+    res.writeHead(200, { 'Content-Type': 'application/javascript' });
+    // 返回格式: callbackName(json数据)
+    res.end(callbackName + '(' + JSON.stringify(data) + ')');
+}).listen(3000);
+----
+
+==== Java Servlet 示例
+
+[source, java]
+----
+@WebServlet("/api/user")
+public class UserServlet extends HttpServlet {
+    @Override
+    protected void doGet(HttpServletRequest req, HttpServletResponse resp)
+            throws IOException {
+        String callback = req.getParameter("callback");
+        String json = "{\"name\":\"Alice\",\"age\":30}";
+
+        resp.setContentType("application/javascript");
+        PrintWriter out = resp.getWriter();
+        out.print(callback + "(" + json + ")");
+    }
+}
+----
+
+服务端返回的 `Content-Type` 应为 `application/javascript`(而非 `application/json`), 因为返回的内容本质是 JavaScript 代码而非纯 JSON 数据.
+
+=== JSONP 与 CORS 对比
+
+JSONP 和 CORS 都用于解决跨域问题, 但各有适用场景:
+
+|===
+| 特性 | JSONP | CORS
+
+| 请求方法
+| 仅支持 `GET`
+| 支持所有 HTTP 方法(GET, POST, PUT, DELETE 等)
+
+| 浏览器兼容性
+| IE 6+ 全兼容
+| IE 10+ 现代浏览器
+
+| 数据格式
+| 仅支持 JSON
+| 任意格式(JSON, XML, 二进制等)
+
+| 错误处理
+| 无法捕获 HTTP 状态码错误(如 404, 500)
+| 可通过 HTTP 状态码精确判断
+
+| 安全性
+| 依赖服务端配合, 存在 XSS 风险
+| 基于 HTTP 头的标准机制, 更可控
+
+| 请求头定制
+| 无法设置自定义请求头
+| 支持自定义请求头
+
+| 实现复杂度
+| 简单, 纯前端可实现
+| 需要服务端配置 CORS 头
+|===
+
+=== JSONP 的安全风险
+
+JSONP 虽然实现简单, 但存在以下安全风险:
+
+* **回调函数劫持:** 如果服务端未做来源验证, 任意网站都可以构造 `<script>` 标签引用你的 JSONP 接口, 获取用户数据. 解决方案是通过 `Referer` 头或自定义 Token 验证请求来源.
+
+* **XSS 漏洞:** 如果服务端未对回调函数名做严格校验, 攻击者可注入恶意代码. 回调函数名应仅允许字母、数字和下划线. 更多 XSS 相关内容可参考 <<XSS攻击讲解.adoc, XSS 攻击讲解>>.
+
+* **CSRF 风险:** JSONP 请求天然携带 Cookie, 如果接口有副作用操作(如修改数据), 可能被 CSRF 攻击利用.
+
+**安全最佳实践:**
+
+. 对回调函数名做严格校验(仅允许 `[a-zA-Z0-9_.]`)
+. 验证请求来源(检查 `Referer` 头或使用一次性 Token)
+. JSONP 接口仅用于读取数据(`GET` 请求), **禁止**用于修改数据的操作
+. 在可能的情况下优先使用 CORS 替代 JSONP
+
+=== 总结
+
+JSONP 是 Web 发展早期解决跨域问题的一种巧妙方案, 它利用 `<script>` 标签不受同源策略限制的特性, 通过"填充"回调函数的方式实现了跨域数据传输.
+
+**核心要点回顾:**
+
+* **原理:** 利用 `<script>` 标签跨域加载并执行 JavaScript 代码的特性
+* **适用场景:** 仅需 `GET` 请求读取跨域数据的场景, 或需要兼容老旧浏览器(IE 10 以下)
+* **局限性:** 仅支持 GET 方法、无法错误处理、存在安全风险
+* **现代替代方案:** 优先使用 CORS, 它更安全、更灵活、功能更强大
+* **安全提醒:** 务必校验回调函数名, 验证请求来源, 避免在 JSONP 接口中执行写操作

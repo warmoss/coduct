@@ -1,0 +1,321 @@
+== 区块链原理讲解
+
+**区块链**(Blockchain)是一种**去中心化**的分布式账本技术, 由中本聪(Satoshi Nakamoto)在 2008 年比特币白皮书中首次提出. 其核心思想是: 将数据以**区块**(Block)为单位, 通过**密码学哈希**链接成链, 由**共识机制**保证网络中各节点的数据一致性, 从而实现无需可信第三方的可信数据存储与交换.
+
+区块链的颠覆性在于它解决了**拜占庭将军问题**(Byzantine Generals Problem) -- 在分布式系统中, 如何在存在不可信节点的情况下达成共识. 它让互不信任的参与者可以在一个公开网络上协作, 而无需依赖银行, 政府或公证人等中心化机构.
+
+=== 核心概念
+
+区块(Block):: **数据存储的基本单元**, 包含区块头和区块体. 区块头存储元数据(前序哈希、时间戳、Merkle 根等), 区块体存储交易列表. 每个区块通过前序哈希引用上一个区块, 形成链式结构
+
+链(Chain):: 区块之间通过哈希指针连接形成的**有序数据结构**. 从创世区块(Genesis Block)到最新区块, 链上数据不可篡改 -- 修改任一区块的数据会导致其后所有区块的哈希失效
+
+节点(Node):: 运行区块链协议软件的**计算机**, 是网络的参与者. 全节点(Full Node)保存完整的区块链数据; 轻节点(Light Node)仅保存区块头
+
+交易(Transaction):: 区块链上的**状态变更操作**, 如转账、合约调用. 交易由发送方签名后广播到网络, 经矿工或验证者打包入区块
+
+共识机制(Consensus Mechanism):: 网络中所有节点就**区块内容达成一致**的算法. 常见的共识机制有工作量证明(PoW)、权益证明(PoS)、委托权益证明(DPoS)等
+
+[[merkle-tree]]
+Merkle 树(Merkle Tree):: 一种**二叉哈希树**, 用于高效验证大量数据中某个元素是否存在. 叶子节点是交易哈希, 非叶子节点是其子节点哈希的拼接哈希, 根节点(Merkle Root)存储在区块头中. 轻节点只需获取 Merkle 证明(Merkle Proof)即可验证某笔交易是否在区块中, 而无需下载整个区块
+
+[plantuml, "Merkle 树结构", format=png]
+----
+@startuml
+!define round circle
+!define dot node
+
+skinparam backgroundColor transparent
+skinparam rectangle {
+    BackgroundColor lightgreen
+    BorderColor darkgreen
+}
+
+rectangle "Merkle Root\nHash(AB+CD)" as root
+rectangle "Hash AB\nHash(A+B)" as h1
+rectangle "Hash CD\nHash(C+D)" as h2
+rectangle "Tx A" as txa
+rectangle "Tx B" as txb
+rectangle "Tx C" as txc
+rectangle "Tx D" as txd
+
+root --> h1
+root --> h2
+h1 --> txa
+h1 --> txb
+h2 --> txc
+h2 --> txd
+@enduml
+----
+
+=== 核心原理
+
+==== 密码学哈希
+
+区块链的安全性建立在**哈希函数**的三大特性之上:
+
+* **抗原像性(Preimage Resistance)**: 给定 `stem:[y]`, 无法找到 `stem:[x]` 使得 `stem:[H(x) = y]` -- 这意味着只能从区块数据计算哈希, 无法从哈希反推数据
+* **抗第二原像性(Second Preimage Resistance)**: 给定 `stem:[x]`, 无法找到 `stem:[x' \neq x]` 使得 `stem:[H(x') = H(x)]` -- 确保每个区块唯一对应其哈希值
+* **抗碰撞性(Collision Resistance)**: 无法找到任意两个不同的 `stem:[x]` 和 `stem:[y]` 使得 `stem:[H(x) = H(y)]` -- 杜绝数据篡改
+
+比特币使用 **SHA-256** 算法, 输出 256 位(32 字节)的哈希值. 每个区块的哈希作为唯一标识, 并嵌入下一个区块的头部, 形成**链式不可篡改结构**.
+
+==== 链式结构
+
+区块通过哈希指针链接, 这是区块链"不可篡改"的根本保证:
+
+[plantuml, "区块链链式结构", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+skinparam rectangle {
+    BackgroundColor lightblue
+    BorderColor blue
+}
+
+rectangle "区块 N-1\nPrev: 0000...0000\nHash: 0x7A...B2" as b1
+rectangle "区块 N\nPrev: 0x7A...B2\nHash: 0x3C...D9" as b2
+rectangle "区块 N+1\nPrev: 0x3C...D9\nHash: 0xE5...F1" as b3
+
+b1 --> b2 : "前序哈希"
+b2 --> b3 : "前序哈希"
+
+note bottom of b1 : 创世区块
+note bottom of b2 : 常规区块
+note bottom of b3 : 最新区块
+@enduml
+----
+
+每一区块包含以下字段:
+
+[cols="2*"]
+|===
+| 字段 | 说明
+
+| `prev_block_hash` | 前一个区块的哈希值, 构成链式结构
+| `merkle_root` | 区块中所有交易的 Merkle 树根哈希
+| `timestamp` | 区块创建时间(Unix 时间戳)
+| `nonce` | 工作量证明中使用的随机数
+| `difficulty_target` | 难度目标值, 控制出块速度
+| `transactions` | 交易列表
+|===
+
+==== 非对称加密与数字签名
+
+区块链使用**非对称加密**(如 ECDSA, EdDSA)实现身份认证和交易授权:
+
+* 用户生成一对密钥: **私钥**(private key) 和 **公钥**(public key)
+* 私钥由用户秘密保管, 公钥公开作为**地址**(Address)的生成依据
+* 交易由私钥**签名**, 任何人可用公钥**验证**签名, 确认交易由私钥持有者发起且未被篡改
+
+比特币使用 **secp256k1** 椭圆曲线, 生成 33 字节压缩公钥和 20 字节地址.
+
+[source,sql]
+----
+-- 交易验证逻辑示意
+-- 每个交易输入包含: 前序交易哈希 + 输出索引 + 解锁脚本(ScriptSig)
+-- 每个交易输出包含: 金额 + 锁定脚本(ScriptPubKey)
+
+验证过程:
+  1. 获取前序交易输出中的锁定脚本
+  2. 将解锁脚本和锁定脚本拼接执行
+  3. 验证签名是否匹配公钥和交易数据
+  4. 验证解锁脚本是否满足锁定脚本的条件
+----
+
+=== 工作流程
+
+一笔交易从发起到最终确认的完整流程:
+
+. **交易创建**: 用户使用钱包客户端创建交易, 指定收款人地址、金额, 并用自己的私钥对交易签名
+. **交易广播**: 签名后的交易广播到 P2P 网络, 每个节点验证签名和 UTXO 有效性后转发给邻居节点
+. **交易打包**: 矿工或验证者从交易内存池(Mempool)中选择交易, 打包成候选区块
+. **共识达成**: 通过共识机制(如 PoW 挖矿)为候选区块寻找有效 nonce, 使区块哈希满足难度目标
+. **区块广播**: 找到有效区块后广播到全网, 其他节点验证后将其追加到本地链
+. **交易确认**: 新区块被全网接受, 交易获得第一个确认; 后续区块继续追加时确认数递增
+
+[plantuml, "交易全流程", format=png]
+----
+@startuml
+actor "发送方" as sender
+participant "钱包" as wallet
+participant "节点 A" as nodeA
+database "Mempool" as mempool
+participant "矿工" as miner
+participant "节点 B" as nodeB
+participant "区块链" as chain
+
+sender -> wallet: 发起转账
+wallet -> nodeA: 广播签名交易
+nodeA -> mempool: 验证并加入内存池
+nodeA -> miner: 转发交易
+miner -> mempool: 从内存池选取交易
+miner -> miner: 执行 PoW 挖矿
+miner -> nodeB: 广播新块
+nodeB -> chain: 验证并追加到链
+nodeB -> wallet: 通知交易确认
+@enduml
+----
+
+=== 共识机制
+
+==== 工作量证明 (Proof of Work, PoW)
+
+PoW 是比特币和早期以太坊使用的共识机制. 矿工通过**暴力搜索 nonce** 使区块哈希满足难度目标:
+
+* 哈希条件: `stem:[H(block\_header) < 2^{256 - bits}]`, 其中 `stem:[bits]` 是难度值
+* 难度自动调整: 每 2016 个区块(约 2 周)重新计算, 使出块时间稳定在 10 分钟
+* 最长链原则: 节点始终选择**累计工作量最大**的链作为有效链
+
+[source,text]
+----
+PoW 挖矿过程 (伪代码):
+  while True:
+    nonce = random()
+    hash = SHA256(SHA256(block_header + nonce))
+    if hash < target:
+      broadcast_block(block_header + nonce)
+      break
+----
+
+PoW 的优点: 安全性极高, 攻击者需掌控 >51% 算力才能篡改链. 缺点: 能源消耗巨大, 出块速度慢.
+
+==== 权益证明 (Proof of Stake, PoS)
+
+PoS 是以太坊 2.0 采用的共识机制. 验证者(Va1idator)按持有的**质押代币数量**和**持有时间**被选为出块者:
+
+* 质押门槛: 需锁定一定数量代币成为验证者(以太坊要求 32 ETH)
+* 随机选择: 基于伪随机算法选择验证者, 权重正比于质押量
+* 惩罚机制: 作恶或离线会被**罚没**(Slashing), 扣除部分质押
+
+[cols="2,2,3"]
+|===
+| 特性 | PoW | PoS
+
+| 能源消耗 | 极高 | 极低
+| 安全性 | 51% 算力攻击 | 51% 质押攻击
+| 出块速度 | 慢(比特币 10 分钟) | 快(以太坊 12 秒)
+| 硬件要求 | 专用矿机(ASIC) | 普通计算机
+| 去中心化程度 | 矿池集中化风险 | 质押集中化风险
+| 经济模型 | 区块奖励 + 手续费 | 区块奖励 + 手续费 + 罚没
+|===
+
+==== 其他共识机制
+
+委托权益证明(DPoS):: 代币持有者**投票**选举少量代表(如 21 个)负责出块, 效率更高但更中心化. 代表若表现不佳会被投票替换. 代表: EOS, TRON
+
+实用拜占庭容错(PBFT):: **许可链**(Permissioned Blockchain)常用的共识算法, 通过多轮投票在有限节点间达成共识. 容忍不超过 `stem:[f = (n-1)/3]` 个拜占庭节点. 代表: Hyperledger Fabric
+
+权威证明(PoA):: 由预选的**可信验证者**轮流出块, 适合企业级联盟链场景. 代表: VeChain
+
+=== 区块链类型
+
+[cols="1,2,2,2"]
+|===
+| 特性 | 公有链 | 联盟链 | 私有链
+
+| 参与权限 | 任何人 | 授权成员 | 单一组织
+| 共识节点 | 全部节点 | 选定节点 | 组织内节点
+| 交易速度 | 慢 | 快 | 最快
+| 去中心化 | 高 | 中 | 低
+| 典型代表 | Bitcoin, Ethereum | Hyperledger, R3 | 企业内部链
+|===
+
+=== 智能合约
+
+**智能合约**(Smart Contract)是部署在区块链上的**可自动执行的程序代码**, 由 Nick Szabo 在 1994 年提出, 以太坊率先将其付诸实践. 核心特性:
+
+* **确定性**: 同一合约代码在不同节点上执行必须产生完全相同的结果
+* **不可篡改**: 合约一经部署, 代码不可修改(可通过代理合约模式变通)
+* **自动执行**: 满足预设条件时自动触发执行, 无需第三方介入
+* **透明公开**: 合约代码和状态在链上完全公开, 任何人可审计
+
+以太坊智能合约使用 **Solidity** 语言编写, 运行在 **EVM**(Ethereum Virtual Machine)上:
+
+[source,solidity]
+----
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract SimpleStorage {
+    uint256 private storedData;
+
+    event DataChanged(uint256 newValue);
+
+    function set(uint256 x) public {
+        storedData = x;
+        emit DataChanged(x);
+    }
+
+    function get() public view returns (uint256) {
+        return storedData;
+    }
+}
+----
+
+部署和执行合约需要消耗 **Gas**(燃料), Gas 费用 = `Gas Used * Gas Price`, 防止死循环和资源滥用.
+
+=== UTXO 模型 vs 账户模型
+
+区块链有两种主流的**状态记录模型**:
+
+未花费交易输出(UTXO):: **比特币模型**. 每个交易包含多个输入和输出, 输入引用前序交易中未花费的输出, 输出创建新的 UTXO. 余额 = 所有可被当前私钥使用的 UTXO 之和. 优点: 并行性好, 隐私性强; 缺点: 实现复杂, 不适合状态密集型应用
+
+账户模型(Account Model):: **以太坊模型**. 类似银行账户, 每个地址有一个余额状态, 交易直接修改账户余额. 优点: 实现简单, 适合智能合约; 缺点: 易受重放攻击
+
+[plantuml, "UTXO 模型示意", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+
+rectangle "Tx0 Output\n100 BTC" as utxo1
+rectangle "Tx1 Output\n50 BTC" as utxo2
+rectangle "Tx1 Output\n30 BTC" as utxo3
+rectangle "新交易 输入" as input
+rectangle "新交易 输出\n120 BTC" as output1
+rectangle "新交易 输出\n60 BTC" as output2
+
+utxo1 --> input : 引用 UTXO
+utxo2 --> input : 引用 UTXO
+input --> output1 : 花费
+input --> output2 : 找零
+
+note right of output1 : 收款人地址
+note right of output2 : 发款人找零地址
+@enduml
+----
+
+=== 扩容方案
+
+区块链面临的核心瓶颈是**不可能三角**(Blockchain Trilemma): 去中心化(Secure)、可扩展(Scalable)、安全(Secure)三者**不可兼得**, 最多满足其中两个:
+
+第一层扩容(Layer 1):: 直接在**基础链**上优化. 包括增大区块(如 Bitcoin Cash)、分片(Sharding, 如以太坊 2.0)、改进共识(如 DAG 结构)
+
+第二层扩容(Layer 2):: 在**基础链之上**构建附加网络, 仅在必要时锚定到主链. 典型方案:
+* **闪电网络**(Lightning Network): 比特币链下支付通道, 实现即时、低成本的微支付
+* **状态通道**(State Channel): 双方在链下多次交互后, 仅在通道开启和关闭时上链
+* **Rollup**: 将交易数据压缩后提交到主链, 在链下执行计算. 包括 Optimistic Rollup(欺诈证明)和 ZK-Rollup(零知识证明)
+
+=== 应用场景
+
+[cols="1,3"]
+|===
+| 场景 | 说明
+
+| 加密货币 | 比特币、以太坊等数字货币, 去中心化价值转移
+| 去中心化金融(DeFi) | 借贷、交易、稳定币等金融服务, 无需传统金融机构
+| 非同质化代币(NFT) | 代表数字资产所有权的唯一 Token, 用于数字艺术、游戏道具
+| 供应链溯源 | 记录商品从生产到交付的全链路数据, 防止伪造
+| 数字身份 | 基于 DID(去中心化标识)的自主身份管理
+| 数据存证 | 存证、版权登记、学历认证等不可篡改的凭证
+| 跨链互操作 | 不同区块链间资产和数据互通
+| 去中心化自治组织(DAO) | 通过智能合约管理的社区组织, 投票决策
+|===
+
+=== 总结
+
+* 区块链通过**密码学哈希 + 共识机制**在去中心化网络中实现了**数据不可篡改**和**一致性**
+* **PoW** 和 **PoS** 是主流的共识机制, 各有优劣, 适应不同场景
+* **智能合约**使区块链从单纯的账本升级为**可编程的计算平台**
+* 区块链面临**不可能三角**的挑战, 扩容方案(Layer 2, 分片等)是当前发展的核心方向
+* 公有链、联盟链、私有链各有适用场景, 技术选型应权衡**去中心化程度, 性能和安全性**三者关系

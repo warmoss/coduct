@@ -1,0 +1,50 @@
+== 开发人员培养计划
+
+=== 基础
+* [书籍]代码整洁之道
+* [书籍]整洁代码的艺术
+* [书籍]Clean Architecture
+
+=== 后端
+* [书籍]疯狂Java讲义(第6版)
+* MyBatis源码
+* gRPC官方文档
+* Spring官方文档&源码
+* Spring Cloud官方文档&源码
+
+=== 中间件
+* MySQL官方文档
+* Redis官方文档
+* MongoDB官方文档
+* ElasticSearch官方文档
+* ClickHouse官方文档
+* Kafka官方文档
+* PolarDB官方文档
+* RocketMQ官方文档&源码
+* Seata官方文档
+* Sentinel官方文档
+
+=== Python
+* [书籍]疯狂Python讲义
+* [书籍]编写整洁的Python代码(第2版)
+
+=== Golang
+* [书籍]The Go Programming Language
+* [书籍]Concurrency in Go
+* [书籍]深入理解Go语言
+* [书籍]Go底层原理与工程化实践
+* [书籍]Mastering Go
+
+=== 运维
+* Grafana官方文档
+* K8s官方文档
+* [书籍]Terraform in Action
+
+=== 架构
+* [书籍]计算机操作系统(十二五)
+* [书籍]现代操作系统(十二五)
+* [书籍]计算机网络(十二五)
+
+=== 其他
+* PlantUML官方文档
+* [书籍]自私的基因

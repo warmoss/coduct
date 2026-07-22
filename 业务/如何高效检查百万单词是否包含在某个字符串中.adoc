@@ -1,0 +1,192 @@
+== 如何高效检查百万单词是否包含在某个字符串中
+
+=== 问题引入
+
+在内容审核和个性化过滤场景中, 我们经常面临这样一个问题: 给定一个包含数百万个屏蔽词的集合, 如何快速判断一段用户输入文本中是否包含其中任何一个词?
+
+**最直接的做法** 是遍历每个屏蔽词, 对文本逐个执行字符串匹配算法(如 KMP 或 `indexOf`). 但当屏蔽词数量达到百万级, 每个词都需要扫描一遍文本, 时间复杂度达到 **O(N * M)**(N 为屏蔽词数量, M 为文本长度), 这在实时场景下是完全不可接受的.
+
+我们需要一种**只扫描一遍文本**就能检测所有屏蔽词的算法.
+
+=== 应用场景
+
+场景一(关键词过滤):: 在招聘软件中, 用户根据职位名称或招聘方名称中的一个或多个关键词屏蔽该职位; 系统需要在每次刷新时快速判断职位是否命中屏蔽列表
+
+场景二(弹幕过滤):: 在弹幕视频网站中, 用户设置关键词屏蔽弹幕; 在线实时弹幕流需要毫秒级判断每条弹幕是否包含任何屏蔽词
+
+场景三(内容审核):: 在 UGC 平台中, 系统需要检测用户发布的文本、评论、昵称是否包含敏感词库中的任意词汇
+
+=== 方案对比
+
+下面对比几种常见方案在处理百万级屏蔽词时的表现.
+
+[cols="1,2,2,2"]
+|===
+|方案
+|时间复杂度
+|空间复杂度
+|适用场景
+
+|暴力遍历(Brute Force)
+|O(N * M * L)
+|O(1)
+|屏蔽词极少(< 100)
+
+|正则表达式联合匹配
+|O(M * Avg Regex)
+|O(模式串总长度)
+|模式串数量较少, 且可以用正则表达
+
+|Trie 树
+|O(M * 回溯代价)
+|O(所有模式串总长度)
+|纯前缀匹配, 无需后缀匹配
+
+|**Aho-Corasick 自动机**
+|**O(M + Z)**
+|O(所有模式串总长度)
+|**百万级屏蔽词, 实时匹配**
+
+|Bloom Filter
+|O(M)
+|O(k * n)
+|仅判断是否存在, 不关心位置
+|===
+
+其中 **Z** 是匹配总数, **N** 是屏蔽词数量, **M** 是文本长度, **L** 是屏蔽词平均长度. Aho-Corasick 算法的 **O(M + Z)** 意味着匹配时间**只与文本长度和匹配结果数相关**, 与屏蔽词数量无关.
+
+=== 前置知识: Trie 树
+
+Aho-Corasick 算法建立在 **Trie 树**(字典树/前缀树)的基础之上. Trie 树是一种利用字符串公共前缀来加速检索的树形数据结构.
+
+<<算法/Trie树讲解, Trie树讲解>>
+
+=== 核心方案: Aho-Corasick 自动机
+
+**Aho-Corasick 算法**(简称 AC 自动机)是解决多模式串匹配问题的经典算法. 它在 Trie 树的基础上引入**失败指针(Failure Link)**, 使得匹配失败时能够快速跳转到另一个分支继续匹配, 从而实现只扫描一次文本即可找出所有模式串.
+
+<<算法/Aho-Corasick算法讲解, Aho-Corasick算法讲解>>
+
+=== 实际应用与优化
+
+==== 构建与匹配流程
+
+在实际系统中, 屏蔽词检测一般分为两步.
+
+1. **预处理阶段(离线):** 将所有屏蔽词构建成 AC 自动机. 这个过程只在屏蔽词列表更新时执行一次, 时间复杂度 O(所有模式串总长度)
+
+2. **匹配阶段(在线):** 对用户输入的文本运行自动机, 扫描一遍即可找出所有命中的屏蔽词. 匹配时间复杂度 O(M + Z)
+
+==== 动态更新屏蔽词
+
+在实际场景中, 屏蔽词列表是动态变化的(用户新增或删除屏蔽词). 处理动态更新有以下策略.
+
+* **全量重建:** 每次更新时重建整个自动机. 适用于更新频率低的场景(如每隔几分钟同步一次词库)
+
+* **双缓冲切换:** 维护两份自动机(读写分离). 读操作用当前活跃的自动机, 写操作在后台构建新自动机, 构建完成后原子切换. 适用于需要**无锁读取**的高并发场景
+
+* **增量更新:** 学术界有支持动态增删模式串的 AC 自动机变种, 但实现复杂, 工程中使用较少
+
+==== 内存优化
+
+百万级屏蔽词(假设平均长度 10 个字符)的 AC 自动机可能占用数百 MB 内存. 可考虑以下优化.
+
+* **使用数组替代指针/Map 存储子节点:** 如果字符集较小(如仅 ASCII), 可以用固定大小数组(如 `next[256]`), 避免 HashMap 开销
+
+* **压缩 Trie + AC 自动机:** 将连续单支路径压缩, 减少节点数
+
+* **使用 DFA 化:** 将 AC 自动机转化为完全的确定性有限自动机(补全所有转移边), 虽然增加构建时间和内存, 但匹配时无需跟随失败指针, 速度更快
+
+==== 代码示例
+
+下面是一个用 Python 实现的最小化 AC 自动机(仅核心逻辑, 不包含优化), 用于屏蔽词检测.
+
+[source,python]
+----
+from collections import deque
+
+class ACNode:
+    def __init__(self):
+        self.children = {}
+        self.fail = None
+        self.is_end = False
+
+class ACAutomaton:
+    def __init__(self):
+        self.root = ACNode()
+
+    def add_word(self, word: str) -> None:
+        """添加屏蔽词到自动机"""
+        node = self.root
+        for ch in word:
+            if ch not in node.children:
+                node.children[ch] = ACNode()
+            node = node.children[ch]
+        node.is_end = True
+
+    def build(self) -> None:
+        """构建失败指针(BFS)"""
+        self.root.fail = None
+        q = deque()
+        # 深度 1 的节点 fail 指向 root
+        for child in self.root.children.values():
+            child.fail = self.root
+            q.append(child)
+        # BFS 构建其余节点的 fail 指针
+        while q:
+            cur = q.popleft()
+            for ch, child in cur.children.items():
+                f = cur.fail
+                while f and ch not in f.children:
+                    f = f.fail
+                child.fail = f.children[ch] if f else self.root
+                # 继承 fail 节点的结束标记(关键!)
+                if child.fail and child.fail.is_end:
+                    child.is_end = True
+                q.append(child)
+
+    def search(self, text: str) -> list:
+        """扫描文本, 返回命中的所有屏蔽词"""
+        result = []
+        node = self.root
+        for i, ch in enumerate(text):
+            # 跟随失败指针找到可匹配的状态
+            while node is not self.root and ch not in node.children:
+                node = node.fail
+            node = node.children.get(ch, self.root)
+            # 检查当前状态及 fail 链上是否有匹配
+            if node.is_end:
+                # 输出匹配结果(实际应用需记录位置)
+                result.append((i, "matched"))
+        return result
+----
+
+**使用示例:**
+
+[source,python]
+----
+ac = ACAutomaton()
+for word in ["he", "she", "his", "hers"]:
+    ac.add_word(word)
+ac.build()
+print(ac.search("ushers"))
+# 输出: [(3, 'matched'), (3, 'matched'), (5, 'matched')]
+----
+
+==== 工程实践经验
+
+* **分词预处理:** 中文屏蔽词场景下, 可先对文本进行分词, 再以词为单位构建 AC 自动机, 避免单字匹配导致误判
+
+* **白名单机制:** 检测到屏蔽词后, 再查白名单确认是否需要豁免. 白名单可用 HashSet 或 Bloom Filter 实现
+
+* **性能基准:** 在一台普通服务器上, 100 万屏蔽词的 AC 自动机扫描 100 字符的文本, 耗时通常在 **微秒级**(< 1ms), 完全可以满足实时在线场景
+
+=== 总结
+
+* **Aho-Corasick 算法** 是解决百万级屏蔽词匹配问题的工程最优解, 匹配时间复杂度 O(M + Z) 与屏蔽词数量无关
+
+* 其核心思想是 **Trie 树 + 失败指针**, 利用字符串后缀关系实现匹配失败时的高效跳转
+
+* 在实际工程中, 需要结合**动态更新策略**、**内存优化**和**业务逻辑(分词/白名单)** 来构建完整的内容过滤系统
+
+* 对于"是否包含"而非"在哪里匹配"的场景, 也可以结合 Bloom Filter 做第一级快速过滤, 减少 AC 自动机的调用次数

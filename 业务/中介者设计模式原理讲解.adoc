@@ -1,0 +1,237 @@
+== 中介者设计模式原理讲解
+
+中介者模式(Mediator Pattern)是一种**行为型设计模式**, 通过引入一个中介者对象来封装一组对象之间的交互, 使对象间不再显式相互引用, 从而降低耦合度. 当系统中存在**多对多**的交互关系时, 直接交互会导致对象间相互依赖、难以维护, 中介者模式将这种网状结构转化为星型结构.
+
+=== 概念定义
+
+*中介者(Mediator):: 定义通信接口, 用于协调各同事对象之间的交互
+*具体中介者(Concrete Mediator):: 实现中介者接口, 维护同事对象的引用并实现协作逻辑
+*同事(Colleague):: 所有需要互相通信的对象, 每个同事只依赖中介者, 不直接引用其他同事
+
+中介者模式的核心思想是**将多对多的网状交互转为一对多的星型交互**, 让对象间的通信由中介者统一调度.
+
+=== 核心原理
+
+在没有中介者的情况下, 多个对象相互通信会形成**网状结构**, 每个对象都需知道其他所有对象的存在:
+
+[plantuml,"无中介者的网状通信",format=png]
+----
+@startuml
+object A
+object B
+object C
+object D
+
+A --> B
+A --> C
+A --> D
+B --> C
+B --> D
+C --> D
+@enduml
+----
+
+引入中介者后, 所有对象只与中介者通信, 形成**星型结构**:
+
+[plantuml,"中介者模式的星型通信",format=png]
+----
+@startuml
+object A
+object B
+object C
+object D
+object Mediator
+
+A --> Mediator
+B --> Mediator
+C --> Mediator
+D --> Mediator
+@enduml
+----
+
+中介者模式包含四个核心角色:
+
+[plantuml,"中介者模式类图",format=png]
+----
+@startuml
+interface Mediator {
+  + notify(sender: Colleague, event: String): void
+}
+
+class ConcreteMediator {
+  - colleagues: List<Colleague>
+  + notify(sender: Colleague, event: String): void
+}
+
+class Colleague {
+  # mediator: Mediator
+  + send(event: String): void
+  + receive(event: String): void
+}
+
+class ConcreteColleagueA
+class ConcreteColleagueB
+
+Mediator <|.. ConcreteMediator
+Colleague o--> Mediator
+Colleague <|-- ConcreteColleagueA
+Colleague <|-- ConcreteColleagueB
+ConcreteMediator o--> Colleague
+@enduml
+----
+
+=== 工作流程
+
+中介者模式的协作流程如下:
+
+. **同事触发事件** - 某个同事对象状态发生变化, 调用中介者的通知方法
+. **中介者调度** - 中介者接收通知, 根据发件人和事件类型决定哪些其他同事需要响应
+. **分发电信** - 中介者调用目标同事的相应方法, 完成通信
+
+[plantuml,"中介者模式时序图",format=png]
+----
+@startuml
+actor Client
+participant ConcreteColleagueA
+participant ConcreteMediator
+participant ConcreteColleagueB
+
+Client -> ConcreteColleagueA: doSomething()
+ConcreteColleagueA -> ConcreteMediator: notify(this, "eventA")
+ConcreteMediator -> ConcreteColleagueB: receive("eventA")
+ConcreteColleagueB --> ConcreteMediator: 处理结果
+ConcreteMediator --> ConcreteColleagueA: 返回
+ConcreteColleagueA --> Client: 完成
+@enduml
+----
+
+=== 代码示例
+
+以**聊天室**为例, 多个用户通过聊天室中介者收发消息:
+
+[source,java]
+----
+// 中介者接口
+interface ChatMediator {
+    void sendMessage(User sender, String message);
+    void addUser(User user);
+}
+
+// 具体中介者: 聊天室
+class ChatRoom implements ChatMediator {
+    private List<User> users = new ArrayList<>();
+
+    @Override
+    public void addUser(User user) {
+        users.add(user);
+    }
+
+    @Override
+    public void sendMessage(User sender, String message) {
+        for (User user : users) {
+            // 消息发送给除自己外的所有人                   // <1>
+            if (user != sender) {
+                user.receive(sender.getName(), message);
+            }
+        }
+    }
+}
+
+// 同事基类
+abstract class User {
+    protected ChatMediator mediator;
+    protected String name;
+
+    public User(ChatMediator mediator, String name) {
+        this.mediator = mediator;
+        this.name = name;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public abstract void send(String message);
+    public abstract void receive(String senderName, String message);
+}
+
+// 具体同事: 普通用户
+class RegularUser extends User {
+    public RegularUser(ChatMediator mediator, String name) {
+        super(mediator, name);
+    }
+
+    @Override
+    public void send(String message) {
+        System.out.println(name + " 发送: " + message);
+        mediator.sendMessage(this, message);               // <2>
+    }
+
+    @Override
+    public void receive(String senderName, String message) {
+        System.out.println(name + " 收到来自 " + senderName + " 的消息: " + message);
+    }
+}
+
+// 客户端使用
+public class Client {
+    public static void main(String[] args) {
+        ChatMediator chatRoom = new ChatRoom();
+
+        User alice = new RegularUser(chatRoom, "Alice");
+        User bob = new RegularUser(chatRoom, "Bob");
+        User charlie = new RegularUser(chatRoom, "Charlie");
+
+        chatRoom.addUser(alice);
+        chatRoom.addUser(bob);
+        chatRoom.addUser(charlie);
+
+        alice.send("大家好!");
+        bob.send("你好 Alice!");
+    }
+}
+----
+<1> 中介者决定消息的分发逻辑, 避免发送者自己判断
+<2> 同事通过中介者发送, 不直接调用其他同事
+
+输出结果:
+
+[source,shell]
+----
+Alice 发送: 大家好!
+Bob 收到来自 Alice 的消息: 大家好!
+Charlie 收到来自 Alice 的消息: 大家好!
+Bob 发送: 你好 Alice!
+Alice 收到来自 Bob 的消息: 你好 Alice!
+Charlie 收到来自 Bob 的消息: 你好 Alice!
+----
+
+=== 适用场景
+
+中介者模式适用于以下场景:
+
+* **多对多交互** - 一组对象之间存在复杂的网状通信关系, 难以维护
+* **交互逻辑集中化** - 希望将多个对象间的协作行为抽取到一处统一管理
+* **组件复用** - 对象希望减少对其他对象的依赖, 使其更易于复用和测试
+
+=== 与外观模式的区别
+
+中介者模式和外观模式都引入了中间层, 但目的不同:
+
+[cols="3*"]
+|===
+| 维度 | 中介者模式 | 外观模式
+
+| **类型** | 行为型 | 结构型
+| **目的** | 协调多个对象之间的交互 | 为子系统提供统一简化接口
+| **方向** | 双向通信, 同事之间可相互发送 | 单向调用, 客户端调用子系统
+| **粒度** | 多个同事之间调度 | 单个入口封装复杂子系统
+| **使用者** | 同事对象相互使用 | 客户端使用
+|===
+
+=== 总结
+
+* 中介者模式通过**引入中介者对象**, 将多对多的网状交互转为一对多的星型交互, 大幅降低对象间的耦合度
+* 核心是同事对象只依赖中介者, 不直接引用其他同事, 交互逻辑集中在中介者中管理
+* 与外观模式的区别在于: 中介者协调**双向**交互, 外观模式提供**单向**简化入口
+* 中介者可能成为**瓶颈和单点故障**, 当同事数量过多或交互逻辑过于复杂时, 中介者本身会变得臃肿难以维护

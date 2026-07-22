@@ -1,0 +1,167 @@
+== MutationObserver讲解
+
+=== 什么是 MutationObserver?
+**MutationObserver** 是一个现代浏览器提供的 Web API, 用于**异步监视**对 DOM 树所做的更改. 它被设计来替代旧的 **Mutation Events**, 后者是同步的, 并且存在性能问题.
+
+你可以把它理解为一个**监听 DOM 变化的“侦探”**. 你告诉这个侦探:
+
+. **要监视哪个目标(Target):** 比如一个具体的 DOM 元素.
+
+. **要关注什么变化(What to observe):** 比如属性的变化、子节点的增删、文本内容的变化等.
+
+. **当变化发生时应该做什么(Callback):** 定义一个回调函数, 当侦探发现你关心的变化时, 它会用变化的信息来调用这个函数.
+
+=== 为什么需要它? (与 Mutation Events 的对比)
+在 **MutationObserver** 出现之前, 人们使用 **Mutation Events**(如 **DOMNodeInserted**, **DOMAttributeChanged**). 但它们有严重缺陷:
+
+. **性能差:** 事件是同步触发的, 每次 DOM 变化都会立即调用事件处理程序. 如果在一个循环中做大量 DOM 修改, 浏览器会变得非常卡顿.
+
+. **语法陈旧:** 事件模型的 API 不够灵活.
+
+**MutationObserver** 的优势:
+
+* **异步回调:** DOM 的变化不会立即触发回调. **MutationObserver** 会将多个变化**批量处理**, 然后在微任务(microtask)阶段统一触发一次回调, 极大地提高了性能.
+
+* **更精细的控制:** 可以配置需要观察的变化类型、具体属性等, 非常灵活.
+
+* **更丰富的信息:** 回调函数会收到一个包含所有变更记录的列表, 你可以详细查看每一次变更的具体内容.
+
+=== 核心用法三步走
+**第 1 步: 创建观察者 (Observer)**
+
+使用构造函数创建一个观察者实例, 并传入一个回调函数. 这个回调函数将在发生变化时被调用.
+
+[source, javascript, linenums]
+----
+// 创建观察者, 并定义回调函数
+const observer = new MutationObserver(function(mutationsList, observer) {
+  // mutationsList: 一个 MutationRecord 对象的数组, 每个对象描述了一个变化
+  // observer: 就是当前这个 MutationObserver 实例本身
+  for(let mutation of mutationsList) {
+    if (mutation.type === 'childList') {
+      console.log('有子节点被添加或删除了! ');
+    } else if (mutation.type === 'attributes') {
+      console.log(`属性 ${mutation.attributeName} 被修改了! `);
+    }
+  }
+});
+----
+
+**第 2 步: 配置观察选项 (Options)**
+
+定义一个配置对象, 指定你要观察哪些变化.
+
+[source, javascript, linenums]
+----
+// 配置观察选项
+const config = {
+  attributes: true,         // 监视目标属性的变化
+  attributeFilter: ['class', 'style'], // 可选的, 只监视特定属性, 避免不必要的回调
+  childList: true,          // 监视目标子节点的添加和删除
+  subtree: true,            // 是否监视所有后代节点的变化. 默认为 false, 只监视目标节点本身.
+  characterData: true,      // 监视文本内容的变化
+  attributeOldValue: true,  // 是否在 MutationRecord 中记录变化前的属性值
+  characterDataOldValue: true // 是否在 MutationRecord 中记录变化前的文本数据
+};
+----
+
+**第 3 步: 开始观察与停止观察**
+
+使用 **observe()** 方法开始观察一个特定的 DOM 节点. 使用 **disconnect()** 方法可以停止观察.
+
+[source, javascript, linenums]
+----
+// 选择要观察的目标节点
+const targetNode = document.getElementById('some-element');
+
+// 开始观察目标节点
+observer.observe(targetNode, config);
+
+// ... 之后, 当你不再需要观察时 ...
+// observer.disconnect();
+----
+
+=== 回调参数详解: MutationRecord
+
+回调函数接收的 **mutationsList** 是一个 **MutationRecord** 对象的数组. 每个 **MutationRecord** 包含以下常用属性:
+
+[cols="1,5"]
+|===
+|属性|描述
+
+|**type**
+|变化的类型. 可以是 **'attributes'**(属性)、**'childList'**(子节点)、**'characterData'**(文本数据).
+
+|**target**
+|发生变化的 DOM 节点.
+
+|**addedNodes**
+|一个 **NodeList**, 包含新增的节点. 仅对 **type** 为 **childList** 有效.
+
+|**removedNodes**
+|一个 **NodeList**, 包含被移除的节点. 仅对 **type** 为 **childList** 有效.
+
+|**attributeName**
+|被更改的属性名称. 仅对 **type** 为 **attributes** 有效.
+
+|**previousSibling**
+|被添加或移除的节点的上一个兄弟节点.
+
+|**nextSibling**
+|被添加或移除的节点的下一个兄弟节点.
+
+|**oldValue**
+|变化前的值. 如果配置中设置了 **attributeOldValue** 或 **characterDataOldValue** 为 **true**, 则此属性会根据类型包含属性旧值或文本旧值.
+
+|===
+
+=== 实际应用场景
+. **动态内容加载:** 当第三方脚本(如广告、评论插件)动态地向页面注入内容时, 你可以用 **MutationObserver** 来检测这些内容何时被加载完成, 然后执行相应的操作(如初始化组件).
+
+. **单页应用 (SPA) 路由:** 在一些框架中, 当路由变化时, 内容区域会动态更新. 可以用 **MutationObserver** 来检测内容区域的变化, 从而触发一些清理或初始化逻辑.
+
+. **表单增强:** 监视一个自定义表单控件的状态变化, 根据其 **disabled** 或 **checked** 属性的变化来更新 UI.
+
+. **代码高亮或语法检查:** 监视一个可编辑的 **<div>**(如代码编辑器)的内容变化, 并在内容改变后实时进行高亮或语法检查.
+
+. **撤销/重做功能:** 记录 DOM 的每一次变化, 以便在未来实现撤销操作.
+
+=== 示例: 监听元素属性的变化
+
+[source, javascript, linenums]
+----
+<div id="box" style="width: 100px; height: 100px; background: red;"></div>
+<button onclick="changeBox()">改变盒子样式</button>
+
+<script>
+  const target = document.getElementById('box');
+  const observer = new MutationObserver((mutations) => {
+    mutations.forEach(mutation => {
+      if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
+        console.log('样式被改变了! ');
+        console.log('新的样式: ', target.getAttribute('style'));
+      }
+    });
+  });
+
+  // 开始观察, 只观察 style 属性的变化
+  observer.observe(target, {
+    attributes: true,
+    attributeFilter: ['style'] // 只观察 style 属性, 忽略其他属性变化
+  });
+
+  function changeBox() {
+    // 随机改变盒子背景色
+    target.style.background = `rgb(${Math.floor(Math.random() * 255)}, ${Math.floor(Math.random() * 255)}, ${Math.floor(Math.random() * 255)})`;
+  }
+</script>
+----
+
+=== 注意事项
+* **避免循环触发:** 不要在 **MutationObserver** 的回调函数中修改正在被观察的属性, 否则可能会引起无限循环.
+
+* **性能考虑:** 虽然 **MutationObserver** 是异步的, 性能很好, 但也不要在回调中执行非常耗时的操作.
+
+* **浏览器兼容性:** 现代浏览器支持良好(IE11+). 对于老旧浏览器, 可能需要 polyfill 或回退到降级方案.
+
+总之, **MutationObserver** 是一个强大且高效的工具, 非常适合用于对 DOM 变化进行响应式处理的场景.

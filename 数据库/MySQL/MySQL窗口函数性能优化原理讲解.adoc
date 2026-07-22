@@ -1,0 +1,266 @@
+== MySQL窗口函数性能优化原理讲解
+
+MySQL窗口函数性能优化是一个重要话题, 主要涉及**执行原理**和**优化策略**. 以下从原理到实践的全面讲解:
+
+=== 窗口函数的执行原理
+
+==== 执行阶段
+
+[source, sql]
+----
+-- 窗口函数在查询执行的较后阶段执行
+SELECT 
+    column1,
+    SUM(column2) OVER (PARTITION BY column3 ORDER BY column4)
+FROM table
+WHERE condition  -- 1. 先执行WHERE过滤
+GROUP BY ...     -- 2. 再执行GROUP BY(如果有)
+HAVING ...       -- 3. 执行HAVING
+                 -- 4. 最后执行窗口函数
+----
+
+==== 内存使用模式
+
+* **临时排序空间:** 窗口函数需要排序, 使用内存或磁盘临时表
+
+* **分区数据缓存:** 每个分区数据需要在内存中处理
+
+* **帧数据维护:** 滑动窗口需要维护帧内数据
+
+=== 影响性能的关键因素
+
+==== 排序操作
+
+[source, sql]
+----
+-- 有ORDER BY的窗口函数需要排序
+ROW_NUMBER() OVER (ORDER BY column1)  -- 需要全表排序
+ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary)  -- 分区内排序
+----
+
+==== 分区大小
+
+* 分区数量过多 -> 每个分区小, 管理开销大
+
+* 分区数量过少 -> 每个分区大, 排序负担重
+
+==== 窗口帧定义
+
+[source, sql]
+----
+-- 不同帧定义有不同性能特征
+SUM(salary) OVER (ORDER BY date ROWS 10 PRECEDING)  -- 快: 固定大小帧
+SUM(salary) OVER (ORDER BY date RANGE INTERVAL 7 DAY PRECEDING) -- 慢: 动态帧
+----
+
+=== 优化策略与实践
+
+==== 索引优化
+
+[source, sql]
+----
+-- 为窗口函数创建合适的复合索引
+-- 索引顺序: (分区列, 排序列, 筛选列)
+CREATE INDEX idx_window ON employees (department_id, hire_date, salary);
+
+-- 对于RANGE窗口, 需要特殊考虑
+CREATE INDEX idx_range ON sales (sale_date, amount, product_id);
+----
+
+==== 减少数据量
+
+[source, sql]
+----
+-- 优化前: 全表计算窗口函数
+SELECT *, 
+       SUM(amount) OVER (PARTITION BY customer_id) 
+FROM sales;
+
+-- 优化后: 先过滤后计算
+WITH filtered_sales AS (
+    SELECT customer_id, amount
+    FROM sales 
+    WHERE sale_date >= '2024-01-01'
+)
+SELECT customer_id, amount,
+       SUM(amount) OVER (PARTITION BY customer_id)
+FROM filtered_sales;
+----
+
+==== 避免重复计算
+
+[source, sql]
+----
+-- 优化前: 重复窗口定义
+SELECT 
+    SUM(revenue) OVER (PARTITION BY dept) as dept_total,
+    AVG(revenue) OVER (PARTITION BY dept) as dept_avg,
+    COUNT(*) OVER (PARTITION BY dept) as dept_count
+FROM sales;
+
+-- 优化后: 使用WINDOW子句
+SELECT 
+    SUM(revenue) OVER w as dept_total,
+    AVG(revenue) OVER w as dept_avg,
+    COUNT(*) OVER w as dept_count
+FROM sales
+WINDOW w AS (PARTITION BY dept);
+----
+
+==== 选择合适的窗口函数
+
+[source, sql]
+----
+-- ROWS vs RANGE 性能对比
+-- ROWS: 基于行位置, 性能更好
+SUM(amount) OVER (ORDER BY date ROWS 10 PRECEDING)
+
+-- RANGE: 基于值范围, 可能更慢
+SUM(amount) OVER (ORDER BY date RANGE INTERVAL 7 DAY PRECEDING)
+----
+
+=== 执行计划分析
+
+==== 识别窗口函数操作
+
+[source, sql]
+----
+EXPLAIN ANALYZE
+SELECT employee_id,
+       salary,
+       AVG(salary) OVER (PARTITION BY department_id) as avg_salary
+FROM employees;
+----
+
+执行计划关键指标:
+
+* Using filesort: 需要排序操作
+
+* Using temporary: 使用临时表
+
+* Window function optimization status: 查看是否使用了优化
+
+==== 性能诊断查询
+
+[source, sql]
+----
+-- 查看窗口函数内存使用
+SELECT * 
+FROM performance_schema.memory_summary_by_thread_by_event_name
+WHERE EVENT_NAME LIKE '%window%';
+
+-- 监控排序操作
+SELECT * 
+FROM information_schema.INNODB_METRICS
+WHERE NAME LIKE '%sort%';
+----
+
+=== 高级优化技巧
+
+==== 分区裁剪
+
+[source, sql]
+----
+-- 利用WHERE条件减少分区处理
+SELECT 
+    product_id,
+    SUM(sales) OVER (PARTITION BY product_id)
+FROM sales
+WHERE product_id IN (1, 2, 3)  -- MySQL可能智能优化分区处理
+ORDER BY product_id;
+----
+
+==== 并行处理
+
+[source, sql]
+----
+-- MySQL 8.0+ 支持有限并行
+-- 设置相关参数
+SET SESSION windowing_use_high_precision = ON;
+SET SESSION optimizer_switch = 'window_functions_optimization=on';
+----
+
+==== 物化视图模式
+
+[source, sql]
+----
+-- 对于复杂窗口计算, 考虑预计算
+CREATE TABLE department_summary AS
+SELECT 
+    department_id,
+    SUM(salary) as total_salary,
+    AVG(salary) as avg_salary,
+    COUNT(*) as emp_count
+FROM employees
+GROUP BY department_id;
+
+-- 然后基于汇总表进行窗口计算
+----
+
+=== 实际案例分析
+
+==== 案例1: 排名查询优化
+
+[source, sql]
+----
+-- 原始查询
+SELECT *,
+       RANK() OVER (ORDER BY sales DESC) as rank_num
+FROM sales_data
+WHERE year = 2024;
+
+-- 优化步骤:
+-- 1. 添加索引: ALTER TABLE sales_data ADD INDEX idx_year_sales (year, sales DESC);
+-- 2. 减少数据: 先过滤年份
+-- 3. 考虑分页: LIMIT offset, count
+----
+
+==== 案例2: 累计和优化
+
+[source, sql]
+----
+-- 使用ROW_NUMBER()避免自连接
+WITH numbered AS (
+    SELECT id, amount, date,
+           ROW_NUMBER() OVER (ORDER BY date) as rn
+    FROM transactions
+)
+SELECT a.id, a.date, a.amount,
+       SUM(b.amount) as running_total
+FROM numbered a
+JOIN numbered b ON b.rn <= a.rn
+GROUP BY a.id, a.date, a.amount;
+----
+
+=== 监控与调优参数
+
+[source, sql]
+----
+-- 关键系统变量
+SHOW VARIABLES LIKE '%sort%';
+SHOW VARIABLES LIKE '%tmp%';
+
+-- 建议调整的参数
+SET sort_buffer_size = 8M;      -- 排序缓冲区大小
+SET tmp_table_size = 256M;      -- 临时表大小
+SET max_heap_table_size = 256M; -- 内存表大小
+SET windowing_use_high_precision = ON; -- 窗口计算精度
+----
+
+=== 最佳实践总结
+
+. **索引优先:** 为PARTITION BY和ORDER BY列创建复合索引
+
+. **数据精简:** 先过滤后计算, 减少处理数据量
+
+. **函数选择:** 优先使用ROWS而非RANGE窗口
+
+. **避免嵌套:** 窗口函数避免嵌套使用
+
+. **定期监控:** 监控排序和临时表使用情况
+
+. **分批处理:** 大数据集考虑分批次计算
+
+. **版本特性:** 利用MySQL 8.0+的窗口函数优化特性
+
+窗口函数性能优化需要结合具体查询模式、数据分布和MySQL版本特性. 通过合理的索引设计、查询重写和参数调优, 可以显著提升窗口函数的执行效率.

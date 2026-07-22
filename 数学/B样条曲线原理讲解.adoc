@@ -1,0 +1,239 @@
+== B样条曲线原理讲解
+
+B样条曲线(B-Spline Curve)是贝塞尔曲线的一般化推广, 解决了贝塞尔曲线的**全局控制**问题. 它通过引入**节点向量(Knot Vector)**和**分段多项式基函数**, 实现了对曲线形状的**局部控制**: 移动一个控制点仅影响曲线的一部分, 而非整条曲线. B样条曲线是计算机辅助设计(CAD)、工业造型和几何建模的核心技术.
+
+=== 什么是B样条曲线
+
+B样条曲线通过一组**控制点**和**节点向量**定义一条分段多项式曲线. 与贝塞尔曲线不同, B样条曲线的控制点数量与多项式阶次**独立**, 因此可以定义包含大量控制点的复杂曲线, 同时保持较低阶次.
+
+定义列表::
+
+B样条曲线:: 由 **n+1** 个控制点 stem:[P_0, P_1, ..., P_n] 和节点向量 stem:[t_0, t_1, ..., t_{m-1}] 定义的**分段**参数曲线, 其中 **m = n + p + 1** (p 为阶次).
+节点向量(Knot Vector):: 一个非递减的实数序列 stem:[t_0 \le t_1 \le ... \le t_{m-1}], 将参数域划分为若干区间, 每个区间对应一段多项式.
+阶次 p(Degree):: B样条基函数的最高幂次数. **p 次** B样条曲线由 **p+1** 阶基函数定义.
+局部支撑性(Local Support):: 基函数仅在有限的**相邻 stem:[p+1]** 个节点区间上非零, 这是局部控制的关键.
+参数 u:: 取值范围通常为 stem:[t_p] 到 stem:[t_{m-p-1}], 对应曲线的有效参数区间.
+
+与贝塞尔曲线的关键区别在于: B样条曲线的基函数是**分段**定义的, 而非全局; 控制点数量可以远大于阶次, 而非限制为阶次 + 1.
+
+=== 数学定义
+
+==== B样条基函数的递归定义
+
+B样条基函数采用 **Cox-de Boor** 递归公式定义. 零次基函数为分段常数:
+
+stem:[N_{i,0}(u) = \begin{cases} 1, & t_i \le u < t_{i+1} \\ 0, & \text{otherwise} \end{cases}]
+
+高阶基函数通过递归组合得到:
+
+stem:[N_{i,p}(u) = \frac{u - t_i}{t_{i+p} - t_i} N_{i,p-1}(u) + \frac{t_{i+p+1} - u}{t_{i+p+1} - t_{i+1}} N_{i+1,p-1}(u)]
+
+这个递归公式是理解B样条的核心. 直观含义: **p** 次基函数是两个 **p-1** 次基函数的线性混合, 混合系数由当前参数 **u** 在节点区间中的相对位置决定.
+
+==== 曲线定义
+
+stem:[C(u) = \sum_{i=0}^{n} N_{i,p}(u) P_i]
+
+其中 stem:[N_{i,p}(u)] 为 **p** 次B样条基函数, stem:[P_i] 为控制点.
+
+[plantuml, "B样条基函数递归计算示意图", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+title Cox-de Boor 递归树 (p=2 示例)
+
+rectangle "N₀,₂" as N02
+rectangle "N₀,₁" as N01
+rectangle "N₁,₁" as N11
+rectangle "N₀,₀" as N00
+rectangle "N₁,₀" as N10
+rectangle "N₂,₀" as N20
+
+N02 --> N01 : "混合系数 α₀"
+N02 --> N11 : "混合系数 α₁"
+N01 --> N00
+N01 --> N10
+N11 --> N10
+N11 --> N20
+
+note bottom of N00 : 零次基函数\n分段常数
+note bottom of N10 : 零次基函数
+note bottom of N20 : 零次基函数
+@enduml
+----
+
+==== 节点向量与曲线行为
+
+节点向量的结构直接决定B样条曲线的行为. 设节点向量长度 **m**, 控制点数量 **n+1**, 阶次 **p**, 满足 **m = n + p + 1**.
+
+节点向量的两个关键特性:
+
+* **节点重复度(Knot Multiplicity)**: 同一节点重复出现的次数. 重复度 **r** 会使曲线在该节点处的可微性降低 **r - 1** 阶 (从 stem:[C^{p-1}] 降至 stem:[C^{p-r}]).
+* **节点跨度(Knot Span)**: 相邻节点之间的区间 stem:[t_i, t_{i+1}), 每个跨度对应一段独立的贝塞尔曲线段.
+
+[cols="3*"]
+|===
+| 重复度 r | 连续性 | 效果
+
+| 1 | stem:[C^{p-1}] | 标准光滑
+| p | stem:[C^0] | 曲线拐点(尖角)
+| p+1 | 不连续 | 曲线在该点断开
+|===
+
+=== B样条曲线的分类
+
+根据节点向量的分布方式, B样条曲线分为三种主要类型.
+
+==== 均匀B样条(Uniform B-Spline)
+
+节点向量中的节点等距分布, 例如 stem:[0, 1, 2, 3, 4, 5]. 基函数形状在平移后完全相同(平移对称性). 计算简单, 但不支持在端点处精确穿过控制点.
+
+==== 准均匀B样条(Clamped B-Spline)
+
+节点向量的**首尾节点重复度为 p+1**, 中间节点均匀分布. 例如 **p=3** 时: stem:[0,0,0,0,1,2,3,4,4,4,4]. 这种形式使曲线**穿过首尾控制点**, 与贝塞尔曲线一致, 是最常用的形式.
+
+[plantuml, "准均匀B样条的节点向量结构 (p=3)", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+title 节点向量: [0,0,0,0,1,2,3,4,4,4,4]
+
+() t0 as "t₀=0 (r=4)"
+() t1 as "t₁=1"
+() t2 as "t₂=2"
+() t3 as "t₃=3"
+() t4 as "t₄=4 (r=4)"
+
+t0 --- t1 : span 1
+t1 --- t2 : span 2
+t2 --- t3 : span 3
+t3 --- t4 : span 4
+
+note bottom of t0 : 重复度 p+1\n曲线穿过起点
+note bottom of t4 : 重复度 p+1\n曲线穿过终点
+@enduml
+----
+
+==== 非均匀B样条(Non-Uniform B-Spline)
+
+节点向量中的节点**非等距分布**, 可以任意指定节点位置和重复度. 这是最通用的形式, 可以精细控制曲线在不同区域的光滑程度. 当配合**权重**(Weight)扩展为 **NURBS** 时, 可以精确表示圆弧、圆锥曲线等解析形状.
+
+=== 核心特性
+
+* **局部控制性**: 移动控制点 stem:[P_i] 仅影响参数区间 stem:[(t_i, t_{i+p+1})] 内的曲线段, 其余部分保持不变. 这是B样条相比贝塞尔最核心的优势.
+* **凸包性**: 每一段曲线都包含在其对应控制点的**凸包**内. 由于局部支撑性, 这个凸包比贝塞尔曲线的整体凸包更紧致, 碰撞检测和求交计算更高效.
+* **连续性**: B样条曲线具有内建 stem:[C^{p-1}] 连续性(若节点无重复). 无需像贝塞尔曲线那样手动拼接并约束连续性条件.
+* **仿射不变性**: 对曲线做仿射变换等价于对控制点做相同变换.
+* **强凸包性(Strong Convex Hull)**: 对于参数 u 在节点区间 stem:[t_i, t_{i+1}) 内, 曲线段完全包含在 stem:[p+1] 个控制点的凸包中.
+
+[plantuml, "局部控制性示意图", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+title 移动 P₃ 仅影响局部
+
+rectangle "控制点 P₀" as P0
+rectangle "控制点 P₁" as P1
+rectangle "控制点 P₂" as P2
+rectangle "控制点 P₃" as P3
+rectangle "控制点 P₄" as P4
+rectangle "受影响范围" as Range
+
+P0 --- P1
+P1 --- P2
+P2 --- P3
+P3 --- P4
+
+note right of Range : 移动 P₃ 仅影响\n(t₃, t₃₊ₚ₊₁) 范围
+P3 -left- Range
+@enduml
+----
+
+=== De Boor 算法
+
+De Boor 算法是计算B样条曲线上任意点的**递推方法**, 相当于贝塞尔曲线的 De Casteljau 算法的B样条版本.
+
+给定控制点 stem:[P_i] (i = 0..n), 阶次 **p**, 节点向量和参数 **u**, 算法步骤如下:
+
+. 确定 **u** 所属的节点区间 stem:[t_k, t_{k+1}), 其中 **p** <= k < m-p-1
+. 对区间内的控制点进行递推插值:
+   stem:[P_i^r = (1 - \alpha_{i,r}) P_{i-1}^{r-1} + \alpha_{i,r} P_i^{r-1}]
+   其中 stem:[\alpha_{i,r} = \frac{u - t_i}{t_{i+p+1-r} - t_i}], stem:[r = 1..p], stem:[i = k-p+r .. k]
+. 最终 stem:[P_k^p] 即为曲线上的一点 stem:[C(u)]
+
+[source,pseudo]
+----
+function deBoor(u, p, knots, controlPoints):
+    // 找到 u 所属的节点区间
+    k = findKnotSpan(u, knots, p)
+    // 初始化控制点副本
+    pts = controlPoints[k-p .. k]
+    // 递归计算
+    for r = 1 to p:
+        for i = k-p+r to k:
+            alpha = (u - knots[i]) / (knots[i+p+1-r] - knots[i])
+            pts[i-(k-p)] = (1-alpha) * pts[i-1-(k-p)] + alpha * pts[i-(k-p)]
+    return pts[p]
+----
+
+De Boor 算法的时间复杂度为 stem:[O(p^2)], 对于低阶次(p=3 或 p=2)极为高效.
+
+=== 应用场景
+
+==== 计算机辅助设计(CAD)
+
+B样条曲线是 CAD 系统的**标准曲线表示方式**. 汽车车身、飞机机翼、船舶外壳等工业产品的曲面设计均基于 **NURBS**(Non-Uniform Rational B-Spline, 非均匀有理B样条), 它是B样条在有理形式下的扩展, 可以精确表示圆锥曲线和球面等.
+
+==== 计算机图形学与动画
+
+B样条曲线用于关键帧插值和路径动画, 因其局部控制性允许动画师微调部分路径而不影响整体.
+
+==== 数据拟合与插值
+
+给定一组离散数据点, 通过反算控制点(曲线插值)可以得到一条光滑的B样条曲线作为拟合结果. 这是逆向工程和测量数据处理的基础.
+
+[source,python]
+----
+import numpy as np
+
+def basis_function(i, p, u, knots):
+    """计算第 i 个 p 次B样条基函数在 u 处的值"""
+    if p == 0:
+        return 1.0 if knots[i] <= u < knots[i+1] else 0.0
+    left = (u - knots[i]) / (knots[i+p] - knots[i]) * basis_function(i, p-1, u, knots) \
+           if knots[i+p] != knots[i] else 0.0
+    right = (knots[i+p+1] - u) / (knots[i+p+1] - knots[i+1]) * basis_function(i+1, p-1, u, knots) \
+            if knots[i+p+1] != knots[i+1] else 0.0
+    return left + right
+
+def curve_point(u, p, control_points, knots):
+    """计算B样条曲线上参数 u 对应的点"""
+    n = len(control_points) - 1
+    point = np.zeros(2)
+    for i in range(n + 1):
+        point += basis_function(i, p, u, knots) * control_points[i]
+    return point
+----
+
+==== 字体设计
+
+OpenType 字体中的 TrueType 轮廓使用二阶B样条(即二次均匀B样条)描述字形. CMYK 和 PostScript 字体使用的是贝塞尔曲线.
+
+=== 与贝塞尔曲线的关系
+
+B样条曲线是贝塞尔曲线的**一般化推广**, 两者关系如下:
+
+* 当B样条的节点向量为 stem:[0, 0, ..., 0, 1, 1, ..., 1] (首尾各 **p+1** 个重复), 控制点数量为 **p+1** 时, B样条曲线退化为**贝塞尔曲线**.
+* 贝塞尔曲线可视作B样条曲线的一个**特例**: 单段、无内节点、控制点数量等于阶次 + 1.
+* B样条曲线可以表示为多段贝塞尔曲线的拼接(通过节点插入算法), 这使得现有贝塞尔渲染管线可以直接用于B样条.
+
+WARNING: 虽然B样条在理论上是贝塞尔的一般化, 但实际应用中选择哪种取决于需求: 简单形状选贝塞尔(更简单), 复杂连续曲面选B样条(更灵活).
+
+=== 总结
+
+* B样条曲线通过**节点向量**和**分段基函数**实现了对曲线形状的**局部控制**, 克服了贝塞尔曲线的全局控制局限.
+* **Cox-de Boor 递归公式**是B样条基函数的数学基础, **De Boor 算法**是计算曲线上点的核心方法.
+* 根据节点向量分布分为**均匀、准均匀、非均匀**三类, 其中准均匀B样条最常用.
+* B样条的核心优势: **局部控制性、内建连续性、紧致凸包性、控制点数量与阶次解耦**.
+* **NURBS**(非均匀有理B样条)是B样条在有理形式下的扩展, 是 CAD 行业的标准.
+* B样条是贝塞尔曲线的**一般化推广**, 贝塞尔曲线是B样条的特例.

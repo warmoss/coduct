@@ -1,0 +1,297 @@
+== LDAP原理讲解
+
+=== 什么是 LDAP?
+
+**LDAP**, 全称是 **轻量级目录访问协议**, 是一种用于访问和维护分布式目录信息服务的应用层协议. 它的核心作用可以概括为: **提供一种标准化的方式, 对组织中的资源(人员、设备、应用)进行集中存储、查询和管理**.
+
+* **协议:** LDAP本身定义了客户端如何与服务器通信, 包括连接、认证、查询和修改操作.
+
+* **目录服务:** LDAP服务器存储的是目录数据--一种以"树状结构"组织的、以查询为主、修改为辅的数据集.
+
+* **轻量级:** 相比更早的 **DAP(目录访问协议)** 协议, LDAP简化了大部分操作, 基于TCP/IP直接通信, 效率更高.
+
+你每天都在使用 LDAP 而不自知——企业邮箱系统用 LDAP 查询通讯录, 办公系统用 LDAP 做单点登录, GitHub Enterprise 用 LDAP 同步组织成员.
+
+[[ldap-directory-vs-database]]
+
+=== 目录服务 vs 关系型数据库
+
+很多人第一次接触 LDAP 时最大的困惑是: **LDAP 和数据库有什么区别?**
+
+|===
+| 维度 | LDAP 目录服务 | 关系型数据库(RDBMS)
+
+| **设计目标** | 读多写少, 快速查询 | 读写平衡, 复杂事务
+
+| **数据结构** | 树状层次结构 | 二维表结构
+
+| **查询效率** | 按层级搜索极快 | 需 JOIN 多表, 相对较慢
+
+| **写入性能** | 写入较慢, 不擅长频繁更新 | 写入性能优秀, 支持事务
+
+| **事务支持** | 有限(仅简单原子操作) | 完整 ACID 事务支持
+
+| **扩展方式** | 主从复制、分区 | 分库分表、读写分离
+
+| **典型场景** | 认证、组织架构查询 | 业务系统、交易记录
+
+| **协议** | LDAP | JDBC/ODBC
+
+|===
+
+简单来说: **你用它来"找东西"而不是"记账"**.
+
+=== LDAP 核心概念
+
+==== DIT — 目录信息树
+
+LDAP 的数据以 **树状结构** 组织, 这棵树被称为 **DIT(目录信息树)**. 树的每个节点是一个 **条目(Entry)**, 条目之间通过父子关系形成层级.
+
+[source,text]
+----
+dc=example,dc=com              (根)
+├── ou=people                   (组织单元 - 人员)
+│   ├── uid=zhangsan            (张三)
+│   └── uid=lisi                (李四)
+├── ou=groups                   (组织单元 - 组)
+│   ├── cn=developers           (开发组)
+│   └── cn=admins               (管理组)
+└── ou=devices                  (组织单元 - 设备)
+    └── cn=server-01            (服务器)
+----
+
+==== 条目(Entry)
+
+**条目** 是 LDAP 中最基本的数据单元, 类似于关系型数据库中的"一行记录". 每个条目由一组 **属性(Attribute)** 组成, 并且属于一个或多个 **对象类(ObjectClass)**.
+
+==== DN 和 RDN
+
+**DN(标识名)** 是条目的全局唯一标识, 从树根到该条目的完整路径. 例如: `uid=zhangsan,ou=people,dc=example,dc=com`.
+
+**RDN(相对标识名)** 是条目在其父节点下的唯一标识, 是 DN 的最左部分. 例如上述 DN 中, RDN 是 `uid=zhangsan`.
+
+[WARNING]
+====
+DN 在整棵树中必须是唯一的. 一旦 DN 确定, 该条目的"位置"就固定了. 如果组织架构调整(如从 `ou=people` 移到 `ou=staff`), 则需要修改 DN, 相当于"搬家".
+====
+
+==== 属性(Attribute)
+
+每个条目包含多个属性. 属性由 **类型** 和 **值** 组成. 类型定义了该属性的语法约束(如字符串、整数、二进制).
+
+|===
+| 属性类型 | 说明 | 示例值
+| **uid** | 用户 ID | `zhangsan`
+| **cn** | 通用名称(Common Name) | `张三`
+| **sn** | 姓氏(Surname) | `张`
+| **mail** | 邮箱 | `zhangsan@example.com`
+| **telephoneNumber** | 电话号码 | `+86-10-12345678`
+| **memberOf** | 所属组 DN | `cn=developers,ou=groups,dc=example,dc=com`
+| **userPassword** | 密码(通常哈希存储) | `{SSHA}hashvalue==`
+|===
+
+==== 对象类(ObjectClass)
+
+**对象类** 决定了条目可以包含哪些属性(必须和可选). 对象类之间可以 **继承**:
+
+[source,text]
+----
+top (顶级抽象类)
+└── person (人员)
+    ├── organizationalPerson (组织人员)
+    │   └── inetOrgPerson (互联网组织人员)
+    └── posixAccount (POSIX 账号)
+----
+
+示例: `inetOrgPerson` 继承自 `organizationalPerson`, 后者继承自 `person`. 因此一个 `inetOrgPerson` 可以同时拥有所有这三个类定义的属性.
+
+[source,ldif]
+----
+# LDIF 格式表示的条目
+dn: uid=zhangsan,ou=people,dc=example,dc=com
+objectClass: top
+objectClass: person
+objectClass: organizationalPerson
+objectClass: inetOrgPerson
+uid: zhangsan
+cn: 张三
+sn: 张
+mail: zhangsan@example.com
+telephoneNumber: +86-10-12345678
+userPassword: {SSHA}hashvalue==
+----
+
+[NOTE]
+====
+**LDIF(LDAP 数据交换格式)** 是 LDAP 数据的标准文本表示格式, 用于导入/导出和手动编辑 LDAP 数据.
+====
+
+=== LDAP 协议操作
+
+LDAP 协议定义了客户端与服务器之间的一系列操作, 以下是核心操作:
+
+==== 连接与认证 — Bind
+
+Bind 操作用于 **建立会话** 和 **认证身份**. LDAP 支持多种认证方式:
+
+* **匿名绑定:** 不需要用户名密码, 仅用于公共信息查询. 大多数 LDAP 服务器默认允许匿名查询.
+
+* **简单绑定:** 使用 DN 和密码进行认证, 明文传输(需要 TLS/SSL 保护).
+
+* **SASL 绑定:** 通过 SASL 框架支持多种安全认证机制, 如 `DIGEST-MD5`, `GSSAPI(Kerberos)`, `EXTERNAL(客户端证书)`.
+
+==== 查询 — Search
+
+Search 是 LDAP 中使用频率最高的操作. 一个搜索请求包含以下关键参数:
+
+* **baseDN:** 搜索的起始节点, 例如 `dc=example,dc=com`.
+
+* **scope:** 搜索范围:
+  * `base` — 只查询 baseDN 对应的条目本身.
+  * `one` — 查询 baseDN 的直接子条目(不递归).
+  * `sub` — 查询 baseDN 下的所有子条目(递归).
+
+* **filter:** 过滤条件, 使用 LDAP 过滤器语法:
+  * `(uid=zhangsan)` — uid 等于 zhangsan.
+  * `(&(objectClass=inetOrgPerson)(mail=*@example.com))` — 所有人员且邮箱以 `@example.com` 结尾.
+  * `(|(cn=*张三*)(sn=*张*))` — 姓名或姓氏包含"张"的条目.
+  * `(!(memberOf=cn=admins,ou=groups,dc=example,dc=com))` — 不属于管理组的条目.
+
+* **attributes:** 需要返回的属性列表, 为空则返回所有属性.
+
+[plantuml, "LDAP Search 查询流程", format=png]
+----
+@startuml
+actor "LDAP客户端" as client
+participant "LDAP服务器" as server
+
+client -> server: **Bind Request** (dn: cn=admin,dc=example,dc=com)
+server --> client: **Bind Response** (成功)
+client -> server: **Search Request** (baseDN, scope, filter, attributes)
+server --> client: **Search Result Entry** (符合条件的所有条目)
+server --> client: **Search Result Done** (查询完成)
+client -> server: **Unbind** (断开连接)
+@enduml
+----
+
+==== 修改操作
+
+LDAP 支持三种基本修改操作:
+
+* **Add:** 添加新条目到 DIT.
+* **Modify:** 修改现有条目的属性(添加/替换/删除属性值).
+* **Modify DN:** 修改条目的 RDN 或移动条目到新的父节点.
+* **Delete:** 删除条目(仅能删除叶节点, 非叶节点需先删除子条目).
+
+==== 其他操作
+
+* **Compare:** 判断条目中某个属性是否等于指定值.
+* **Abandon:** 放弃正在执行的操作.
+* **Extended Operation:** 扩展操作, 支持厂商自定义操作(如密码修改、启动 TLS).
+
+=== LDAP 协议数据单元(PDU)格式
+
+LDAP 报文使用 **ASN.1 的 BER 编码** 进行传输. 每次交互包含一个消息ID和对应的操作结构:
+
+[source,text]
+----
+LDAPMessage ::= SEQUENCE {
+    messageID       INTEGER (0..maxInt),
+    protocolOp      CHOICE {
+        bindRequest     BindRequest,
+        bindResponse    BindResponse,
+        searchRequest   SearchRequest,
+        searchResEntry  SearchResultEntry,
+        searchResDone   SearchResultDone,
+        ...
+    }
+}
+----
+
+虽然你不需要自己实现 LDAP 报文编码, 但理解这个结构有助于读 LDAP 调试日志.
+
+[[ldap-vs-kerberos]]
+
+=== LDAP 在认证中的角色
+
+LDAP 最广泛的应用是作为 **统一认证中心**. 常见的架构组合是 **LDAP + Kerberos**:
+
+* **LDAP:** 存储用户信息(用户名、全名、邮箱、部门、组等).
+* **Kerberos:** 处理密码认证和票据发放.
+
+|===
+| 职责 | LDAP | Kerberos
+| **存储用户元数据** | 是 | 否
+| **密码验证** | 可选 | 是
+| **单点登录(SSO)** | 部分支持 | 核心能力
+| **密码策略** | 支持(复杂度、有效期) | 否
+| **数据查询** | 丰富, 支持过滤 | 不支持
+|===
+
+实际企业场景中, 用户认证流程通常是:
+
+. 用户输入用户名和密码.
+. 应用通过 SASL GSSAPI 将认证委托给 Kerberos.
+. Kerberos 验证密码并发给票据(TGT).
+. 应用通过 LDAP 查询用户的详细信息(组、权限等).
+
+=== LDAP 的部署和安全
+
+==== 复制架构
+
+LDAP 支持 **主从复制** 来保证高可用:
+
+* **消费者(Consumer):** 只读副本, 响应查询请求, 减轻主服务器压力.
+
+* **提供者(Provider):** 主服务器, 处理写入操作, 将变更推送到消费者.
+
+OpenLDAP 使用 **syncrepl** 协议实现同步, 支持 **刷新与持久(ridp)** 模式(类似数据库的异步复制).
+
+==== 安全加固
+
+* **LDAPS(636端口):** LDAP over TLS, 加密所有通信内容, 防止中间人窃听.
+
+* **StartTLS(389端口):** 先建立明文连接, 再通过 Extended Operation 升级为 TLS 加密.
+
+* **ACL(访问控制列表):** 精准控制不同用户对不同条目的访问权限. 例如: 普通用户可修改自己的密码, 管理员可修改所有信息.
+
+* **密码策略:** 密码复杂度、有效期、锁定策略等.
+
+=== 常见 LDAP 服务器软件
+
+|===
+| 软件 | 特点
+| **OpenLDAP** | 开源, 最广泛使用, 灵活但配置复杂
+| **Microsoft Active Directory** | 商业, LDAP + Kerberos + DNS 深度集成, 生态完善
+| **389 Directory Server** | Red Hat 维护的开源目录服务器
+| **Apache Directory Server** | Java 实现, 支持嵌入式
+| **Apple Open Directory** | macOS 服务器内置的目录服务
+|===
+
+=== LDAP 的常见应用场景
+
+* **企业统一登录(SSO):** 员工使用同一套账号密码登录邮箱、VPN、内网门户、Wi-Fi 等所有系统.
+
+* **组织架构管理:** 集中管理员工信息、部门结构、汇报关系, HR 系统变更后同步到 LDAP.
+
+* **邮件系统地址簿:** 邮件客户端通过 LDAP 查询企业通讯录.
+
+* **网络设备认证:** 路由器、交换机、VPN 网关通过 LDAP 验证管理员身份.
+
+* **Unix/Linux 集中用户管理:** 通过 `nss_ldap` 和 `pam_ldap` 实现多台服务器的统一用户登录.
+
+* **数字证书管理:** PKI 系统使用 LDAP 发布和查询证书撤销列表(CRL).
+
+=== 总结
+
+* **LDAP** 是一个树状的、读优化的目录访问协议, 适合存储组织结构、用户身份等"被查询远多于被修改"的数据.
+
+* 核心概念包括 **DIT**(树)、**Entry**(节点)、**DN/RDN**(路径标识)、**Attribute**(属性)和 **ObjectClass**(属性模板).
+
+* **Search** 是 LDAP 最核心的操作, 支持灵活的 baseDN、scope 和 filter 组合.
+
+* **Bind** 操作提供匿名、简单和 SASL 三种认证方式, 生产环境推荐使用 SASL + TLS.
+
+* LDAP 常与 **Kerberos** 配合, 形成"LDAP 存用户信息 + Kerberos 做密码认证"的经典企业认证架构.
+
+* **注意点:** LDAP 不适合做高写入场景; LDAP 协议默认明文传输(389端口), 务必开启 LDAPS(636) 或 StartTLS 保护数据安全; 良好的 DIT 设计直接影响查询效率, 建议控制树的深度不超过 5 层.

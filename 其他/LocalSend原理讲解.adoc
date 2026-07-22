@@ -1,0 +1,304 @@
+== LocalSend原理讲解
+
+=== 概述
+
+**LocalSend** 是一个开源的、跨平台的局域网文件传输工具. 它不依赖互联网连接, 不经过任何第三方服务器, 直接在本地网络中通过 **REST API** 和 **HTTPS** 完成设备发现和文件传输. 其核心设计理念是: **纯局域网、端到端直连、零信任第三方**.
+
+LocalSend 解决的核心问题:
+
+* **隐私安全:** 文件不经过任何云端中转, 仅在局域网内点对点传输
+* **无需联网:** 在没有互联网的环境中(如内网、飞机上)也能快速传输文件
+* **跨平台:** 支持 Windows、macOS、Linux、Android、iOS, 各平台间互传无差异
+* **零配置:** 设备自动发现, 无需 IP 地址或扫码, 即开即用
+
+=== LocalSend 是什么?
+
+**LocalSend**:: 一个基于 Flutter 构建的开源文件传输应用, 使用 mDNS 发现设备、REST API + HTTPS 传输文件, 所有通信在局域网内完成.
+
+**mDNS (Multicast DNS)**:: 一种无需传统 DNS 服务器的域名解析协议, 设备在局域网内通过多播方式广播自身服务, 其他设备通过监听多播消息发现服务.
+
+**REST API**:: LocalSend 定义了一组 HTTP 端点用于设备信息交换、文件发送和信息确认, 各端点的语义遵循 RESTful 风格.
+
+**自签名证书**:: LocalSend 在启动时动态生成自签名 TLS 证书, 用于 HTTPS 通信的加密, 保证传输过程的机密性.
+
+WARNING: LocalSend 不依赖任何中心服务器, 所有功能在完全离线的局域网中即可工作. 这也是它区别于 Send Anywhere、AirDrop(依赖蓝牙和 Apple 服务)等方案的核心特征.
+
+=== 核心架构
+
+LocalSend 的整体架构可以概括为三个层次:
+
+[plantuml,"LocalSend 架构概览",format=png]
+----
+@startuml
+package "设备 A (发送方)" {
+  [UI 层 (Flutter)]
+  [协议层 (REST API Client)]
+  [发现层 (mDNS Service)]
+}
+
+package "设备 B (接收方)" {
+  [UI 层 (Flutter)]
+  [协议层 (REST API Server)]
+  [发现层 (mDNS Listener)]
+}
+
+package "局域网" {
+  (mDNS 多播) as mdns
+  (HTTPS 直连) as https
+}
+
+发现层 --> mdns : 广播/发现服务
+协议层 --> https : 文件传输
+@enduml
+----
+
+三个层次各自职责:
+
+* **发现层:** 基于 mDNS 协议, 实现设备的自动发现和服务信息交换
+* **协议层:** 基于 REST API + HTTPS, 负责文件发送、接收和状态确认
+* **UI 层:** 基于 Flutter 框架, 提供统一的跨平台用户界面
+
+=== 设备发现: mDNS
+
+LocalSend 使用 mDNS (Multicast DNS) 实现零配置设备发现. 这是整个系统的入口, 决定了用户能否"开箱即用".
+
+==== mDNS 工作原理
+
+mDNS 让设备在局域网内以 **多播** 方式发布和查询服务, 无需中心 DNS 服务器:
+
+[plantuml,"mDNS 设备发现流程",format=png]
+----
+@startuml
+actor "设备 A" as A
+actor "设备 B" as B
+participant "局域网 224.0.0.251:5353" as LAN
+
+A -> LAN: 加入多播组, 监听 5353 端口
+B -> LAN: 加入多播组, 监听 5353 端口
+
+A -> LAN: 发送 mDNS 查询: _localsend._tcp.local
+LAN -> B: 多播转发查询
+B -> LAN: 回复 mDNS 应答: 包含 IP、端口、设备名
+LAN -> A: 多播转发应答
+
+A -> LAN: 发送 mDNS 查询: _localsend._tcp.local
+LAN -> A: 再次多播已缓存的 B 的应答
+
+note over A: 发现设备 B (192.168.1.5:53317)
+A -> B: HTTPS 请求获取设备信息
+B -> A: 返回设备名、头像等信息
+@enduml
+----
+
+关键细节:
+
+* **多播地址:** `224.0.0.251:5353` (IPv4) 或 `[FF02::FB]:5353` (IPv6)
+* **服务类型:** `_localsend._tcp.local`, 这是 LocalSend 注册的 mDNS 服务类型
+* **TTL 缓存:** mDNS 应答默认有 TTL (通常 120 秒), 缓存期内设备再次查询可直接使用缓存结果
+* **探测冲突:** 新设备加入网络时会发送探测消息, 确保设备名不冲突
+
+[source,shell]
+----
+# 使用 avahi-browse 查看局域网中的 LocalSend 服务
+avahi-browse _localsend._tcp -r
+
+# 输出示例
+# = enp0s3 IPv4 My-Phone                                 _localsend._tcp  local
+#    hostname = [My-Phone.local]
+#    address = [192.168.1.5]
+#    port = [53317]
+#    txt = ["version=1.0"]
+----
+
+==== 服务信息包含的内容
+
+每个 LocalSend 设备通过 mDNS 发布的 TXT 记录包含:
+
+* **设备名:** 用户自定义的设备名称, 如 "Xiaomi 14"
+* **版本:** 协议版本号, 如 `version=1.0`
+* **IP 地址:** 设备在局域网中的 IP
+* **端口:** HTTPS 服务监听的端口(默认 `53317`)
+* **设备类型:** 可选的设备类别标识
+
+=== 文件传输协议
+
+LocalSend 定义了一套基于 REST API 的文件传输协议. 所有通信基于 HTTPS, 使用自签名证书加密.
+
+==== 自签名证书
+
+每次 LocalSend 启动时, 应用动态生成一个自签名 TLS 证书:
+
+[source,dart]
+----
+// LocalSend 证书生成逻辑(简化)
+Future<SecurityContext> createSelfSignedContext() async {
+  final key = RSA.generate(2048);
+  final now = DateTime.now();
+  final cert = X509Certificate(
+    key,
+    subject: 'CN=${deviceName}.local',
+    start: now,
+    end: now.add(const Duration(days: 30)),
+  );
+  return SecurityContext(
+    certificate: cert.pem,
+    privateKey: key.toPEM(),
+  );
+}
+----
+
+由于证书是自签名的, 客户端在首次连接时需要**信任未知 CA**. LocalSend 的处理方式是: 在应用层面验证对方的指纹(SHA-256), 而非依赖系统 CA 链.
+
+==== REST API 端点
+
+LocalSend 协议定义了 4 个核心 API 端点:
+
+[cols="2,2,3"]
+|===
+| 方法 | 端点 | 用途
+
+| `GET`
+| `/api/localsend/v2/info`
+| 获取设备信息(设备名、版本、支持的发送方式)
+
+| `POST`
+| `/api/localsend/v2/send-request`
+| 发送方请求接收方确认接收文件(包含文件列表)
+
+| `POST`
+| `/api/localsend/v2/upload`
+| 上传文件数据到接收方
+
+| `POST`
+| `/api/localsend/v2/cancel`
+| 取消正在进行的发送
+|===
+
+==== 完整文件发送流程
+
+[plantuml,"文件发送时序",format=png]
+----
+@startuml
+actor "发送方" as S
+actor "接收方" as R
+
+S -> R: [1] GET /api/localsend/v2/info
+R --> S: 设备信息(deviceName, protocolVersion, ...)
+
+S -> R: [2] POST /api/localsend/v2/send-request
+note right: 包含文件列表: {files: [{id, fileName, size, fileType, sha256}]}
+R --> S: 确认响应(sessionId)
+
+S -> R: [3] POST /api/localsend/v2/upload
+note right: multipart/form-data 上传文件内容
+R --> S: 上传完成确认
+
+S -> R: [4] 重复步骤 3 直到所有文件上传完毕
+
+S -> R: [5] POST /api/localsend/v2/send-request (完成通知)
+R --> S: 接收完成确认
+@enduml
+----
+
+各步骤详解:
+
+. **获取设备信息:** 发送方调用 `/info` 确认接收方处于在线状态, 并获取其支持的协议版本和功能特性
+. **发送请求:** 发送方将文件列表(含文件名、大小、SHA-256 哈希)发送给接收方, 接收方弹出通知让用户确认或拒绝
+. **上传文件:** 接收方确认后, 发送方通过 `multipart/form-data` 逐文件上传实际内容. 上传时携带步骤 2 返回的 `sessionId` 以关联会话
+. **完成通知:** 所有文件上传完毕后, 发送方再次通知接收方, 接收方完成文件写入并清理临时数据
+
+[source,shell]
+----
+# 使用 curl 模拟 LocalSend 发送流程
+
+# 1. 获取设备信息
+curl -k https://192.168.1.5:53317/api/localsend/v2/info
+
+# 2. 发送文件请求
+curl -k -X POST https://192.168.1.5:53317/api/localsend/v2/send-request \
+  -H "Content-Type: application/json" \
+  -d '{
+    "files": [
+      {
+        "id": "file1",
+        "fileName": "photo.jpg",
+        "size": 2048576,
+        "fileType": "image/jpeg",
+        "sha256": "abc123..."
+      }
+    ]
+  }'
+
+# 3. 上传文件
+curl -k -X POST https://192.168.1.5:53317/api/localsend/v2/upload \
+  -F "sessionId=session_xxx" \
+  -F "fileId=file1" \
+  -F "file=@photo.jpg"
+----
+
+TIP: `-k` 参数跳过 TLS 证书验证, 因为 LocalSend 使用自签名证书, 系统 CA 链无法验证其合法性.
+
+==== 安全性设计
+
+LocalSend 的安全性建立在以下几个机制上:
+
+* **传输加密:** 所有通信走 HTTPS, 即使在内网也无法被中间人嗅探文件内容
+* **文件校验:** 每个文件携带 SHA-256 哈希, 接收方校验完整性
+* **接收确认:** 文件不会自动接收, 必须由用户在接收方确认后才开始传输
+* **纯本地:** 不经过任何外部服务器, 不存在云端泄露风险
+
+CAUTION: LocalSend 使用自签名证书, 无法防止局域网内的主动中间人攻击. 在公共 WiFi 等高危网络环境中, 传输敏感文件仍需谨慎. 相比而言, AirDrop 使用 Apple 签名的证书和蓝牙带外验证, 安全性更高.
+
+=== 与同类方案的对比
+
+[cols="2,2,2,2,2"]
+|===
+| 特性 | LocalSend | AirDrop | 微信文件传输助手 | Send Anywhere
+
+| 网络依赖
+| 纯局域网
+| 局域网 + 蓝牙
+| 互联网
+| 互联网(或 P2P)
+
+| 中间服务器
+| 无
+| Apple 服务(发现)
+| 腾讯服务器
+| 中转服务器(可选 P2P)
+
+| 传输加密
+| HTTPS 自签名
+| Apple 端到端加密
+| 仅 TLS
+| 端到端加密
+
+| 平台覆盖
+| Windows/macOS/Linux/Android/iOS
+| 仅 Apple 生态
+| 全平台(需登录)
+| Windows/Android/iOS
+
+| 是否需要账号
+| 否
+| 是(Apple ID)
+| 是(微信账号)
+| 否(但需一次性密钥)
+|===
+
+=== 总结与注意事项
+
+LocalSend 的设计哲学是 **简单、隐私、零依赖**. 它通过 mDNS + REST API + HTTPS 三个成熟协议组合, 实现了一个无需任何基础设施的局域网文件传输方案.
+
+关键要点:
+
+* **发现层** 依赖 mDNS 多播, 要求设备在同一广播域(通常同一网段)内
+* **传输层** 使用 HTTPS 自签名证书, 保证了传输机密性但无法防中间人
+* **协议层** 是 HTTP REST API, 可通过 curl 等工具直接调用, 易于集成和调试
+* **安全边界** 在于局域网物理安全, 不适合在不可信网络传输高度敏感数据
+
+常见问题:
+
+* **跨 VLAN 无法发现:** mDNS 多播通常不会跨 VLAN 转发. 可在路由器上配置 mDNS 中继或使用 avahi-daemon 的 reflector 功能
+* **防火墙阻止连接:** 接收方防火墙需放行端口 `53317` (TCP). Windows Defender 可能默认阻止, 需添加规则
+* **大量小文件传输慢:** 每个文件需独立上传, 大量小文件场景下 HTTP 握手和 TLS 开销显著

@@ -1,0 +1,484 @@
+== ubuntu Socket Activation 原理讲解
+
+=== 概述
+
+**Socket Activation** 是 systemd 引入的一种按需启动服务的机制. 其核心思想是: **由 systemd 代替服务进程监听网络或 Unix socket, 当有连接请求到达时, 再启动对应的服务进程, 并将已就绪的 socket 文件描述符传递给该进程.**
+
+Socket Activation 解决的核心问题:
+
+* **资源浪费:** 传统 SysV init 下, 所有服务在系统启动时一并拉起, 即使暂时无人访问也占用进程表和内存
+* **启动顺序依赖:** 服务 A 依赖服务 B 先启动, 导致启动脚本需要复杂的优先级编排
+* **可靠性不足:** 服务崩溃后 socket 也随之关闭, 导致客户端立即收到连接拒绝, 而非优雅的等待或重试
+
+=== 什么是 Socket Activation?
+
+**Socket Activation**:: systemd 的一种激活策略, 由 systemd 创建并持有 socket, 仅在流量到达时按需派生子进程提供服务.
+
+**socket unit**:: 后缀为 `.socket` 的 systemd 单元文件, 描述 systemd 需要监听哪些地址或路径.
+
+**service unit**:: 后缀为 `.service` 的 systemd 单元文件, 描述实际提供服务的进程如何启动.
+
+**文件描述符传递 (FD Passing)**:: systemd 通过 `sd_listen_fds()` 或环境变量 `$LISTEN_FDS` 将监听中的 socket fd 传递给服务进程.
+
+=== 核心架构
+
+Socket Activation 的架构由三个角色构成:
+
+[plantuml,"Socket Activation 架构",format=png]
+----
+@startuml
+actor "客户端" as client
+participant "systemd" as sd
+participant "socket unit\n(nginx.socket)" as sock
+participant "service unit\n(nginx.service)" as svc
+participant "服务进程\n(nginx)" as proc
+
+client -> sd: 发起连接请求
+activate sd
+sd -> sock: 检查 socket unit 状态
+sock --> sd: 连接已就绪
+sd -> svc: 激活 service unit
+deactivate sd
+activate svc
+svc -> proc: fork + exec 启动 nginx
+svc --> proc: 传递 socket fd
+deactivate svc
+activate proc
+proc -> client: 接受连接并处理
+deactivate proc
+@enduml
+----
+
+关键要点:
+
+* systemd 在服务启动前就已经调用 `socket()` -> `bind()` -> `listen()` 完成了监听
+* 服务进程启动时, systemd 通过 `sd_listen_fds(0)` 将已就绪的 fd 传递过去
+* 服务进程直接 `accept()` 即可处理连接, **无需自行创建 socket**
+
+=== Socket Unit 与服务单元配置
+
+==== Socket Unit 文件
+
+`socket unit` 的典型配置位于 `/etc/systemd/system/` 下, 以 `.socket` 为后缀.
+
+[source,ini]
+----
+[Unit]
+Description=My App Socket
+PartOf=myapp.service
+
+[Socket]
+ListenStream=0.0.0.0:8080
+Accept=false
+
+[Install]
+WantedBy=sockets.target
+----
+
+核心配置项说明:
+
+[cols="2,3"]
+|===
+| 配置项 | 说明
+
+| `ListenStream`
+| TCP socket 监听地址, 格式 `地址:端口`
+
+| `ListenDatagram`
+| UDP socket 监听地址
+
+| `ListenSequentialPacket`
+| SCTP 或 Unix 序列包 socket
+
+| `ListenFIFO`
+| FIFO 命名管道监听
+
+| `ListenMessageQueue`
+| POSIX 消息队列监听
+
+| `Accept`
+| `true` - systemd 代为 `accept()` 每个连接, 每个连接启动一个服务实例; `false`(默认) - 将监听 fd 传给服务, 由服务自行 `accept()`
+|===
+
+==== Service Unit 文件
+
+对应的 `.service` 文件无需做特殊处理即可接收 socket fd:
+
+[source,ini]
+----
+[Unit]
+Description=My App Service
+Requires=myapp.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/myapp
+
+[Install]
+Also=myapp.socket
+----
+
+关键: `Requires=myapp.socket` 建立了 socket unit 与 service unit 的依赖关系, 确保 systemd 先创建 socket 再启动服务.
+
+==== 文件描述符传递机制
+
+当 systemd 启动一个关联了 socket unit 的服务时, 会通过以下方式传递 fd:
+
+* 设置环境变量 `$LISTEN_FDS` 为 socket fd 的数量
+* 从 fd **3** 开始分配, 即 `$LISTEN_FDS` 个 fd 占用 `3` 到 `3 + $LISTEN_FDS - 1`
+* 服务进程调用 `sd_listen_fds(0)` (libsystemd 提供) 获取 fd 数组
+
+[source,c]
+----
+#include <systemd/sd-daemon.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/socket.h>
+
+int main(void) {
+    int n = sd_listen_fds(0);    // <1>
+    if (n < 0) {
+        fprintf(stderr, "sd_listen_fds failed\n");
+        return 1;
+    }
+
+    for (int i = 0; i < n; i++) {
+        int fd = SD_LISTEN_FDS_START + i;   // <2>
+        // 直接 accept 即可
+        int client = accept(fd, NULL, NULL);
+        // ... 处理客户端请求 ...
+        close(client);
+    }
+    return 0;
+}
+----
+<1> 获取 systemd 传递的 fd 数量
+<2> `SD_LISTEN_FDS_START` 恒为 3
+
+[source,python]
+----
+import socket
+import os
+
+# systemd 传递的 fd 数量在环境变量 LISTEN_FDS 中
+n = int(os.environ.get("LISTEN_FDS", 0))
+if n > 0:
+    # fd 从 3 开始
+    fd = socket.fromfd(3, socket.AF_INET, socket.SOCK_STREAM)
+    conn, addr = fd.accept()
+    # ... 处理请求 ...
+----
+
+WARNING: 服务进程必须从 fd 3 开始读取, 不得假设 `stdin`(0)、`stdout`(1)、`stderr`(2) 之外的 fd 可用. systemd 保证在 `exec` 之前正确关闭了除传递 fd 外的所有多余 fd.
+
+=== Accept 模式的两种行为
+
+==== Accept=false (默认) - 监听传递模式
+
+systemd 只负责创建监听 socket, **不执行** `accept()`. 服务启动后自行调用 `accept()` 接收连接.
+
+**适用场景:** 高并发服务(Nginx、Apache、Node.js), 服务内部需要控制连接处理逻辑.
+
+[source,ini]
+----
+[Socket]
+ListenStream=0.0.0.0:8080
+Accept=false
+----
+
+==== Accept=true - 每连接实例化模式
+
+systemd 负责执行 `accept()`, 每个连接到达时 systemd 启动一个独立的服务实例来处理.
+
+**适用场景:** 传统 UNIX 服务(如 SSH、CUPS), 每个连接独立运行一个进程实例, 连接关闭后进程自动退出.
+
+[source,ini]
+----
+[Socket]
+ListenStream=0.0.0.0:2222
+Accept=true
+
+[Service]
+ExecStart=/usr/sbin/sshd -i       # -i 表示从 stdin 处理连接
+StandardInput=socket              # <1>
+----
+<1> `StandardInput=socket` 将连接的 socket 重定向到服务进程的 stdin
+
+=== Socket Activation 的完整工作流程
+
+以 `nginx.socket` 和 `nginx.service` 为例说明完整流程:
+
+[plantuml,"Socket Activation 启动流程",format=png]
+----
+@startuml
+participant "systemd" as sd
+participant "socket:80" as sock
+participant "nginx 进程" as nginx
+participant "客户端" as client
+
+== 系统启动阶段 ==
+sd -> sd: 读取 nginx.socket 配置
+sd -> sock: socket() + bind() + listen()
+sock --> sd: fd=3 监听成功
+note right: socket 就绪, 但 nginx 尚未启动
+
+== 连接到达阶段 ==
+client -> sock: TCP SYN 连接到 80 端口
+sock -> sd: 触发激活事件
+activate sd
+sd -> sd: 查找关联的 nginx.service
+sd -> nginx: fork + exec nginx
+note right: 传递 fd=3 (监听 socket)
+deactivate sd
+
+== 服务处理阶段 ==
+activate nginx
+nginx -> sock: accept() 接受连接
+sock -> client: TCP 握手完成
+nginx -> client: 处理 HTTP 请求
+deactivate nginx
+@enduml
+----
+
+步骤分解:
+
+. **系统启动:** systemd 解析 `nginx.socket`, 执行 `socket()` -> `bind()` -> `listen(80)`, 监听成功但 nginx 本身尚未启动
+
+. **连接到达:** 客户端发起 TCP 连接到 80 端口, 内核协议栈将数据包递送到 systemd 持有的 socket
+
+. **激活服务:** systemd 检测到新连接, 根据 socket unit 的 `Service=` 配置(隐式从文件名匹配), 激活对应的 service unit
+
+. **传递 fd:** systemd 执行 `fork()` + `exec()`, 在 `exec` 前将监听 socket fd(从 3 开始)保留, 并设置 `$LISTEN_FDS` 环境变量
+
+. **服务处理:** nginx 启动后调用 `sd_listen_fds(0)` 获取 fd, 然后执行 `accept()` 处理进入的连接
+
+=== 核心优势
+
+[cols="1,3"]
+|===
+| 优势 | 说明
+
+| 按需启动
+| 服务仅在首次请求到达时才启动, 减少系统启动时间和空闲资源占用
+
+| 并行启动
+| socket unit 可在对应 service unit 之前先就绪, 解除启动顺序依赖. 系统启动时, 所有 socket 可并行创建
+
+| 故障恢复
+| 服务崩溃后 systemd 持有的 socket **依然存在**, 后续连接请求被内核队列缓存. systemd 可配置自动重启服务, 客户端不会立即感知故障
+
+| 平滑重启
+| 重启服务时, 旧的 socket fd 被保留, 新老版本可以在 socket 上共存. 实现零停机升级
+
+| 资源隔离
+| 停止不需要的服务释放内存和进程表; 流量重新到来时自动重新激活
+|===
+
+=== 实战: 搭建一个 Socket Activation 服务
+
+==== Python 示例
+
+编写一个简单的 echo 服务, 通过 Socket Activation 启动:
+
+[source,python]
+----
+import socket
+import os
+import sys
+
+def main():
+    # 获取 systemd 传递的 fd 数量
+    n = int(os.environ.get("LISTEN_FDS", 0))
+    if n < 1:
+        print("No socket fd passed", file=sys.stderr)
+        sys.exit(1)
+
+    # 从 fd 3 创建 socket 对象
+    listen_fd = socket.fromfd(3, socket.AF_INET, socket.SOCK_STREAM)
+
+    while True:
+        conn, addr = listen_fd.accept()
+        with conn:
+            data = conn.recv(1024)
+            conn.sendall(data)
+
+if __name__ == "__main__":
+    main()
+----
+
+创建对应的 unit 文件:
+
+[source,ini]
+----
+# /etc/systemd/system/echo.socket
+[Unit]
+Description=Echo Server Socket
+
+[Socket]
+ListenStream=0.0.0.0:9999
+Accept=false
+
+[Install]
+WantedBy=sockets.target
+----
+
+[source,ini]
+----
+# /etc/systemd/system/echo.service
+[Unit]
+Description=Echo Server
+Requires=echo.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/echo-server.py
+User=nobody
+Group=nogroup
+Restart=on-failure
+
+[Install]
+Also=echo.socket
+----
+
+启用并测试:
+
+[source,shell]
+----
+# 重新加载 systemd 配置
+sudo systemctl daemon-reload
+
+# 启用并启动 socket (服务不会启动, 只创建 socket)
+sudo systemctl enable --now echo.socket
+
+# 验证监听状态
+sudo systemctl status echo.socket
+# ● echo.socket - Echo Server Socket
+#    State: running
+#    Listen: 0.0.0.0:9999 (Stream)
+
+# 发起连接, 触发服务启动
+echo "hello" | nc localhost 9999
+# hello
+
+# 观察服务自动启动
+sudo systemctl status echo.service
+# ● echo.service - Echo Server
+#    Active: active (running)
+#    ...
+
+# 停止 socket 监听
+sudo systemctl stop echo.socket
+----
+
+==== Nginx 示例
+
+Nginx 原生支持 systemd Socket Activation, 只需创建 socket unit:
+
+[source,ini]
+----
+# /etc/systemd/system/nginx.socket
+[Unit]
+Description=Nginx HTTP Server Socket
+PartOf=nginx.service
+
+[Socket]
+ListenStream=0.0.0.0:80
+Accept=false
+
+[Install]
+WantedBy=sockets.target
+----
+
+修改 `nginx.service`, 将 `Sockets=` 指向 nginx.socket:
+
+[source,ini]
+----
+[Unit]
+Description=The NGINX HTTP and reverse proxy server
+Requires=nginx.socket
+
+[Service]
+Type=forking
+ExecStartPre=/usr/sbin/nginx -t
+ExecStart=/usr/sbin/nginx
+ExecReload=/usr/sbin/nginx -s reload
+ExecStop=/usr/sbin/nginx -s quit
+Sockets=nginx.socket
+----
+
+[source,shell]
+----
+# 启用 Socket Activation
+sudo systemctl disable --now nginx.service   # 停止传统启动
+sudo systemctl enable --now nginx.socket      # 启用 socket
+
+# 验证: nginx 进程未运行, 但 80 端口已在监听
+ss -tlnp | grep :80
+# LISTEN 0  511  0.0.0.0:80  0.0.0.0:*  users:(("systemd",pid=1,fd=...))
+
+# 访问触发
+curl http://localhost/
+# nginx 被自动激活并处理请求
+----
+
+=== 与传统启动方式对比
+
+[cols="1,3,3"]
+|===
+| 对比维度 | 传统 SysV/systemd 直接启动 | Socket Activation
+
+| 启动策略
+| 系统启动时同时启动所有服务, 无论是否被使用
+| 系统启动时仅创建 socket, 服务按需延迟启动
+
+| 内存占用
+| 所有服务进程常驻内存, 即使空闲
+| 空闲服务不占用内存, 仅 socket 占用极少量内核资源
+
+| 启动依赖
+| 需要显式编排启动顺序(如 `After=network.target`)
+| socket unit 先就绪即可, 服务可在连接到达时随时启动, 无需依赖网络就绪
+
+| 故障恢复
+| 服务崩溃后 socket 随之关闭, 客户端收到 `Connection refused`
+| systemd 持有的 socket 持续存在, 内核队列缓存连接, 系统自动重启服务
+
+| 并行度
+| 串行或有限并行启动服务
+| 所有 socket 可完全并行创建, 大幅缩短系统启动时间
+|===
+
+=== 注意事项与最佳实践
+
+* **`Accept=true` 慎用于高并发场景:** 每连接 fork 一个进程的开销很大, 适合 SSH、FTP 等低频连接. 高并发 Web 服务应使用 `Accept=false`.
+
+* **确保服务支持 Socket Activation:** 不是所有程序都原生支持从 fd 3 接收 socket. 需要应用程序显式调用 `sd_listen_fds()` 或读取 `$LISTEN_FDS` 环境变量.
+
+* **`Restart=` 策略配合使用:** 建议设置 `Restart=on-failure`, 确保服务崩溃后 systemd 自动重新调度. 配合 socket 持久化, 实现客户端无感恢复.
+
+* **单元文件命名一致性:** `.socket` 和 `.service` 应同名(如 `echo.socket` 和 `echo.service`), systemd 默认通过文件名前缀建立关联.
+
+* **检查 socket 状态:** 使用 `systemctl status <name>.socket` 和 `systemctl list-sockets` 查看所有 socket 状态.
+
+[source,shell]
+----
+# 列出所有 Socket Activation 单元
+systemctl list-sockets
+# 输出示例:
+#  Listen          Unit                        Activates
+#  0.0.0.0:80      nginx.socket               nginx.service
+#  0.0.0.0:9999    echo.socket                echo.service
+#  /run/xxx.sock   xxx.socket                 xxx.service
+----
+
+* **注意 `StandardInput=socket` 的适用性:** 仅当 `Accept=true` 时使用, 将已 `accept()` 的连接重定向到进程的 stdin/stdout. `Accept=false` 模式下, 服务需要通过 fd 自行 `accept()`.
+
+=== 总结
+
+Socket Activation 是 systemd 提供的一种优雅的按需启动机制, 核心要点:
+
+* systemd 代替服务进程完成 `socket()` -> `bind()` -> `listen()`, 服务启动时通过 fd 传递机制继承监听 socket
+* 两种模式: `Accept=false`(传递监听 fd) 适用于高并发服务; `Accept=true`(每连接启动实例) 适用于传统 UNIX 服务
+* 关键优势包括: 按需启动节省资源、解除启动顺序依赖、服务崩溃后 socket 持久化实现自动恢复
+* 服务程序需调用 `sd_listen_fds()` 或解析 `$LISTEN_FDS` 环境变量来接收 systemd 传递的 fd
+* 适用场景广泛: Web 服务器、应用服务器、消息队列、微服务边车等均能从 Socket Activation 获益

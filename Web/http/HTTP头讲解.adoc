@@ -1,0 +1,187 @@
+== HTTP头讲解
+
+=== 什么是 HTTP 头?
+HTTP 头是 HTTP 协议中请求和响应消息的组成部分, 它们以键值对的形式传递额外的信息. 你可以把它们理解为信件或快递上的"元数据".
+
+* **信件类比:** HTTP 请求/响应的主体是信的内容, 而 HTTP 头则是信封上的信息, 如发件人、收件人、日期、邮戳、是否加急等.
+
+* **作用:** HTTP 头允许客户端和服务器传递请求或响应的附加信息, 如内容类型、缓存策略、认证信息、Cookie 等.
+
+=== HTTP 头的语法
+每个 HTTP 头都是一个 `名称: 值` 对, 以冒号和空格分隔. 多个头之间用换行符分隔.
+
+[source, text, linenums]
+----
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+Content-Type: application/json
+Cache-Control: no-cache
+----
+
+=== HTTP 头的分类
+根据上下文, HTTP 头可以分为四大类
+
+==== 通用头
+这类头既可以出现在请求中, 也可以出现在响应中, 但与最终传输的数据本身无关.
+
+* **Cache-Control:** 控制缓存行为(如 no-cache, max-age=3600).
+
+* **Connection:** 控制当前事务完成后是否会关闭网络连接(如 keep-alive, close).
+
+* **Date:** 消息创建的日期和时间.
+
+* **Pragma:** 为了向后兼容 HTTP/1.0 而存在的缓存控制头, 通常等同于 Cache-Control: no-cache.
+
+* **Via:** 由代理服务器添加, 显示请求或响应经过的中间节点.
+
+==== 请求头
+这些头由客户端发送, 提供了关于请求和客户端本身的更多信息.
+
+* **Accept:** 告诉服务器客户端能够处理哪些类型的媒体(MIME 类型), 如 Accept: text/html, application/json.
+
+* **Accept-Encoding:** 告诉服务器客户端支持哪些内容编码(压缩算法), 如 gzip, deflate, br.
+
+* **Accept-Language:** 告诉服务器客户端偏好的自然语言, 如 zh-CN, en;q=0.9.
+
+* **Authorization:** 包含用于服务器验证客户端身份的凭证, 通常是 Bearer <token> 或 Basic <credentials>.
+
+* **Cookie:** 将之前服务器通过 Set-Cookie 头发送的 Cookie 回传给服务器.
+
+* **Host:** 指定请求服务器的域名和端口号(HTTP/1.1 强制要求). 对于虚拟主机配置至关重要.
+
+* **Referer:** 表示当前请求是从哪个页面链接过来的.
+
+* **User-Agent:** 包含发起请求的应用程序信息(浏览器类型、操作系统等).
+
+==== 响应头
+这些头由服务器发送, 提供了关于响应的额外信息.
+
+* **Location:** 在重定向时使用, 指定客户端应该跳转的新 URL(状态码为 3xx).
+
+* **Server:** 描述处理请求的服务器软件信息(如 nginx/1.18.0).
+
+* **Set-Cookie:** 服务器向客户端发送 Cookie, 要求客户端在后续请求中将其带回.
+
+* **Access-Control-Allow-Origin:** 用于 CORS(跨域资源共享), 指定哪些外域可以访问资源(如 * 或 https://example.com).
+
+* **WWW-Authenticate:** 当状态码为 401(未授权)时, 此头指定了进行身份验证所需的方法.
+
+==== 实体头
+这些头描述了请求或响应中传输的实体主体的元数据. 在响应中更为常见.
+
+* **Content-Type:** 指定实体主体的媒体类型(MIME 类型), 如 text/html; charset=utf-8, application/json.
+
+* **Content-Length:** 实体主体的大小(以字节为单位).
+
+* **Content-Encoding:** 实体主体使用的编码(压缩)方式, 如 gzip. 这对应于请求头的 Accept-Encoding.
+
+* **Content-Language:** 实体主体面向的自然语言.
+
+* **Last-Modified:** 所请求资源最后一次被修改的日期和时间, 用于缓存验证.
+
+* **Expires:** 指定响应内容的过期时间, 在此时间之后, 缓存副本被视为过期.
+
+=== 重要 HTTP 头详解与应用场景
+
+==== 缓存控制 (Cache-Control)
+这是控制缓存最核心、最强大的头.
+
+* **请求头:**
+
+** **no-cache:** 客户端要求缓存服务器必须向源服务器重新验证缓存的有效性.
+
+** **no-store:** 不允许缓存任何请求和响应的内容.
+
+** **max-age=0:** 表示客户端不接受 Age 大于 0 的缓存, 等同于 no-cache.
+
+* **响应头:**
+
+** **public:** 响应可以被任何对象(客户端、代理服务器等)缓存.
+
+** **private:** 响应只能被单个用户(浏览器)缓存, 不能被代理服务器等共享缓存.
+
+** **no-cache:** 可以缓存, 但在每次使用前都必须向服务器验证其有效性.
+
+** **no-store:** 绝对禁止缓存.
+
+** **max-age=3600:** 表示资源可以被缓存的最大时间, 单位是秒(这里是 1 小时).
+
+** **s-maxage=86400:** 专门为公共缓存如CDN设置过期时间
+
+==== 内容协商 (Accept, Content-Type)
+这是 RESTful API 和现代 Web 开发的基础.
+
+* **请求:** Accept: application/json 告诉服务器"我希望你返回 JSON 格式的数据".
+
+* **响应:** Content-Type: application/json 告诉客户端"我返回的数据确实是 JSON 格式的".
+
+* **不匹配的后果:** 如果客户端要求 Accept: application/json 但服务器返回了 Content-Type: text/html, 可能会导致客户端(如 Ajax 库)解析错误.
+
+==== 跨域资源共享 (CORS) 相关头
+解决浏览器同源策略限制的关键.
+
+* **请求头** (由浏览器自动添加):
+
+** **Origin:** 表明请求来自哪个源(协议+域名+端口).
+
+* **响应头** (由服务器设置):
+
+** **Access-Control-Allow-Origin:** 必须的. 指定允许访问资源的源. * 表示允许任何源, 但通常不建议.
+
+** **Access-Control-Allow-Methods:** 指定允许的 HTTP 方法(如 GET, POST, PUT).
+
+** **Access-Control-Allow-Headers:** 指定允许的请求头.
+
+** **Access-Control-Allow-Credentials:** 设置为 true 时, 允许发送 Cookie 等凭证信息.
+
+==== 安全相关头
+用于增强 Web 应用的安全性.
+
+* **Strict-Transport-Security (HSTS):** 告诉浏览器在指定时间内(max-age)只能通过 HTTPS 访问该域名, 禁止 HTTP.
+
+* **X-Content-Type-Options: nosniff:** 阻止浏览器对响应内容进行 MIME 类型嗅探, 强制使用 Content-Type 中声明的类型.
+
+* **X-Frame-Options: DENY/SAMEORIGIN:** 防止网站被嵌入到 <frame>, <iframe>, <embed> 中, 用于防御点击劫持.
+
+* **Content-Security-Policy (CSP):** 一个非常强大的安全策略, 用于阻止 XSS 攻击, 可以指定允许加载脚本、样式、图片等资源的来源.
+
+* **Referrer-Policy:** 控制请求中 Referer 头发送的信息量, 保护用户隐私(不泄露来源URL中的敏感信息)
+
+** 从HTTPS页面链接到另一个HTTPS页面时, 发送完整的Referer
+** 从HTTPS页面链接到HTTP页面时, 不发送Referer, 防止安全信息泄漏到不安全的环境.
+** 同源请求发送完整URL, 跨域请求只发送源(协议+域名+端口).
+
+=== 一个完整的 HTTP 交互示例
+**客户端请求:**
+
+[source, text, linenums]
+----
+GET /api/users/123 HTTP/1.1
+Host: api.example.com
+User-Agent: Mozilla/5.0...
+Accept: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+Cache-Control: no-cache
+Cookie: sessionid=abc123
+----
+
+**服务器响应:**
+
+[source, text, linenums]
+----
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Content-Length: 85
+Cache-Control: private, max-age=300
+Server: nginx
+Access-Control-Allow-Origin: https://www.example.com
+Set-Cookie: sessionid=def456; Path=/; HttpOnly
+
+{
+  "id": 123,
+  "name": "John Doe",
+  "email": "john@example.com"
+}
+----
+
+=== 总结
+HTTP 头是 Web 通信的"幕后英雄", 它们默默无闻地处理着缓存、认证、内容格式、安全策略等关键任务. 深入理解并正确使用 HTTP 头, 对于构建高性能、安全、健壮的 Web 应用至关重要.

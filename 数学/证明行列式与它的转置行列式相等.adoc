@@ -1,0 +1,26 @@
+== 证明行列式与它的转置行列式相等
+
+[stem]
+++++
+D = \begin{bmatrix}
+      a_{1,1} & a_{1,2} & \cdots & a_{1,n} \\
+      a_{2,1} & a_{2,2} & \cdots & a_{2,n} \\
+      \vdots & \vdots & \ddots & \vdots \\
+      a_{n,1} & a_{n,2} & \cdots & a_{n,n}
+    \end{bmatrix}
+
+D^T = \begin{bmatrix}
+      a_{1,1} & a_{2,1} & \cdots & a_{n,1} \\
+      a_{1,2} & a_{2,2} & \cdots & a_{n,2} \\
+      \vdots & \vdots & \ddots & \vdots \\
+      a_{1,n} & a_{2,n} & \cdots & a_{n,n}
+    \end{bmatrix}
+
+    b_{i,j} = a_{j,i}
+
+    D^T = \sum(-1)^{t_1} b_{1,p_1} b_{2,p_2} \cdots b_{n,p_n} = \sum(-1)^{t_2} a_{p_1,1} a_{p_2,2} \cdots a_{p_n,n}
+
+    (-1)^{t_1} b_{1,p_1} \cdots b_{i,p_i} \cdots b_{j,p_j} \cdots b_{n,p_n}
+
+    (-1)^{t_1} b_{1,p_1} \cdots b_{j,p_j} \cdots b_{i,p_i} \cdots b_{n,p_n}
+++++

@@ -1,0 +1,155 @@
+== Kubernetes原理讲解
+
+=== Kubernetes 的核心设计理念
+
+要理解 K8s 的原理, 首先要明白它的设计思想:
+
+. **声明式 API vs. 命令式操作:**
+
+** **命令式:** 你告诉系统"具体怎么做"(例如: 运行一个 Nginx 容器, 映射端口 80).
+
+** **声明式:** 你告诉系统"你期望的状态是什么"(例如: 确保始终有 3 个 Nginx 实例在运行, 并且端口 80 可访问). 你只需提交一个 YAML/JSON 文件来描述这个期望状态, K8s 的控制器会不断地检查当前状态, 并自动驱动系统达到这个期望状态. 这是 K8s 自动化和自我修复能力的基础.
+
+. **控制器模式:** 这是 K8s 的大脑. 一系列控制器(如 Deployment Controller, StatefulSet Controller)持续地监听它们所管理对象的实际状态和期望状态. 一旦发现差异(例如, 某个 Pod 崩溃了), 就会采取行动(例如, 重启一个 Pod)来消除差异.
+
+. **面向 API 和可扩展:** K8s 的一切都是资源, 并且可以通过 API Server 进行 CRUD 操作. 你可以自定义资源(Custom Resource Definitions, CRD)和控制器来扩展 K8s 的能力, 管理任何你想要的资源(例如, 一个 MySQL 集群).
+
+. **松耦合与微服务:** K8s 鼓励将应用拆分为松耦合的微服务. 服务之间通过稳定的网络标识(Service)进行发现和通信, 而不是依赖不稳定的 IP 地址.
+
+=== 核心架构
+
+一个 K8s 集群由两部分组成:
+
+* **控制平面:** 集群的大脑, 负责管理和调度.
+
+* **工作节点:** 干活的机器, 负责运行容器.
+
+==== 控制平面组件
+
+API Server::
+
+* **作用:** 集群的唯一入口. 所有内部组件、客户端工具(kubectl)都通过它来操作集群.
+
+* **原理:** 提供了 RESTful API, 负责认证、授权、校验请求, 并将资源的状态持久化到 etcd 中. 它是所有组件通信的枢纽.
+
+etcd::
+
+* **作用:** 一个高可用的键值对数据库.
+
+* **原理:** 存储着整个集群的所有配置数据和状态数据(例如, 有哪些 Pod, 它们在哪个 Node 上, Service 配置等). 它是 K8s 的"唯一信源", 必须保证其安全和高可用.
+
+Scheduler::
+
+* **作用:** 负责调度 Pod 到合适的工作节点上.
+
+* **原理:** 它监听 API Server, 发现还没有被调度到节点的新 Pod. 然后根据一系列调度策略(如资源请求、亲和性/反亲和性、数据 locality 等)为 Pod 选择一个最合适的节点. 它只做决策, 不执行, 执行由 Kubelet 负责.
+
+Controller Manager::
+
+* **作用:** 运行着一系列控制器的大脑集合.
+
+* **原理:** 每个控制器都是一个独立的控制循环, 负责监听特定资源的状态. 例如:
+
+** Deployment Controller: 确保 Deployment 声明的副本数与实际运行的 Pod 数量一致.
+
+** Node Controller: 监控节点状态, 当节点失联时做出响应.
+
+** Service Controller: 负责为 Service 配置负载均衡器.
+
+Cloud Controller Manager::
+
+用于与底层云提供商(如 AWS, GCP, Azure)的 API 交互, 管理云上的负载均衡器、存储卷等资源.
+
+==== 工作节点组件
+
+Kubelet::
+
+* **作用:** 节点上的"节点代理", 负责与管理平面通信, 并管理本节点上容器的生命周期.
+
+* **原理:** 它从 API Server 监听分配给本节点的 Pod, 然后根据 Pod 定义(通过容器运行时)启动、停止容器. 同时, 它周期性地向 API Server 报告本节点和其上 Pod 的状态.
+
+Kube Proxy::
+
+* **作用:** 负责节点的网络代理和负载均衡.
+
+* **原理:** 它在每个节点上运行, 维护网络规则. 当有请求访问 Service 的虚拟 IP 时, Kube-proxy 会根据规则(如 iptables 或 IPVS)将流量转发到后端对应的 Pod 上.
+
+容器运行时::
+
+* **作用:** 负责真正运行容器的软件, 例如 containerd, CRI-O.
+
+* **原理:** Kubelet 通过 CRI 标准接口与容器运行时交互, 指令它拉取镜像、启动和停止容器.
+
+=== 核心工作原理解析
+
+==== Pod 的创建与调度流程
+
+假设你执行 `kubectl apply -f nginx-deployment.yaml`:
+
+. **提交:**  kubectl 将 YAML 文件内容发送给 API Server.
+
+. **存储与通知:**  API Server 对请求进行校验和授权, 然后将这个 Deployment 资源的定义存入 etcd. 写入成功后, API Server 会通知所有监听此类型资源的组件.
+
+. **控制器介入:**  Deployment Controller 监听到了一个新的 Deployment 被创建. 它读取这个对象的期望状态(比如 replicas: 3), 并在 etcd 中创建对应的 ReplicaSet 资源.
+
+. **ReplicaSet 控制器介入:**  ReplicaSet Controller 监听到了新的 ReplicaSet, 发现期望的 Pod 数量是 3, 但实际的 Pod 数量是 0. 于是它通过 API Server 创建 3 个 Pod 资源定义(此时 Pod 的 nodeName 字段为空, 表示待调度).
+
+. **调度器介入:**  Scheduler 监听到了这 3 个 nodeName 为空的 Pod. 它执行调度算法:
+
+** 过滤: 排除所有不满足条件的节点(如资源不足、节点有污点等).
+
+** 评分: 对剩余节点打分(如选择资源最空闲的).
+
+** 绑定: Scheduler 选择一个分数最高的节点, 然后通过 API Server 更新 Pod 的定义, 将其 nodeName 字段设置为该节点名. 这个更新会被写入 etcd.
+
+. **Kubelet 执行:**  目标节点上的 Kubelet 一直在监听分配给自己的 Pod. 它发现了有一个 Pod 的 nodeName 是自己. 于是, Kubelet 会:
+
+** 通过 容器运行时 拉取指定的镜像.
+
+** 根据 Pod 定义创建并启动容器.
+
+** 如果 Pod 定义了数据卷, 会挂载存储.
+
+** 周期性地向 API Server 报告 Pod 状态(Running, Error 等).
+
+==== 服务发现与负载均衡
+
+* **问题:** Pod 是不稳定的, 它们可能会被重建、调度到别的节点, IP 地址会变. 客户端如何稳定地访问一组 Pod?
+
+* **解决方案: Service**
+
+. 你创建一个 Service 资源, 它通过 Label Selector 选择一组 Pod(例如 app: nginx).
+
+. Endpoints Controller 会监听 Service 和 Pod 的变化, 动态维护一个 Endpoints 对象, 里面是所有匹配 Pod 的 IP 地址列表.
+
+. 同时, K8s 会为 Service 分配一个虚拟 IP, 称为 ClusterIP.
+
+. 每个节点上的 Kube-proxy 监听到 Service 和 Endpoints 的变化后, 会在本机更新 iptables/IPVS 规则. 规则的核心是: 当目标地址是 Service 的 ClusterIP 时, 将流量负载均衡到 Endpoints 列表中的 Pod IP 上.
+
+. 客户端只需要访问这个稳定的 ClusterIP, Kube-proxy 会负责将请求转发到后端健康的 Pod.
+
+==== 配置与敏感信息管理
+
+* **问题:** 应用配置(如配置文件、环境变量、密码)不能硬编码在镜像里.
+
+* **解决方案: ConfigMap 和 Secret**
+
+** **ConfigMap:** 用于存储普通的配置信息.
+
+** **Secret:** 用于存储敏感信息(如密码、令牌), 以 Base64 编码(非加密)存储.
+
+** **原理:** 你将配置数据创建为 ConfigMap 或 Secret 对象, 存储在 etcd 中. 然后在 Pod 定义中, 你可以通过环境变量或数据卷的方式将它们挂载到容器内部. 这样, 应用配置就和容器镜像解耦了.
+
+=== 总结
+
+Kubernetes 的核心原理可以概括为:
+
+. **一个中心:** 以 API Server 为唯一的通信枢纽.
+
+. **一个数据库:** 以 etcd 为唯一的状态存储.
+
+. **一个大脑:** 以 控制器模式 为核心的驱动循环, 不断调整现实, 使其符合用户的期望.
+
+. **两层网络:** Pod IP 实现容器间直接通信, Service VIP 提供稳定的服务抽象和负载均衡.
+
+通过这套精密的协作机制, Kubernetes 将一个分布式系统抽象成了一个你可以理解和操作的"单一计算机", 让你能够以声明式的方式轻松管理成千上万的容器化应用.

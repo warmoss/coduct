@@ -1,0 +1,284 @@
+== 大模型如何做到调用MCP的
+
+前文 <<大模型/大模型如何做到调用工具的.adoc#, 大模型如何做到调用工具的>> 讲解了模型**如何学会调用工具**——这是模型自身的能力基础. 而 MCP 则是**工具的统一协议标准**, 定义了工具的描述、发现和调用方式. 当两者结合, 就构成了现代 AI Agent 的核心能力: 模型通过 MCP 协议调用标准化的外部工具.
+
+本文聚焦于**模型如何通过 MCP Client 这一桥梁, 将自身的工具调用能力与 MCP 协议对接起来**, 实现从"模型生成函数调用"到"MCP Server 执行操作"的完整链路.
+
+参考: <<大模型/大模型MCP原理讲解.adoc#, 大模型MCP原理讲解>>, <<大模型/大模型如何做到调用工具的.adoc#, 大模型如何做到调用工具的>>, <<大模型/大模型工作流原理讲解.adoc#, 大模型工作流原理讲解>>
+
+=== 核心逻辑: 模型不直接调用 MCP
+
+一个关键认知: **大模型不直接与 MCP Server 通信**. 模型本质上仍然是"文本生成器", 它并不知道 MCP 协议的存在. 真正起桥接作用的是 **MCP Client**.
+
+[plantuml, "模型与MCP的关系", format=png]
+----
+@startuml
+rectangle "大模型" as LLM {
+  (文本生成能力) as Gen
+  (工具调用能力) as TC
+}
+rectangle "MCP Client" as Client {
+  (工具定义转换) as Conv
+  (协议封装) as Proto
+  (结果注入) as Inject
+}
+rectangle "MCP Server" as Server {
+  (工具实现) as Impl
+}
+
+LLM --> Client: 输出函数调用 JSON
+Client --> LLM: 注入工具结果
+Client --> Server: MCP 协议消息(JSON-RPC)
+Server --> Client: 返回执行结果
+@enduml
+----
+
+模型与 MCP 的分工:
+
+MCP Client:: 负责与 MCP Server 的通信, 包括**工具发现、协议转换、调用转发和结果回传**. 它充当模型和外部工具之间的代理.
+
+大模型:: 保持角色不变——根据上下文中注入的工具定义, 决策是否调用工具以及调用哪个工具, 输出结构化的函数调用 JSON. 模型完全不感知 MCP 协议的存在.
+
+这种设计的关键优势在于 **解耦**: 模型无需了解底层通信细节, MCP Server 也无需适配特定模型. 只要模型支持工具调用, 就能通过 MCP Client 连接任意 MCP Server.
+
+=== MCP Client 的三个核心职责
+
+MCP Client 在模型和 MCP Server 之间扮演三层角色.
+
+==== 职责一: 工具定义转换
+
+MCP Client 在初始化阶段通过 `tools/list` 获取 MCP Server 暴露的工具列表, 然后将其转换为模型能理解的工具定义格式.
+
+MCP Server 返回的工具定义(MCP 格式):
+
+[source,json]
+----
+{
+  "name": "get_weather",
+  "description": "获取指定城市的天气信息",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "city": { "type": "string", "description": "城市名称" },
+      "date": { "type": "string", "description": "日期, 格式 YYYY-MM-DD" }
+    },
+    "required": ["city"]
+  }
+}
+----
+
+MCP Client 将其转换为模型输入格式(以 OpenAI Function Calling 格式为例):
+
+[source,json]
+----
+{
+  "type": "function",
+  "function": {
+    "name": "get_weather",
+    "description": "获取指定城市的天气信息",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "city": { "type": "string", "description": "城市名称" },
+        "date": { "type": "string", "description": "日期, 格式 YYYY-MM-DD" }
+      },
+      "required": ["city"]
+    }
+  }
+}
+----
+
+不同模型的工具定义格式不同, MCP Client 需要为每个模型做相应的格式适配. 但无论哪种格式, 核心信息一致: **工具名称、功能描述、参数 Schema**.
+
+==== 职责二: 工具调用转发
+
+当模型输出了工具调用 JSON 后, MCP Client 拦截该输出, 将其转换为 MCP 协议的 `tools/call` 请求, 发送给对应的 MCP Server.
+
+[plantuml, "MCP Client 转发流程", format=png]
+----
+@startuml
+participant "大模型" as LLM
+participant "MCP Client" as Client
+participant "MCP Server" as Server
+
+note over LLM: 上下文中有工具定义\n(get_weather, search_web)
+LLM -> Client: 输出工具调用 JSON\n{"name":"get_weather","args":{"city":"北京"}}
+note over Client: 解析模型输出\n识别出工具调用
+Client -> Server: tools/call\n{name:"get_weather",arguments:{city:"北京"}}
+note over Server: 执行实际逻辑\n(调用天气API)
+Server --> Client: 返回执行结果\n{temp:25,condition:"晴"}
+note over Client: 将结果封装为\nTool role 消息
+Client -> LLM: 注入工具结果\nrole:tool\ncontent:{temp:25,condition:"晴"}
+note over LLM: 基于结果生成\n最终回答
+@enduml
+----
+
+转发过程中的关键处理:
+
+* **格式解析:** 不同模型输出的工具调用格式不同(OpenAI 的 `tool_calls` 数组, Anthropic 的 `tool_use` content block), MCP Client 需要统一解析
+* **Server 路由:** 一个 MCP Client 可能同时连接多个 MCP Server, 需要根据工具名称确定调用哪个 Server
+* **参数校验:** 在转发前校验参数是否符合 JSON Schema, 拒绝不合法的调用, 避免无效请求浪费资源
+* **超时与重试:** MCP Client 需要处理网络超时、Server 不可用等异常情况
+
+==== 职责三: 结果注入
+
+MCP Server 返回的执行结果需要注入回模型的上下文, 让模型基于真实结果生成回答.
+
+MCP Server 返回的标准响应:
+
+[source,json]
+----
+{
+  "content": [
+    { "type": "text", "text": "北京今天 25°C, 晴天" }
+  ],
+  "isError": false
+}
+----
+
+MCP Client 将其转换为模型可理解的格式(以 OpenAI 格式为例):
+
+[source,json]
+----
+{
+  "role": "tool",
+  "tool_call_id": "call_abc123",
+  "content": "北京今天 25°C, 晴天"
+}
+----
+
+结果注入的核心原则:
+
+* **保持原样:** 注入的结果应尽量保持 MCP Server 返回的原始内容, 不篡改数据
+* **支持多种类型:** MCP 的 Content 支持 `text`, `image`, `resource` 等多种类型, Client 需要按模型的能力处理不同类型
+* **错误处理:** 当 `isError` 为 true 时, Client 应将错误信息注入上下文, 让模型决定如何处理(重试、改用其他工具或告知用户)
+
+=== 完整工作流程
+
+将上述三个职责串联起来, 一个完整的 MCP 调用流程如下:
+
+. **初始化阶段:** MCP Client 启动时, 根据配置文件(如 `.vscode/mcp.json`)启动或连接所有配置的 MCP Server, 并通过 `tools/list` 获取每个 Server 的工具列表
+. **工具注入:** MCP Client 将获取到的所有工具定义合并, 转换为当前模型支持的格式, 注入到系统消息中
+. **用户提问:** 用户输入问题
+. **模型推理:** 模型基于系统消息中的工具定义, 分析用户意图, 决定是否调用工具
+. **工具输出:** 模型输出结构化的工具调用 JSON
+. **拦截与转发:** MCP Client 拦截模型输出, 解析工具调用, 确定目标 MCP Server, 发送 `tools/call` 请求
+. **Server 执行:** MCP Server 执行实际的操作(如查询数据库、调用 API、读写文件)
+. **结果返回:** MCP Server 返回执行结果
+. **结果注入:** MCP Client 将结果转换为 Tool role 消息, 注入回模型上下文
+. **最终回答:** 模型基于原始问题 + 工具结果, 生成最终回答
+
+[plantuml, "MCP 调用完整流程", format=png]
+----
+@startuml
+actor 用户 as User
+participant "MCP Client" as Client
+collections "大模型" as LLM
+participant "MCP Server" as Server
+
+== 初始化 ==
+Client -> Server: tools/list (发现工具)
+Server --> Client: 返回工具列表
+Client -> Client: 转换工具定义为模型格式
+Client -> LLM: 注入工具定义到系统消息
+
+== 对话 ==
+User -> LLM: "北京的天气怎么样?"
+LLM -> LLM: 分析意图, 发现需要 get_weather
+LLM --> Client: 输出工具调用 JSON
+Client -> Client: 解析工具调用, 校验参数
+Client -> Server: tools/call (get_weather, city=北京)
+Server -> Server: 调用天气 API
+Server --> Client: 返回天气数据
+Client -> Client: 封装为 Tool role 消息
+Client -> LLM: 注入工具结果
+LLM --> User: "北京今天 25°C, 晴天"
+@enduml
+----
+
+=== 多 Server 场景下的工具路由
+
+在实际应用中, MCP Client 通常同时连接多个 MCP Server, 每个 Server 提供一组工具. MCP Client 需要维护一个**全局工具注册表**.
+
+[source,json]
+----
+{
+  "servers": {
+    "weather-server": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["weather-server.js"]
+    },
+    "database-server": {
+      "type": "sse",
+      "url": "https://db.example.com/mcp"
+    },
+    "search-server": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["@mcp/server-web-search"]
+    }
+  }
+}
+----
+
+MCP Client 内部维护的注册表结构:
+
+[source,json]
+----
+{
+  "get_weather":   { "server": "weather-server", "description": "..." },
+  "query_db":      { "server": "database-server", "description": "..." },
+  "search_web":    { "server": "search-server",  "description": "..." },
+  "fetch_page":    { "server": "search-server",  "description": "..." }
+}
+----
+
+工具路由的关键逻辑:
+
+* **名称去重:** 不同 Server 暴露同名工具时, Client 需要定义冲突解决策略(通常以后者覆盖前者或添加 Server 前缀)
+* **透明调度:** 模型无需知道工具属于哪个 Server, 只需按名称调用; Client 根据注册表自动路由
+* **健康检查:** Client 定期向 Server 发送 `ping`, 检测连接状态; 故障 Server 的工具从注册表中暂时移除
+
+=== 关键技术挑战
+
+==== 工具定义的长度控制
+
+当连接大量 MCP Server 时, 所有工具定义的 JSON 可能占用大量上下文空间. 例如一个复杂的数据库查询工具, 其参数 Schema 可能包含几十个字段.
+
+* **解决:** Client 可以按需注入工具定义(Agent 模式), 而非一次性注入所有工具. 模型先基于精简描述决策, 再动态拉取详细 Schema
+
+==== 工具选择的准确性
+
+当有几十个甚至上百个工具时, 模型可能选错工具. 例如用户问"查一下订单状态", 模型却调用了搜索工具而非订单查询工具.
+
+* **解决:** 工具 description 要精准且包含触发关键词; 某些 Client 会先让模型做一次"工具选择"分类, 缩小候选范围后再调用
+
+==== 流式与异步处理
+
+MCP 支持流式响应(Streaming), 即 Server 可以分段返回结果. Client 需要在模型和 Server 之间正确处理流式数据.
+
+* **解决:** Client 先缓冲流式结果直到完整, 再一次性注入模型; 或支持 Server 主动推送(SSE 模式下的 `notifications`)
+
+==== 安全与权限控制
+
+MCP Client 是安全边界的关键节点. 如果模型调用了危险工具(如 `delete_file`), Client 需要有能力拦截.
+
+* **解决:** Client 可以实现**权限白名单**, 仅允许模型调用已授权的工具; 或实现**二次确认**, 高危操作先询问用户
+
+=== 总结
+
+大模型调用 MCP 的核心机制可以概括为:
+
+* **模型不感知 MCP** - 模型只知道自己在调用"工具", 不知道 MCP 协议; MCP 是 Client 和 Server 之间的通信协议
+* **MCP Client 是桥梁** - 它负责将 MCP 工具定义转换为模型能理解的格式, 并将模型的函数调用转发为 MCP 协议消息
+* **标准化带来解耦** - 模型无需关心工具的实现细节, Server 无需关心模型的格式偏好; MCP Client 屏蔽了所有差异
+
+从更宏观的视角看, 这套机制体现了经典的分层设计思想:
+
+. **模型层** - 提供工具调用能力(学会输出结构化函数调用)
+. **协议层(MCP)** - 标准化工具的描述、发现和调用
+. **传输层(STDIO/SSE)** - 屏蔽底层通信细节
+. **实现层(MCP Server)** - 提供具体的工具功能
+
+每一层各司其职, 共同构成了现代 AI Agent 调用外部工具的完整技术栈.

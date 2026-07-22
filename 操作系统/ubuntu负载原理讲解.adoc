@@ -1,0 +1,348 @@
+== ubuntu负载原理讲解
+
+=== 概述
+
+**系统负载(Load Average)** 是衡量 Linux 系统繁忙程度的核心指标. 它反映的是一段时间内系统处于 **可运行态** 和 **不可中断睡眠态** 的进程平均数. 不同于 CPU 使用率只反映 CPU 的忙碌程度, 负载包含了 CPU、磁盘 I/O、锁竞争等多方面因素, 是一个更全面的系统健康度指标.
+
+系统负载常用于:
+
+* **容量规划:** 判断当前系统是否还有余量处理更多请求
+* **性能定位:** 快速区分瓶颈在 CPU 还是在 I/O
+* **异常检测:** 负载突增往往意味着应用或基础设施出现了问题
+
+=== 负载定义
+
+**负载(Load)**:: 在给定时刻, 系统中处于 **TASK_RUNNING**(正在运行或等待 CPU)和 **TASK_UNINTERRUPTIBLE**(不可中断睡眠, 通常等待 I/O)状态的进程/线程数量.
+
+**负载平均(Load Average)**:: 一段时间内的指数加权移动平均负载值. Linux 通过 `/proc/loadavg` 报告 1 分钟、5 分钟、15 分钟三个时间窗口的平均值.
+
+**可运行进程(Running Process)**:: 状态为 `R` 的进程, 正在使用 CPU 或已在运行队列中等待 CPU 调度.
+
+**不可中断睡眠进程(Uninterruptible Sleep Process)**:: 状态为 `D` 的进程, 通常在内核中等待 I/O 完成(如磁盘读写、NFS 请求), 不能被信号唤醒.
+
+WARNING: `D` 状态进程也是负载的一部分, 这是 Linux 负载和 CPU 使用率存在差异的根本原因. 即使 CPU 空闲, 如果大量进程在等待磁盘 I/O, 负载依然可能很高.
+
+=== 负载计算原理
+
+Linux 内核的负载计算涉及三个关键机制: **进程状态跟踪**、**定时采样** 和 **指数加权移动平均**.
+
+==== 进程状态跟踪
+
+内核通过进程描述符 `task_struct` 中的 `__state` 字段跟踪每个进程的状态:
+
+[source,c]
+----
+/* 进程状态 (include/linux/sched.h) */
+#define TASK_RUNNING            0
+#define TASK_INTERRUPTIBLE      1
+#define TASK_UNINTERRUPTIBLE    2
+#define TASK_STOPPED            4
+#define TASK_TRACED             8
+/* ... */
+----
+
+每次状态切换时, 内核更新运行队列的计数. 当进程变为 `TASK_RUNNING` 时加入运行队列; 变为 `TASK_UNINTERRUPTIBLE` 时也计入负载计数; 变为其他状态时则移出.
+
+==== 定时采样
+
+内核通过 **定时器中断(Timer Tick)** 周期性采样系统中的活跃进程数. 在 SMP 系统中, 每个 CPU 核独立维护自己的运行队列, 采样时汇总所有核的计数.
+
+采样频率由 `HZ` 宏决定, 通常为 100 或 250 (即每 10ms 或 4ms 采样一次).
+
+==== 指数加权移动平均
+
+内核不使用简单算术平均, 而是采用 **指数加权移动平均(EWMA, Exponentially Weighted Moving Average)** 算法, 给近期数据更高权重, 使负载能更快反映系统变化.
+
+[plantuml,"负载计算流程",format=png]
+----
+@startuml
+start
+:定时器中断触发;
+:遍历所有 CPU 的运行队列;
+:统计 running + uninterruptible 进程数 (calc_load);
+:更新活跃计数到 per-CPU 变量;
+:每 5 秒触发一次负载计算;
+:读取 per-CPU 活跃计数求和;
+:计算 EWMA 新值;
+:更新到 avenrun[] 数组;
+:更新 /proc/loadavg;
+stop
+@enduml
+----
+
+核心算法简化公式:
+
+[source,c]
+----
+// 内核负载计算核心逻辑 (简化)
+#define EXP_1  1884  /* 1/exp(5sec/1min) 的定点数近似 */
+#define EXP_5  2014  /* 1/exp(5sec/5min) 的定点数近似 */
+#define EXP_15 2037  /* 1/exp(5sec/15min) 的定点数近似 */
+
+unsigned long avenrun[3];  // 1min, 5min, 15min
+
+static inline void calc_load(unsigned long ticks)
+{
+    unsigned long active_tasks;  // 当前活跃进程数
+    unsigned long *p;
+
+    active_tasks = count_active_tasks();  // 汇总各 CPU 的活跃进程
+
+    // 对三个时间窗口分别计算 EWMA
+    // new = old * exp + active * (1 - exp)
+    p = avenrun;
+    *p = calc_load(*p, EXP_1, active_tasks);   // 更新 1 分钟平均
+    p++;
+    *p = calc_load(*p, EXP_5, active_tasks);   // 更新 5 分钟平均
+    p++;
+    *p = calc_load(*p, EXP_15, active_tasks);  // 更新 15 分钟平均
+}
+
+unsigned long calc_load(unsigned long load, unsigned long exp,
+                        unsigned long active)
+{
+    // 定点数计算: load = load * exp + active * (FIXED_1 - exp)
+    load *= exp;
+    load += active * (FIXED_1 - exp);
+    return load / FIXED_1;
+}
+----
+
+EWMA 的特性:
+
+* 1 分钟负载对系统变化最敏感, 但波动较大
+* 15 分钟负载最平滑, 反映系统长期趋势
+* 5 分钟负载居中, 兼顾敏感度和平滑度
+
+=== 负载与 CPU 使用率的区别
+
+这是最常见的认知误区. 二者衡量的是不同维度:
+
+[cols="2,3,3"]
+|===
+| 维度 | CPU 使用率 | 系统负载
+
+| 定义
+| CPU 忙于执行指令的时间占比
+| 系统中处于运行态或不可中断睡眠态的进程数
+
+| 范围
+| 0% ~ 100% (per CPU)
+| 无上限 (可远大于 CPU 核数)
+
+| 影响因素
+| 仅 CPU 计算量
+| CPU + 磁盘 I/O + 锁竞争 + 网络 I/O
+
+| 典型场景
+| CPU 密集型计算负载高
+| I/O 等待、大量进程排队
+|===
+
+从负载值判断系统瓶颈:
+
+* **负载 ≈ CPU 核数**: 系统刚好满载, 资源利用充分
+* **负载 > CPU 核数 × 1.5**: 可能存在性能瓶颈, 需要进一步排查
+* **负载高 + CPU 使用率低**: 大概率是 I/O 瓶颈(磁盘、网络或锁)
+* **负载高 + CPU 使用率高**: CPU 密集型负载过重
+
+WARNING: 判断是否过载不能只看负载绝对值, 必须结合 CPU 核数. 例如, 负载 4 在 8 核机器上很健康, 但在 2 核机器上已经过载.
+
+=== 从 /proc/loadavg 读取负载
+
+`/proc/loadavg` 是内核暴露负载信息的主要接口:
+
+[source,shell]
+----
+cat /proc/loadavg
+----
+
+输出示例:
+
+[source,text]
+----
+2.45 1.78 1.52 3/456 12345
+----
+
+各字段说明:
+
+[cols="1,4"]
+|===
+| 字段 | 说明
+
+| `2.45`
+| 1 分钟平均负载
+
+| `1.78`
+| 5 分钟平均负载
+
+| `1.52`
+| 15 分钟平均负载
+
+| `3/456`
+| 当前正在运行的进程数 / 系统总进程数
+
+| `12345`
+| 最近创建的 PID
+|===
+
+`uptime` 命令直接读取此文件展示:
+
+[source,shell]
+----
+$ uptime
+ 14:32:15 up 32 days,  4:22,  3 users,  load average: 2.45, 1.78, 1.52
+----
+
+=== 负载场景实战分析
+
+==== CPU 密集型负载高
+
+当系统运行大量 CPU 计算任务时, 负载和 CPU 使用率同时升高. 使用 `stress` 工具模拟:
+
+[source,shell]
+----
+# 模拟 4 个 CPU 密集型进程(4 核机器)
+stress --cpu 4 --timeout 60 &
+
+# 观察负载变化
+watch -n 1 'cat /proc/loadavg; echo "---"; mpstat -P ALL 1 1'
+----
+
+此时 `mpstat` 显示所有 CPU 核心使用率接近 100%, 负载接近 4. 排查方向: 优化计算逻辑、增加副本数或升级 CPU.
+
+==== I/O 密集型负载高
+
+I/O 等待是负载高但 CPU 空闲的典型场景:
+
+[source,shell]
+----
+# 模拟 I/O 密集型负载(持续读写磁盘)
+stress --io 4 --timeout 60 &
+
+# 观察负载和 CPU iowait
+vmstat 1 5
+----
+
+`vmstat` 输出中的 `wa` 列(iowait)偏高, 而 `us`(user)和 `sy`(system)偏低. 排查方向:
+
+* 使用 `iostat -x 1` 查看磁盘利用率(`%util`)和平均服务时间(`svctm`)
+* 使用 `iotop` 定位 I/O 密集型进程
+* 检查是否存在磁盘故障或 RAID 重建
+
+[source,shell]
+----
+# 定位 I/O 瓶颈
+iostat -x 1 5
+
+# 输出关键字段
+# %util - 磁盘繁忙时间占比(接近 100% 表示饱和)
+# await - I/O 平均响应时间(毫秒)
+# svctm - 实际 I/O 服务时间
+----
+
+==== 进程数过多导致负载高
+
+即使每个进程消耗很少资源, 大量进程同时竞争 CPU 也会推高负载:
+
+[source,shell]
+----
+# 查看当前进程总数
+ps aux | wc -l
+
+# 查看运行队列中的进程数
+cat /proc/loadavg | awk '{print $4}'
+
+# 查看每个 CPU 的运行队列长度
+sar -q 1 3
+----
+
+排查方向: 检查是否存在 fork bomb、线程池配置过大、连接数泄漏等问题.
+
+==== 不可中断睡眠(D 状态)进程排查
+
+大量 `D` 状态进程通常意味着内核 I/O 子系统出现问题:
+
+[source,shell]
+----
+# 统计各状态的进程数
+ps aux | awk '{print $8}' | sort | uniq -c
+
+# 查看 D 状态进程及其等待的 channel
+ps -eo pid,stat,wchan:32,comm | grep D
+----
+
+常见原因:
+
+* NFS 挂载点不可达(nfs server 宕机或网络中断)
+* 磁盘控制器或驱动问题
+* cgroup 的 `memory.max` 过小导致频繁回收
+* 文件系统锁竞争(如 ext4 journal 阻塞)
+
+=== 与 cgroup 的关系
+
+在容器化环境中, 负载的语义需要重新理解. `cgroup` 对 CPU 资源进行限制后, 宿主机看到的负载是全局的, 而容器内看到的负载仅反映其 cgroup 内部的排队情况.
+
+`systemd-cgtop` 可以查看每个 cgroup 的资源使用:
+
+[source,shell]
+----
+systemd-cgtop
+----
+
+在 cgroup v2 中, CPU 控制器通过 `cpu.weight` 和 `cpu.max` 控制资源分配. 容器内看到的负载可能与宿主机差异较大, 因为容器被限制在部分 CPU 上运行. 详见 <<ubuntu cgroup原理讲解.adoc#cgroup-v1-vs-v2, cgroup 原理>>.
+
+=== 常用监控工具总结
+
+[cols="3,3,3"]
+|===
+| 工具 | 用途 | 常用参数
+
+| `uptime`
+| 查看负载平均值
+| 无参数
+
+| `top` / `htop`
+| 实时查看进程负载和状态
+| `top -b -n 1`
+
+| `vmstat`
+| 系统整体运行状态(进程、内存、I/O)
+| `vmstat 1 5`
+
+| `iostat`
+| 磁盘 I/O 详细统计
+| `iostat -x 1 5`
+
+| `mpstat`
+| 各 CPU 核心使用率
+| `mpstat -P ALL 1 3`
+
+| `sar`
+| 系统活动历史记录(需 `sysstat` 包)
+| `sar -q 1 3`
+
+| `pidstat`
+| 按进程的资源使用报告
+| `pidstat -d 1 3`
+
+| `/proc/loadavg`
+| 内核直接暴露的负载数据
+| `cat /proc/loadavg`
+|===
+
+=== 常见误区与注意事项
+
+* **误解一: 负载 < 1 就安全.** 负载必须除以 CPU 核数来判断. 负载 1 在单核机器上满载, 在 16 核机器上远未饱和.
+* **误解二: CPU 使用率低负载就一定低.** I/O 瓶颈可导致负载很高但 CPU 完全空闲.
+* **误解三: 只看 1 分钟负载.** 15 分钟负载更能反映趋势, 1 分钟负载因 EWMA 算法方差较大, 偶然突增未必是问题.
+* **误解四: 负载高就加 CPU.** 如果瓶颈在磁盘 I/O 或锁竞争, 加 CPU 核数对降低负载毫无帮助.
+
+[[load-optimization]]
+=== 降低负载的常用策略
+
+* **CPU 瓶颈:** 优化算法减少计算量、增加 CPU 核数、使用缓存减少重复计算
+* **I/O 瓶颈:** 使用 SSD 替代 HDD、优化 SQL 查询减少扫描量、增加内存缓存减少磁盘访问
+* **进程数过多:** 使用连接池/线程池控制并发数、限制单机最大连接数
+* **锁竞争:** 减少临界区大小、使用无锁数据结构、拆分锁粒度(如分段锁)
+* **容器场景:** 合理设置 cgroup 的 `cpu.weight` 和 `cpu.max`, 避免过度超卖

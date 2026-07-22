@@ -1,0 +1,257 @@
+== Ansible讲解
+
+=== 概述
+
+Ansible 是一个开源的 IT 自动化运维工具, 由 Red Hat 维护. 它主要用于**配置管理**, **应用部署**和**任务自动化**. 与 Puppet, Chef 等传统工具不同, Ansible 采用**无代理(Agentless)**架构, 通过 SSH 协议直接管理目标机器, 无需在受控节点上安装任何额外软件.
+
+它的核心设计理念是: **简单**, **幂等**和**声明式**. 用户通过 YAML 格式的 Playbook 描述期望的系统状态, Ansible 自动计算并执行必要的变更, 使系统达到该状态.
+
+=== 核心概念
+
+控制节点(Control Node)::
+  安装了 Ansible 的主机. 它负责执行 Playbook, 通过 SSH 连接到受控节点下发任务. 控制节点可以是你的笔记本、CI/CD 服务器或专门的运维跳板机.
+
+受控节点(Managed Node)::
+  被 Ansible 管理的主机. 可以是物理服务器、虚拟机或云主机. Ansible 通过 SSH 连接到这些节点执行任务.
+
+Inventory(主机清单)::
+  定义了所有受控节点的列表和分组信息. Inventory 可以是静态的 INI/YAML 文件, 也可以是动态的脚本(如从云平台 API 动态获取).
+
+Playbook(剧本)::
+  使用 YAML 格式编写的自动化任务描述文件. 它是 Ansible 的核心概念, 定义了一系列要在目标主机上执行的操作.
+
+Task(任务)::
+  Playbook 中的最小执行单元. 每个 Task 调用一个 Ansible Module 来完成具体的操作.
+
+Module(模块)::
+  Ansible 的核心功能单元, 用于执行具体的系统操作. 例如 `copy` 模块用于复制文件, `service` 模块用于管理服务, `yum`/`apt` 模块用于安装软件包. Ansible 提供了上千个内置模块.
+
+Role(角色)::
+  一种组织和复用 Playbook 内容的机制. Role 将 Tasks, Handlers, Variables, Templates 等按标准目录结构组织, 便于复用和分享.
+
+=== 核心特性与设计原理
+
+==== 无代理架构
+
+Ansible 最显著的特点是**无需在受控节点上安装代理**:
+
+* 控制节点通过 SSH 连接受控节点, 无需开放额外端口或安装守护进程.
+* 执行任务时, Ansible 将模块代码(通常是 Python 脚本)推送到受控节点, 在内存中执行, 执行完毕即清理.
+* 这意味着 Ansible 的资源占用极低, 管理上千台服务器也不会对管理节点造成明显压力.
+
+==== 幂等性
+
+幂等性是 Ansible 的核心设计原则之一:
+
+* 对一个系统执行一次 Playbook 和执行多次 Playbook, 最终结果应保持一致.
+* 例如 `copy` 模块在目标文件已存在且内容一致时, 不会重复拷贝; `service` 模块在服务已启动时, 不会重复启动.
+* 幂等性确保了自动化脚本的**可靠性和可重复性**, 是配置管理和 CI/CD 的基础.
+
+==== 模块化设计
+
+Ansible 的模块是独立的功能单元:
+
+* 每个模块专注于单一职责, 如 `command` 执行命令, `file` 管理文件属性和目录.
+* 模块的返回值是结构化的 JSON 数据, 包含 `changed`, `failed`, `msg` 等字段, 便于 Playbook 中的条件判断和错误处理.
+* 用户可以编写自定义模块, 支持 Python, Shell 等语言.
+
+==== 声明式 vs 命令式
+
+Ansible 以**声明式**为主, 辅以命令式能力:
+
+* **声明式:** Playbook 描述"系统应该处于什么状态", 而非"如何达到该状态". 例如"确保 Nginx 已安装并运行", Ansible 自动判断是否需要安装和启动.
+* **命令式:** `command` 和 `shell` 模块允许执行原始命令, 适用于声明式模块无法覆盖的场景. 但滥用命令式会破坏幂等性.
+
+=== Playbook 基础语法
+
+Playbook 是整个 Ansible 自动化的核心. 以下是一个典型的 Playbook 示例:
+
+[source,yaml]
+----
+---
+- name: 部署 Web 应用
+  hosts: webservers
+  become: yes
+  vars:
+    app_port: 8080
+    app_version: "1.2.3"
+
+  tasks:
+    - name: 确保 Nginx 已安装
+      apt:
+        name: nginx
+        state: present
+
+    - name: 确保 Nginx 正在运行
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: 部署应用配置
+      template:
+        src: app.conf.j2
+        dest: /etc/nginx/sites-available/app.conf
+      notify: 重启 Nginx
+
+    - name: 确保应用目录存在
+      file:
+        path: /var/www/app
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+  handlers:
+    - name: 重启 Nginx
+      service:
+        name: nginx
+        state: restarted
+----
+
+Playbook 各字段说明:
+
+`name`:: 可选的人类可读描述, 建议为每个 Play 和 Task 添加以便调试.
+`hosts`:: 指定要执行的目标主机或主机组, 引用 Inventory 中的定义.
+`become`:: 是否提权执行(如切换到 root). 默认为 `no`.
+`vars`:: 定义变量, 可在 Playbook 中通过 `{<!-- -->{ app_port }}` 引用.
+`tasks`:: 要执行的任务列表, 按顺序依次执行.
+`notify` / `handlers`:: 特殊的触发机制. 当 Task 状态为 `changed` 时, 会通知对应的 Handler 在 Playbook 末尾执行. 常用于配置变更后的服务重启.
+
+=== Ansible 执行流程
+
+Ansible 执行一个 Playbook 的内部流程如下:
+
+. **解析 Inventory:** 加载主机清单, 确定目标主机列表和分组关系.
+. **解析 Playbook:** 按顺序解析 Play 和 Tasks, 展开变量引用, 合并角色和包含文件.
+. **收集 Facts:** 默认在每个 Play 开始时, 在受控节点上执行 `setup` 模块, 收集系统信息(主机名, IP, 操作系统, CPU 内存等). Facts 可作为变量在 Playbook 中使用.
+. **创建连接:** 通过 SSH 建立到每个受控节点的连接.
+. **按序执行 Task:** 逐个执行 Tasks. 对每个 Task:
+   * 将 Module 代码(如 Python 脚本)通过 SSH 推送到受控节点.
+   * 在受控节点的内存中执行该模块.
+   * 模块执行完成后, 返回 JSON 结果并清理临时文件.
+   * 控制节点解析返回结果, 判断 `changed`, `failed` 等状态.
+   * 如果 Task 包含 `notify`, 且状态为 `changed`, 则标记对应 Handler 待执行.
+   * 如果 Task 失败(默认情况下), Playbook 终止.
+. **执行 Handlers:** 所有 Tasks 执行完毕后, 按顺序执行被通知的 Handlers.
+. **返回结果:** 汇总所有节点的执行结果, 输出到控制台.
+
+[plantuml, "Ansible Playbook 执行流程", format=png]
+----
+@startuml
+start
+:解析 Inventory;
+:解析 Playbook;
+:收集 Facts;
+while (目标主机列表不为空?) is (是)
+  :建立 SSH 连接;
+  while (Tasks 列表不为空?) is (是)
+    :推送模块代码;
+    :在受控节点执行模块;
+    :返回 JSON 结果;
+    if (状态为 changed?) then (是)
+      :标记 Handler 待执行;
+    else (否)
+    endif
+    if (状态为 failed?) then (是)
+      :终止 Playbook;
+      stop
+    else (否)
+    endif
+  endwhile (否)
+  :执行已通知的 Handlers;
+endwhile (否)
+:输出汇总结果;
+stop
+@enduml
+----
+
+=== 常用模块详解
+
+以下是实际运维中最常用的 Ansible 模块:
+
+`command` / `shell`:: 在受控节点上执行任意命令. `command` 更安全(不支持管道和重定向), `shell` 支持 Shell 特性.
+`copy`:: 从控制节点复制文件到受控节点. 支持设置文件属性(owner, group, mode).
+`file`:: 管理文件、目录和符号链接的属性. 可用于创建目录、删除文件、修改权限等.
+`template`:: 基于 Jinja2 模板引擎, 将模板文件渲染后复制到受控节点. 适合生成动态配置文件.
+`service` / `systemd`:: 管理系统服务的启动、停止、重启和开机自启.
+`yum` / `apt`:: 管理包安装和卸载. 通过 `state: present` 安装, `state: absent` 卸载.
+`user`:: 管理用户账号和 SSH 密钥.
+`firewalld` / `ufw`:: 管理防火墙规则.
+
+[source,yaml]
+----
+- name: 常用模块示例
+  hosts: all
+  become: yes
+  tasks:
+    - name: 使用 command 执行命令
+      command: uptime
+      register: result
+    - name: 显示执行结果
+      debug:
+        msg: "服务器运行时间: {<!-- -->{ result.stdout }}"
+
+    - name: 使用 copy 部署文件
+      copy:
+        src: /local/path/config.conf
+        dest: /etc/app/config.conf
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: 使用 template 渲染配置
+      template:
+        src: app.yml.j2
+        dest: /etc/app/app.yml
+
+    - name: 确保用户存在
+      user:
+        name: deploy
+        groups: sudo
+        shell: /bin/bash
+        create_home: yes
+----
+
+=== 变量与模板
+
+Ansible 通过变量和模板实现配置的灵活管理:
+
+==== 变量来源
+
+Inventory 变量:: 在主机清单文件中按主机或组定义.
+Playbook 变量:: 在 Playbook 的 `vars` 区块中定义.
+Facts 变量:: Ansible 自动收集的系统信息, 如 `ansible_hostname`, `ansible_os_family`.
+注册变量:: Task 执行结果的 `register` 捕获.
+外部变量:: 通过 `vars_files` 或 `--extra-vars` 传入.
+
+==== Jinja2 模板
+
+Ansible 使用 Jinja2 模板引擎生成动态文件. 模板文件后缀通常为 `.j2`.
+
+[source,yaml]
+----
+# templates/nginx.conf.j2
+server {
+    listen {<!-- -->{ app_port }};
+    server_name {<!-- -->{ server_name }};
+
+    location / {
+        proxy_pass http://127.0.0.1:{<!-- -->{ backend_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+----
+
+=== 总结
+
+Ansible 以其**无代理架构**, **幂等性**和**声明式配置**成为现代运维自动化的首选工具之一:
+
+* **无代理**大幅降低了运维成本和安全风险, 只需 SSH 即可管理.
+* **YAML Playbook** 易于学习和阅读, 降低了自动化入门门槛.
+* **幂等性**保证了自动化操作的可靠性, 可放心重复执行.
+* **丰富的模块生态**覆盖了从系统配置到云资源管理的广泛场景.
+* **Ansible Galaxy** 社区提供了大量可复用的 Roles, 加速了自动化脚本的编写.
+
+掌握 Ansible, 意味着可以用代码化(Infrastructure as Code)的方式管理基础设施, 是 DevOps 实践中的关键技能.

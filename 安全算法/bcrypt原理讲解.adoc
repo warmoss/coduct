@@ -1,0 +1,212 @@
+== bcrypt原理讲解
+
+=== 概述
+
+bcrypt 是一种基于 Blowfish 密码算法的密码哈希函数, 由 Niels Provos 和 David Mazières 于 1999 年设计. 它专门用于安全地存储密码, 通过引入 **salt(盐值)** 和 **cost factor(成本因子)** 来抵御暴力破解和 Rainbow Table(彩虹表)攻击.
+
+=== 设计目标
+
+1. **抗 Rainbow Table 攻击**: 每个密码都使用随机盐值, 使得预计算的彩虹表无效.
+2. **可调节的计算成本**: 通过成本因子控制哈希速度, 随硬件发展可动态增加计算难度.
+3. **慢速哈希**: 故意设计为计算密集型和缓慢的, 使得暴力破解的成本极高.
+
+=== 核心原理
+
+==== 1. Blowfish 密码算法
+
+bcrypt 基于 Blowfish 分组密码算法的密钥扩展(key schedule)阶段. 标准的 Blowfish 算法包含:
+
+- **P-数组**: 18 个 32 位子密钥(P1, P2, ..., P18)
+- **S-盒**: 4 个 S 盒, 每个包含 256 个 32 位条目
+
+bcrypt 利用了 Blowfish 的密钥扩展过程, 但对其进行了修改:
+
+- 使用 salt 和 password 一起初始化 Blowfish 的状态
+- 通过反复迭代(cost factor 控制轮数)来混合密钥
+
+==== 2. Salt(盐值)
+
+bcrypt 使用 128 位(16 字节)的随机盐值. 盐值的作用是:
+
+- 确保即使是相同的密码也会产生不同的哈希值
+- 防止 Rainbow Table 攻击
+- 防止攻击者通过观察哈希值判断两个用户是否使用了相同的密码
+
+==== 3. Cost Factor(成本因子)
+
+成本因子是 bcrypt 的核心安全机制:
+
+- 表示为 `2^cost` 的指数形式
+- 例如 cost=10 表示进行 `2^10 = 1024` 轮迭代
+- 每增加 1, 计算时间翻倍
+- 现代推荐值为 10~12(可根据硬件调整)
+
+==== 4. 哈希结构
+
+bcrypt 的输出格式为:
+
+```
+$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
+```
+
+各部分含义:
+
+[cols="1,2,2"]
+|===
+| 部分 | 值示例 | 说明
+
+| 算法标识 | `$2b$` | 算法版本(`$2a$`、`$2b$`、`$2y$`)
+| 成本因子 | `10` | 2^10 = 1024 轮迭代
+| 盐值(Base64) | `N9qo8uLOickgx2ZMRZoMye` | 22 字符 Base64 编码(128 位)
+| 哈希值(Base64) | `IjZAgcfl7p92ldGxad68LJZdL17lhWy` | 31 字符 Base64 编码(184 位)
+|===
+
+**版本说明**:
+
+* `$2a$`: 原始版本
+* `$2b$`: 修正了 `$2a$` 在处理长密码时的 bug(2011 年)
+* `$2x$` / `$2y$`: 仅在 OpenBSD 的过渡期使用
+
+=== 算法流程
+
+[source, text]
+----
+输入: password(密码), salt(盐值), cost(成本因子)
+输出: bcrypt hash(哈希值)
+
+1. 初始化:
+   - 用 Blowfish 的初始 P-数组和 S-盒初始化状态
+   
+2. 密钥扩展(Key Schedule):
+   - 使用 salt 和 password 通过 eksblowfish 算法设置密钥
+   - 重复 2^cost 轮:
+     a. 使用 password 异或 P-数组
+     b. 使用 salt 加密 P-数组和 S-盒(交替进行)
+     c. 反复使用 Blowfish 加密算法更新状态
+   
+3. 最终加密:
+   - 使用扩展后的密钥加密标准明文 "OrpheanBeholderScryDoubt"
+   - 重复加密 64 次
+   
+4. 输出:
+   - 格式化为标准 bcrypt 格式字符串
+----
+
+==== eksblowfish 算法
+
+bcrypt 的核心是 **eksblowfish**(Expensive Key Schedule Blowfish), 它通过昂贵的密钥扩展来实现慢速哈希:
+
+```
+eksblowfish(password, salt, cost):
+    1. 用标准 Blowfish 初始化 P 和 S
+    2. 用 password 和 salt 对 P 和 S 进行 2^cost 次迭代混合
+    3. 返回最终的 P 和 S
+```
+
+=== 安全性分析
+
+==== 抗暴力破解
+
+- bcrypt 的计算成本是可调的, 即使硬件性能提升, 也可以增加 cost 值
+- 例如 cost=12 时, GPU 每秒只能尝试几百到几千次(而 MD5 每秒可达数十亿次)
+
+==== 抗 Rainbow Table
+
+- 128 位的随机盐值确保每个密码都有 2^128 种可能的哈希值
+- Rainbow Table 的存储成本变得完全不可行
+
+==== 抗 ASIC/GPU 攻击
+
+- bcrypt 需要大量内存访问(4KB 的 S-盒), 不适合 GPU 并行
+- Blowfish 的密钥扩展是串行的, 很难用 ASIC 加速
+
+=== 使用注意事项
+
+==== Cost 选择建议
+
+|===
+
+|场景 |推荐 Cost |时间参考
+
+| 低安全需求 | 8 | ~50ms
+| 一般 Web 应用 | 10 | ~200ms
+| 高安全需求 | 12 | ~800ms
+| 极高安全需求 | 14 | ~3s
+
+|===
+
+时间参考基于现代 CPU, 实际时间因硬件而异, 应以实际测试为准.
+
+==== 常见误区
+
+. **不要自己实现 bcrypt**: 使用成熟的库实现, 避免引入实现漏洞
+. **不要截断密码**: bcrypt 会自动处理最长 72 字节的密码
+. **不要在应用层加密后再哈希**: 直接对原始密码使用 bcrypt
+. **不要使用过低的 cost**: 至少使用 cost=10
+
+=== 与其他哈希算法对比
+
+|===
+
+| 特性 | bcrypt | PBKDF2 | scrypt | argon2
+
+| 设计年份 | 1999 | 2000 | 2009 | 2015
+| 内存可调 | 否(固定4KB) | 否 | 是 | 是
+| 并行度可调 | 否 | 否 | 否 | 是
+| 抗 GPU 攻击 | 中等 | 弱 | 强 | 强
+| 推荐场景 | 通用密码存储 | 兼容性要求 | 高安全需求 | 最新标准
+
+|===
+
+=== 代码示例
+
+==== Java 使用 bcrypt(使用 jBCrypt)
+
+[source, java]
+----
+import at.favre.lib.crypto.bcrypt.BCrypt;
+
+// 哈希密码
+String password = "mySecurePassword123";
+String bcryptHash = BCrypt.withDefaults()
+    .hashToString(12, password.toCharArray());
+// $2a$12$...
+
+// 验证密码
+BCrypt.Result result = BCrypt.verifyer()
+    .verify(password.toCharArray(), bcryptHash);
+boolean isValid = result.verified;
+----
+
+==== Node.js 使用 bcrypt
+
+[source, javascript]
+----
+const bcrypt = require('bcrypt');
+
+// 哈希密码
+const salt = await bcrypt.genSalt(12);
+const hash = await bcrypt.hash('mySecurePassword123', salt);
+
+// 验证密码
+const isValid = await bcrypt.compare('mySecurePassword123', hash);
+----
+
+==== Python 使用 bcrypt
+
+[source, python]
+----
+import bcrypt
+
+# 哈希密码
+password = b"mySecurePassword123"
+salt = bcrypt.gensalt(rounds=12)
+hashed = bcrypt.hashpw(password, salt)
+
+# 验证密码
+is_valid = bcrypt.checkpw(password, hashed)
+----
+
+=== 总结
+
+bcrypt 是一个经过时间考验的密码哈希算法, 通过盐值、可调节成本因子和基于 Blowfish 的复杂密钥扩展, 提供了可靠的密码存储方案. 虽然出现了更现代的选择如 argon2, 但 bcrypt 仍然是目前最广泛使用和推荐的密码哈希算法之一. 在选择成本因子时, 应在安全性和用户体验之间取得平衡, 并根据硬件发展适时调整.

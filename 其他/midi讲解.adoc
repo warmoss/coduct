@@ -1,0 +1,276 @@
+== MIDI 原理讲解
+
+MIDI(Musical Instrument Digital Interface, 乐器数字接口)是电子乐器之间、乐器和计算机之间通信的**行业标准协议**. 它不传输音频波形, 而是传输"演奏指令"——如按下哪个键、力度多大、持续多久——接收端根据这些指令合成声音. 这种"指令而非音频"的设计使 MIDI 文件极小且易于编辑.
+
+=== 什么是 MIDI
+
+MIDI:: 1983 年由各大合成器制造商联合制定的**数字接口标准**, 定义了一套硬件连接规范和消息格式, 用于电子乐器间的实时演奏数据交换.
+GM(General MIDI):: MIDI 标准的扩展, 统一了 128 种乐器的音色编号, 确保同一 MIDI 文件在不同设备上播放出相似的音色.
+SMF(Standard MIDI File):: 标准 MIDI 文件格式(.mid), 将 MIDI 消息序列化为可存储和传输的文件格式.
+
+MIDI 的核心思想是**事件驱动**——它记录的是"何时、何事、何值", 而非音频采样点. 这使得:
+
+* **文件极小**: 一首 3 分钟的钢琴曲 MIDI 文件仅 10-30 KB, 而同等长度的 WAV 文件约 30 MB
+* **高度可编辑**: 每个音符的位置、时长、力度都可独立修改, 不像音频需要剪切波形
+* **音色无关**: 同一 MIDI 文件可在不同合成器上播放, 呈现不同"音色演奏"
+
+[NOTE]
+====
+MIDI 1.0 标准自 1983 年发布后沿用至今, 2020 年发布了 MIDI 2.0 标准, 增加了更高分辨率、双向通信和更多控制参数. 本文以 MIDI 1.0 为主, 因其仍是当前最广泛使用的版本.
+====
+
+=== 硬件接口
+
+MIDI 硬件使用 5 针 DIN 连接器, 传输速率为 **31.25 kbps**(波特率), 采用电流环方式传输:
+
+* `MIDI In`: 接收 MIDI 消息
+* `MIDI Out`: 发送本设备产生的 MIDI 消息
+* `MIDI Thru`: 将 MIDI In 收到的消息原样转发出去, 用于串联多个设备
+
+五个引脚中仅使用三个: 引脚 2(GND)、引脚 4/5(差分信号). 一条 MIDI 电缆支持 **16 个通道**(Channel), 每个通道可对应一种乐器音色.
+
+=== MIDI 消息体系
+
+MIDI 消息分为**通道消息**(Channel Message)和**系统消息**(System Message)两大类.
+
+==== 通道消息
+
+通道消息携带通道号(0-15), 只被指定通道的设备响应. 按功能分为:
+
+* **音符消息**: Note On(按下键)和 Note Off(松开键)
+* **控制变更(Control Change, CC)**: 改变音量、声像、延音等参数
+* **程序变更(Program Change)**: 切换乐器音色
+* **弯音轮(Pitch Bend)**: 音高弯曲
+* **触后(Aftertouch)**: 按键后继续施加压力的变化
+
+===== 音符消息
+
+音符消息是 MIDI 最核心的消息, 每条消息包含三个字节:
+
+[source,hex]
+----
+状态字节: 1001 CCCC  (9n, Note On)
+数据字节 1: 0PPP PPPP  (音符编号, 0-127)
+数据字节 2: 0VVV VVVV  (力度 Velocity, 0-127)
+----
+
+状态字节的高四位 `1001` 表示 Note On, 低四位 `CCCC` 表示通道号(0-15). 数据字节最高位始终为 0.
+
+Note Off 消息的状态字节为 `1000 CCCC`(8n).
+
+[NOTE]
+====
+Note On 且力度为 0 时, 等价于 Note Off. 这是常见的"力度 0 表示释键"优化, 可减少消息数量.
+====
+
+音符编号与音高的对应关系:
+
+[cols="3*"]
+|===
+| 音符编号 | 音名 | 说明
+| 60 | C4(中央 C) | 88 键钢琴的第 40 号键
+| 69 | A4(440 Hz) | 标准调音音高
+| 0 | C-1 | 最低音
+| 127 | G9 | 最高音
+|===
+
+钢琴键 88 个(21-108), 编号遵循公式:
+
+stem:[N = 12 \times \log_2 (f / 440) + 69]
+
+其中 stem:[N] 为 MIDI 音符编号, stem:[f] 为频率(Hz).
+
+===== 控制变更(CC)
+
+控制变更消息用于调整演奏参数, 格式为:
+
+[source,hex]
+----
+状态字节: 1011 CCCC  (Bn, Control Change)
+数据字节 1: 0CCC CCCC  (控制器编号, 0-127)
+数据字节 2: 0VVV VVVV  (控制器值, 0-127)
+----
+
+常用的控制器编号:
+
+[cols="3*"]
+|===
+| 编号 | 名称 | 说明
+| 1 | Modulation Wheel | 调制轮(颤音)
+| 7 | Volume | 通道音量
+| 10 | Pan | 声像(0=左, 64=中, 127=右)
+| 11 | Expression | 表情控制器
+| 64 | Sustain Pedal | 延音踏板(0=关, >=64=开)
+| 120 | All Sound Off | 静音所有声音
+| 121 | Reset All Controllers | 重置所有控制器
+| 123 | All Notes Off | 关闭所有音符
+|===
+
+===== 程序变更
+
+程序变更消息用于切换乐器音色:
+
+[source,hex]
+----
+状态字节: 1100 CCCC  (Cn, Program Change)
+数据字节 1: 0PPP PPPP  (音色编号, 0-127)
+----
+
+GM 标准将 128 个音色分为 16 类, 每类 8 种:
+
+[cols="3*"]
+|===
+| 音色编号 | 类别 | 代表乐器
+| 0-7 | Piano | 钢琴类(三角钢琴、电钢琴等)
+| 8-15 | Chromatic Percussion | 色彩打击乐(钟琴、木琴等)
+| 16-23 | Organ | 风琴
+| 24-31 | Guitar | 吉他
+| 32-39 | Bass | 贝斯
+| 40-47 | Strings | 弦乐
+| 48-55 | Ensemble | 合奏
+| 56-63 | Brass | 铜管
+| 64-71 | Reed | 簧片
+| 72-79 | Pipe | 管乐
+| 80-87 | Synth Lead | 合成主音
+| 88-95 | Synth Pad | 合成铺垫
+| 96-103 | Synth Effects | 合成效果
+| 104-111 | Ethnic | 民族乐器
+| 112-119 | Percussive | 打击乐
+| 120-127 | Sound Effects | 音效
+|===
+
+==== 系统消息
+
+系统消息不携带通道号, 作用于整个系统:
+
+* **系统实时消息**(F8-FF): Timing Clock(时钟同步)、Start/Stop/Continue(播放控制)、Active Sensing(心跳检测)
+* **系统通用消息**(F1/F3): MTC Quarter Frame(MIDI 时间码)、Song Select(歌曲选择)
+* **系统专属消息**(F0-F7): SysEx(System Exclusive), 厂商自定义扩展消息, 用于传输固件更新、合成器参数等专有数据
+
+=== Standard MIDI File(SMF)格式
+
+MIDI 文件(SMF)是 MIDI 消息的磁盘存储格式, 扩展名为 `.mid`. 文件由**块(Chunk)**组成.
+
+==== 文件头块(Header Chunk)
+
+[source,hex]
+----
+4D 54 68 64  - "MThd" 标志
+00 00 00 06  - 头块长度(恒为 6)
+00 00        - 格式类型(0/1/2)
+00 01        - 轨道数
+00 60        - 时间分辨率(每四分音符的 tick 数)
+----
+
+格式类型:
+
+* **Format 0**: 单轨道, 所有事件在一个 Track 中
+* **Format 1**: 多轨道, 第一轨道为全局信息(速度、拍号), 其余为各声部
+* **Format 2**: 多轨道, 各轨道独立, 无全局轨道
+
+时间分辨率(PPQN, Pulse Per Quarter Note)表示每个四分音符的 tick 数, 常见值为 96、120、480、960.
+
+==== 轨道块(Track Chunk)
+
+[source,hex]
+----
+4D 54 72 6B  - "MTrk" 标志
+XX XX XX XX  - 轨道数据长度
+...           - MIDI 事件序列
+----
+
+轨道块中的事件包含 **Delta-Time**(与前一个事件的时间间隔, 以 tick 为单位)和事件数据. Delta-Time 使用**可变长度编码(Variable-Length Quantity, VLQ)**:
+
+[source,hex]
+----
+7F        -> 127         (单字节)
+81 7F     -> 127 + 128 = 255  (两字节, 最高位为 1 表示继续)
+C0 80 00  -> 3 字节同理
+----
+
+VLQ 的编码规则: 每个字节的低 7 位为有效数据, 最高位为 1 表示后续还有字节.
+
+==== 轨道事件类型
+
+轨道中的事件分三类:
+
+* **MIDI 事件**: 标准 MIDI 通道消息(音符、CC、Program Change 等)
+* **Meta 事件**: 非 MIDI 的元数据, 以 `FF` 开头
+* **SysEx 事件**: 以 `F0` 或 `F7` 开头
+
+常用 Meta 事件:
+
+[cols="3*"]
+|===
+| 类型字节 | 名称 | 说明
+| FF 01 | Text Event | 文本注释
+| FF 02 | Copyright | 版权信息
+| FF 03 | Track Name | 轨道名称
+| FF 51 03 | Set Tempo | 设置速度(微秒/四分音符)
+| FF 58 04 | Time Signature | 拍号
+| FF 59 02 | Key Signature | 调号
+| FF 2F 00 | End of Track | 轨道结束标志
+|===
+
+=== MIDI 工作流程
+
+以下以 DAW(Digital Audio Workstation, 数字音频工作站)播放 MIDI 文件为例展示完整流程:
+
+[plantuml, "MIDI 播放工作流程", format=png]
+----
+@startuml
+actor 用户
+participant DAW
+participant "MIDI 文件" as File
+participant "软件合成器" as Synth
+participant "音频接口" as Audio
+
+用户 -> DAW: 加载 MIDI 文件
+DAW -> File: 读取 Header Chunk(格式/轨道数/分辨率)
+DAW -> File: 读取 Track Chunk 中的事件序列
+DAW -> DAW: 构建播放队列(按时间排序的事件列表)
+
+用户 -> DAW: 点击播放
+
+loop 每个时间点
+  DAW -> DAW: 计算当前 tick 位置
+  DAW -> Synth: 发送当前 tick 的所有事件
+  note right
+    Note On → 触发音色发声
+    Control Change → 调整参数
+    Program Change → 切换音色
+    Pitch Bend → 调整音高
+  end note
+  Synth -> Synth: 根据当前音色和参数合成音频
+  Synth -> Audio: 输出音频信号
+  Audio -> 用户: 扬声器发声
+end
+
+DAW -> DAW: 遇到 End of Track 事件
+DAW -> 用户: 播放完成
+@enduml
+----
+
+=== MIDI 2.0 的主要改进
+
+MIDI 2.0 于 2020 年发布, 是 37 年来的首次重大更新:
+
+* **32 位精度**: 音符力度、连续控制器等参数从 7 位(0-127)提升至 32 位, 支持更细腻的表情控制
+* **双向通信**: 设备可主动上报能力(支持的控制器、支持的音色等), 实现即插即用
+* **MIDI-CI(Capability Inquiry)**: 设备间自动协商功能, 兼容 MIDI 1.0 设备
+* **UMP(Universal MIDI Packet)**: 新数据包格式, 支持在 USB、以太网等现代传输层上运行
+* **每音符控制器(PNC)**: 可对单个音符独立控制音高、音量等参数, 而非仅控制整个通道
+
+[NOTE]
+====
+MIDI 2.0 向后兼容 MIDI 1.0, 同一电缆上可同时传输两种协议的消息. 目前(2026 年)主流 DAW 和合成器已逐步支持 MIDI 2.0.
+====
+
+=== 总结
+
+* MIDI 本质是**演奏指令协议**, 记录"何时触发什么事件", 而非音频波形
+* 通道消息支持 16 个通道, 每个通道可独立设置音色和控制参数
+* 音符编号 0-127 对应不同音高, 公式 stem:[N = 12 \times \log_2(f / 440) + 69]
+* SMF 使用块结构(Header + Track), Delta-Time 通过 VLQ 编码节省空间
+* MIDI 2.0 大幅提升了精度和表达能力, 并保持向后兼容
+* 常见应用场景: 电子音乐制作、卡拉 OK 文件、手机铃声、游戏音效触发、灯光和舞台控制(通过 MIDI Show Control)

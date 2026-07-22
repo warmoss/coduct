@@ -1,0 +1,266 @@
+== pnpm原理讲解
+
+pnpm(Performant npm) 是一个快速、磁盘空间高效的 Node.js 包管理器. 它是 npm 和 yarn 的替代品, 通过独创的 **内容可寻址存储(Content-Addressable Storage)** 和 **严格嵌套的 node_modules** 架构, 解决了传统包管理器的依赖共用和幽灵依赖两大痛点.
+
+=== 核心概念
+
+内容可寻址存储(Content-Addressable Store):: pnpm 在全局统一目录(通常为 `~/.pnpm-store`) 中以文件的**内容哈希**作为唯一标识存放所有包. 同一版本的同一文件在磁盘上仅存一份, 跨项目共享.
+
+幽灵依赖(Phantom Dependency):: 在 npm/yarn 的扁平 node_modules 结构中, 项目可以访问未在 `package.json` 中声明的依赖. 这种隐式依赖在升级或移除中间依赖时会意外失效.
+
+严格 node_modules(Strict node_modules):: pnpm 创建的 node_modules 只包含项目 `package.json` 中直接声明的依赖, 且通过**符号链接(symlink)** 和**硬链接(hardlink)** 引用全局存储中的实际文件.
+
+隔离的依赖树(Isolated Dependency Tree):: 每个包的依赖被安装在其自身的 `node_modules` 下, 而非全部平铺到顶层. 这与 npm v3+ 的扁平策略完全不同.
+
+=== 核心原理
+
+==== 传统包管理器的问题
+
+npm v3 之前采用**嵌套结构**: 每个包在其自身目录下包含自己的依赖. 这会导致路径过长(Windows 上常见 `node_modules` 深度问题)和大量重复安装.
+
+npm v3+ 和 yarn 改为**扁平结构**: 将所有依赖平铺到顶层 `node_modules`, 避免嵌套过深. 但扁平结构引入了两个新问题:
+
+. **幽灵依赖:** 项目可以访问未声明的包. 例如, 项目安装了 `express`, 而 `express` 依赖 `body-parser`, 则项目代码可以直接 `require('body-parser')`, 但一旦 `express` 更新后不再依赖 `body-parser`, 代码就会崩溃.
+
+. **依赖重复:** 虽然扁平化减少了嵌套, 但不同版本的同一包仍然会多次安装, 占用大量磁盘空间.
+
+==== pnpm 的 node_modules 结构
+
+pnpm 采用 **符号链接 + 硬链接** 的策略, 创建了既严格又高效的依赖树:
+
+. **顶层 node_modules 只包含直接依赖:** 每个直接依赖以符号链接的形式存在, 指向 `node_modules/.pnpm/<name>@<version>/node_modules/<name>`.
+
+. **.pnpm 目录存储所有包:** 这里以 `package@version/node_modules` 的形式存放所有包及其依赖. 每个包的 `node_modules` 内, 其依赖再次以符号链接指向 `.pnpm` 中对应的包.
+
+. **文件通过硬链接指向全局 store:** 所有包的实际文件通过硬链接指向全局内容可寻址存储, 不占用额外磁盘空间.
+
+[plantuml, "pnpm node_modules 结构示意", format=png]
+----
+@startuml
+skinparam rectangle {
+  BackgroundColor lightblue
+}
+rectangle "project/node_modules" {
+  rectangle "express (symlink)" as sym {
+  }
+  rectangle ".pnpm" as pnpm {
+    rectangle "express@4.18.0/node_modules" as exp {
+      rectangle "express" as exp_real
+      rectangle "body-parser (symlink)" as bp_sym
+    }
+    rectangle "body-parser@1.20.0/node_modules" as bp {
+      rectangle "body-parser" as bp_real
+    }
+  }
+}
+bp_sym --> bp_real : symlink
+sym --> exp_real : symlink
+rectangle "~/.pnpm-store" as store {
+  rectangle "hash1" as h1
+  rectangle "hash2" as h2
+}
+exp_real --> h1 : hardlink
+bp_real --> h2 : hardlink
+@enduml
+----
+
+这种结构带来的好处:
+
+* **严格隔离:** 项目只能访问声明过的直接依赖, 彻底杜绝幽灵依赖
+* **磁盘高效:** 同一版本同一文件全局共享, 可通过 `pnpm store status` 查看共享情况
+* **速度快:** 符号链接创建的成本远低于文件复制
+
+==== 内容可寻址存储(Store)
+
+pnpm 的全局 store 结构基于文件内容哈希:
+
+[source, shell]
+----
+~/.pnpm-store/v3/
+├── files/
+│   ├── 00/          # 哈希前缀目录
+│   │   └── a1b2c3... # 实际文件, 文件名=内容哈希
+│   ├── 01/
+│   └── ...
+└── tmp/             # 临时文件目录
+----
+
+**硬链接与复制策略:**
+
+. 同一台机器上的多个项目, 通过**硬链接**共享 store 中的文件. 硬链接使得多个路径指向磁盘上的同一数据块, 不额外占用空间.
+
+. 在不同磁盘分区或文件系统不支持硬链接时, pnpm 会自动回退为**复制(copy)** 策略.
+
+. 可通过 `pnpm store path` 查看 store 位置, 通过 `pnpm store prune` 清理未被引用的孤包.
+
+==== 依赖解析与安装流程
+
+pnpm 的安装过程分为以下阶段:
+
+. **依赖解析(Resolution):** 读取 `package.json`, 解析每个依赖的版本范围, 查询 registry 获取最新版本.
+
+. **下载到 Store(Download to Store):** 将包下载到全局 store 中, 以内容哈希命名存储.
+
+. **创建符号链接(Create Symlinks):** 在项目的 `node_modules/.pnpm` 下创建包的完整依赖树, 然后从顶层 `node_modules` 创建指向 `.pnpm` 的符号链接.
+
+[plantuml, "pnpm 安装流程", format=png]
+----
+@startuml
+start
+:读取 package.json 和 lockfile;
+:解析依赖版本范围;
+:查询 registry 获取包信息;
+:检查 store 中是否已存在;
+if (已缓存?) then (yes)
+  :复用 store 中的硬链接;
+else (no)
+  :下载包到 store;
+  :计算内容哈希并存储;
+endif
+:在 .pnpm 中构建依赖结构;
+:创建符号链接链;
+:生成 pnpm-lock.yaml;
+stop
+@enduml
+----
+
+==== pnpm-lock.yaml
+
+与 npm 的 `package-lock.json` 和 yarn 的 `yarn.lock` 类似, pnpm 使用 `pnpm-lock.yaml` 锁定依赖版本. 其特点包括:
+
+* **YAML 格式:** 比 JSON 更简洁, 便于 diff 审查
+* **importers 字段:** 记录所有 workspace 项目的依赖信息
+* **packages 字段:** 记录所有被安装包的精确版本、解析地址和依赖关系
+
+=== 工作空间(Workspace)支持
+
+pnpm 原生支持 Monorepo, 通过 `pnpm-workspace.yaml` 声明工作空间:
+
+[source, yaml]
+----
+packages:
+  - "packages/*"
+  - "apps/*"
+  - "!**/test/**"
+----
+
+**关键特性:**
+
+* **所有 workspace 共享同一个 store**, 无需重复下载
+* **本地包链接:** workspace 内的包通过符号链接相互引用, 开发时即时生效
+* **过滤命令:** `pnpm --filter <package-name> <command>` 可针对特定子包执行命令
+* **循环依赖处理:** pnpm 能正确处理 workspace 内部的循环依赖
+
+[source, shell]
+----
+# 在 @company/utils 中执行测试
+pnpm --filter @company/utils test
+
+# 安装所有 workspace 的依赖
+pnpm install
+
+# 在所有 workspace 中更新某个依赖
+pnpm -r update lodash
+----
+
+=== pnpm 与 npm/yarn 的对比
+
+|===
+| 特性 | pnpm | npm | yarn
+
+| **磁盘空间** | 内容寻址存储, 全局共享 | 每个项目独立安装 | 缓存优化但仍有重复
+| **幽灵依赖** | 完全杜绝 | 存在 | 存在
+| **安装速度** | 快(硬链接 + 并行下载) | 中 | 中
+| **Monorepo 支持** | 原生 Workspace | 需 workspace 配置 | 原生 Workspace
+| **lockfile 格式** | YAML | JSON | YAML
+| **严格隔离** | 是 | 否 | 否(但 yarn PnP 可)
+| **Plug'n'Play(PnP)** | 不支持(但不需要) | 不支持 | 支持
+| **钩子脚本** | `pnpmfile.js` / `.pnpmfile.cjs` | `pre/post` 脚本 | `pre/post` 脚本
+|===
+
+=== pnpmfile 配置钩子
+
+pnpm 允许通过 `.pnpmfile.cjs`(或 `pnpmfile.js`) 在依赖解析和安装过程中注入自定义逻辑:
+
+[source, javascript]
+----
+module.exports = {
+  hooks: {
+    // 安装前修改依赖的版本
+    readPackage(pkg) {
+      if (pkg.name === 'lodash') {
+        pkg.dependencies = { ...pkg.dependencies };
+      }
+      return pkg;
+    },
+    // 安装后对包进行后处理
+    afterAllResolved(lockfile) {
+      return lockfile;
+    }
+  }
+};
+----
+
+**适用场景:**
+
+* 锁定传递依赖版本: 当子依赖的版本范围过于宽松时, 强制固定版本
+* 替换依赖: 将某个依赖替换为 fork 版本或内部版本
+* 移除不必要的依赖: 减少安装体积
+
+=== 常见问题与最佳实践
+
+==== Store 迁移
+
+默认 store 位于 `~/.pnpm-store`. 可通过 `.npmrc` 配置自定义路径:
+
+[source, ini]
+----
+store-dir=/data/pnpm-store
+----
+
+==== 在 CI 中优化安装速度
+
+[source, yaml]
+----
+# .github/workflows/ci.yml
+- uses: pnpm/action-setup@v2
+  with:
+    version: 8
+- uses: actions/setup-node@v3
+  with:
+    cache: 'pnpm'
+- run: pnpm install --frozen-lockfile
+----
+
+* `--frozen-lockfile`: 锁定 lockfile, 确保 CI 环境与开发环境一致
+* `--prefer-offline`: 优先使用本地缓存, 减少网络请求
+
+==== 与 Node.js 版本兼容性
+
+pnpm 自身要求 Node.js >= 16.14. 可通过 `package.json` 的 `engines` 字段约束项目所需的 Node.js 版本:
+
+[source, json]
+----
+{
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  }
+}
+----
+
+==== 从 npm/yarn 迁移
+
+. 删除 `node_modules` 和 lockfile(`package-lock.json` 或 `yarn.lock`)
+. 运行 `pnpm import` 从现有 lockfile 生成 `pnpm-lock.yaml`
+. 运行 `pnpm install` 安装依赖
+. 运行项目确保一切正常
+
+=== 总结
+
+pnpm 通过**内容可寻址存储**和**严格嵌套的 node_modules** 两大创新, 在保持与 npm/yarn 兼容的同时, 解决了磁盘空间浪费和幽灵依赖两个核心问题. 其原生 Monorepo 支持和极速的安装体验, 使其成为现代前端和 Node.js 项目的首选包管理器之一.
+
+* 磁盘高效: 全局内容寻址存储, 同一版本仅存一份
+* 依赖严格: 隔离的依赖树, 杜绝幽灵依赖
+* 速度优势: 硬链接机制大幅提升安装速度
+* Monorepo 原生: `pnpm-workspace.yaml` 提供了开箱即用的 Monorepo 支持

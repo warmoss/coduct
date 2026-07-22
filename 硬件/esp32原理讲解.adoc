@@ -1,0 +1,249 @@
+== ESP32 原理讲解
+
+ESP32 是乐鑫科技(Espressif Systems)推出的低成本、低功耗微控制器 SoC, 集成 Wi-Fi 和双模蓝牙功能. 它解决了传统 MCU 在 IoT 场景中网络连接能力不足的问题, 成为智能家居、工业物联网和可穿戴设备的主流选择.
+
+=== 核心概念
+
+片上系统(SoC):: 单个芯片上集成处理器、内存、射频收发器和多种外设, 无需额外芯片即可独立运行完整的网络应用
+Xtensa 双核架构:: Tensilica 设计的 32 位 LX6 微处理器, 支持双核对称多处理(SMP)模式, 主频高达 240 MHz
+RF 子系统:: 2.4 GHz 射频前端, 同时支持 IEEE 802.11 b/g/n Wi-Fi 和蓝牙 4.2 BR/EDR + BLE
+
+=== 系统架构
+
+==== 处理器核心
+
+ESP32 包含两个 Xtensa LX6 核心, 分别标记为 **PRO_CPU** (协议核心)和 **APP_CPU** (应用核心):
+
+* **PRO_CPU** - 负责 Wi-Fi、蓝牙等协议栈运行, 以及中断处理; 默认系统入口
+* **APP_CPU** - 用于用户应用程序执行; 可被 PRO_CPU 唤醒或独立运行
+
+两个核心通过 **共享内存** 和 **跨核中断(Cross-Core Interrupt)** 通信, 避免锁竞争问题. 系统也支持单核模式, 关闭 APP_CPU 以降低功耗.
+
+==== 内存架构
+
+ESP32 采用 **哈佛架构** 与 **统一内存映射** 结合的设计:
+
+[cols="2,2,2,3"]
+|===
+| 类型 | 容量 | 速度 | 用途
+
+| SRAM | 520 KB | 高速 | 代码运行、堆栈、堆分配
+| DRAM | 部分 SRAM 共享 | - | 数据存储
+| Cache | 支持 SPI RAM 映射 | - | 外挂 PSRAM 缓存
+| RTC Slow | 8 KB | 低速 | 深度睡眠时保留数据
+| RTC Fast | 8 KB | 中速 | 睡眠期间保留关键状态
+| Flash | 外挂(通常 4-16 MB) | - | 程序存储、文件系统
+|===
+
+关键设计: **指令缓存(I-Cache)** 和 **数据缓存(D-Cache)** 各 16 KB, 分别缓存 Flash 中的代码和常量数据, 解决 Flash 读取延迟问题.
+
+==== Wi-Fi 子系统
+
+Wi-Fi 基带集成在硬件中, 支持:
+
+* IEEE 802.11 b/g/n 标准, 2.4 GHz 频段
+* 数据速率最高 150 Mbps (HT40, MCS7)
+* **Station** 模式和 **SoftAP** 模式, 以及两者并存的混合模式
+* 硬件加速的 **CCMP**、**TKIP**、**WAPI** 加密
+* **Wi-Fi 敏捷快照(Wi-Fi Agile Snapshot)** 技术, 加快信道切换
+
+[source,c]
+----
+// Wi-Fi 站点模式初始化示例 (ESP-IDF)
+#include "esp_wifi.h"
+
+void wifi_init_sta(void) {
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+
+    esp_wifi_init(&cfg);                   // <1>
+    esp_wifi_set_mode(WIFI_MODE_STA);      // <2>
+    wifi_config_t sta_config = {
+        .sta = {
+            .ssid = "MY_SSID",
+            .password = "MY_PASSWORD"
+        }
+    };
+    esp_wifi_set_config(WIFI_IF_STA, &sta_config); // <3>
+    esp_wifi_start();                      // <4>
+}
+----
+<1> 初始化 TCP/IP 协议栈和 Wi-Fi 驱动
+<2> 设置为站点(Station)模式, 连接路由器
+<3> 配置目标 Wi-Fi 的 SSID 和密码
+<4> 启动 Wi-Fi, 自动扫描并连接
+
+==== 蓝牙子系统
+
+ESP32 蓝牙支持双模架构:
+
+* **BR/EDR (经典蓝牙)** - 用于音频传输(如蓝牙音箱)、SPP 串口透传
+* **BLE (低功耗蓝牙)** - 用于传感器数据采集、信标(Beacon)、Mesh 组网
+
+两种模式共享同一射频硬件, 但不能同时运行. BLE 支持 **BLE Mesh** 协议, 可实现大规模设备组网.
+
+=== 外设接口
+
+==== 通用外设
+
+[cols="3,2,5"]
+|===
+| 外设 | 数量 | 特性
+
+| GPIO | 34 个 | 可编程上拉/下拉, 边沿/电平触发中断
+| ADC | 2 个 12-bit(共 18 通道) | 支持 2 dB 衰减模式, 最高测量 3.9V
+| DAC | 2 个 8-bit | 输出 0-3.3V 模拟信号
+| SPI | 4 个 | 主/从模式, 最高 80 MHz, 支持 DMA
+| I2C | 2 个 | 主/从模式, 标准 100 kHz 和快速 400 kHz
+| UART | 3 个 | 最高 5 Mbps, 支持硬件流控(RTS/CTS)
+| I2S | 2 个 | 音频数据流, 支持 PCM/ADPCM
+| PWM | 8 路(独立定时器) | 16 位精度, 可调频率, 硬件死区插入
+|===
+
+==== 专用硬件加速器
+
+ESP32 内置多个硬件加速模块, 减少 CPU 负载:
+
+* **SHA** - 支持 SHA-1/256/384/512 哈希计算
+* **AES** - 128/192/256 位加密/解密, ECB/CBC/CTR 模式
+* **RSA** - 硬件模幂运算, 加速 RSA 签名验证
+* **RNG** - 真随机数发生器, 基于热噪声
+* **HMAC** - 硬件 HMAC 计算
+* **数字签名(DS)** - 安全存储私钥, 执行签名操作而不暴露密钥
+
+=== 电源管理
+
+ESP32 提供多种 **电源模式**, 在性能和功耗间平衡:
+
+. **Active (活跃模式)** - CPU 全速运行, Wi-Fi/蓝牙全功能; 典型功耗 80-260 mA
+. **Modem-sleep (调制解调器睡眠)** - CPU 运行, 关闭 Wi-Fi/蓝牙射频; 典型功耗 5-20 mA
+. **Light-sleep (浅度睡眠)** - CPU 暂停, 外设时钟关闭, RTC 保持; 唤醒时间约 1 ms; 典型功耗 1-2 mA
+. **Deep-sleep (深度睡眠)** - CPU 和大部分 RAM 断电, 仅 ULP 协处理器和 RTC 运行; 唤醒时间约 10 ms; 典型功耗 10-150 µA
+. **Hibernation (休眠)** - 仅 RTC 定时器和某些 GPIO 保持, 其余全部断电; 最低功耗约 5 µA
+
+==== ULP 协处理器
+
+在 Deep-sleep 模式下, **ULP (Ultra Low Power) 协处理器** 可独立运行, 从 RTC RAM 或 RTC Slow Memory 执行预加载的程序. ULP 支持:
+
+* **ADC 采样** - 周期性读取传感器值
+* **GPIO 检测** - 监控外部引脚电平变化
+* **I2C/SPI 通讯** - 与低功耗传感器交互
+
+当 ULP 检测到预设条件(如温度超过阈值)时, 通过中断唤醒主 CPU.
+
+[source,c]
+----
+// ULP 程序示例 - 周期读取 ADC 并深度睡眠
+// ulp_adc_example.S (汇编编写, 加载到 RTC Slow Memory)
+
+/* 定义变量 */
+	.global wakeup_count
+wakeup_count:
+	.long 0
+
+	.global adc_value
+adc_value:
+	.long 0
+
+	/* 配置 ADC */
+	WRITE_RTC_REG(SENS_SAR_START_FORCE_REG, 0, 1, 1)
+	WRITE_RTC_REG(SENS_SAR_START_FORCE_REG, 1, 1, 0)
+
+	/* 等待测量完成 */
+	WAIT(100)
+
+	/* 读取结果 */
+	READ_RTC_REG(SENS_SAR_MEAS_START1_REG, 15, 12)
+	REG_WR(LOW, adc_value, R0)
+
+	/* 检查是否超过阈值 */
+	SUB R0, R0, 3000    // 假设阈值 3000 mV
+	JUMPR GT, 0, wake   // 超过则唤醒主 CPU
+
+	/* 否则计数, 继续睡眠 */
+	STEP(1)
+	REG_RD(LOW, wakeup_count, R0)
+	ADDI R0, R0, 1
+	REG_WR(LOW, wakeup_count, R0)
+	SLEEP 1000000        // 睡眠 1 秒后重新运行
+wake:
+	WAKE
+----
+
+=== 启动流程
+
+ESP32 的启动过程分为多个阶段:
+
+. **ROM Bootloader** - 芯片上电后, ROM 中的一级引导程序运行, 检查 **GPIO0** 电平:
+   * 低电平 - 进入 **下载模式(Download Boot)**, 等待 USB/UART 烧录固件
+   * 高电平 - 进入 **SPI 启动模式**, 读取 Flash 头部信息
+. **二级引导程序(Second Stage Bootloader)** - 从 Flash 偏移 `0x1000` 加载, 解析分区表, 初始化 RAM, 加载应用程序
+. **启动调度器** - 调用 `app_main()` 函数, FreeRTOS 调度器启动, PRO_CPU 和 APP_CPU 开始协同工作
+
+[plantuml, "ESP32 启动流程", format=png]
+----
+@startuml
+start
+:上电复位;
+
+if (GPIO0 电平?) then (低电平)
+  :下载模式;
+  :等待串口烧录;
+  stop
+else (高电平)
+  :ROM Bootloader\n读取 Flash 头部;
+  :加载二级引导程序\n(Flash 0x1000);
+  :解析分区表;
+  :加载应用程序\n到 IRAM/DRAM;
+  :调用 app_main();
+  :启动 FreeRTOS 调度器;
+  stop
+endif
+@enduml
+----
+
+=== 开发框架与工具链
+
+==== ESP-IDF
+
+**ESP-IDF (Espressif IoT Development Framework)** 是官方开发框架, 基于 FreeRTOS, 提供:
+
+* 完整的 Wi-Fi、蓝牙协议栈 API
+* 驱动程序库(所有外设)
+* 网络协议栈(LwIP、HTTP、MQTT、WebSocket)
+* OTA 固件升级
+* 安全启动(Secure Boot)和 Flash 加密
+* CMake 构建系统
+
+[source,shell]
+----
+# 安装 ESP-IDF (Windows)
+git clone --recursive https://github.com/espressif/esp-idf.git
+cd esp-idf
+install.bat
+export.bat
+----
+
+==== Arduino-ESP32
+
+基于 Arduino 框架的封装层, 降低入门门槛. 适合快速原型开发, 但高级功能(如 ULP 编程、Wi-Fi 嗅探)需借助 ESP-IDF API.
+
+=== 安全特性
+
+ESP32 内置多层安全机制:
+
+* **Secure Boot** - 使用 RSA-3072 或 ECDSA-256 签名验证固件映像, 防止恶意固件替换
+* **Flash 加密** - AES-256 对 Flash 中的内容进行加密, 固件明文仅出现在芯片内部总线
+* **物理安全** - 通过 **eFuse** 熔断机制, 可永久锁定调试接口(JTAG), 阻止外部读取固件
+
+[WARNING]
+====
+Secure Boot 和 Flash 加密需要在首次烧录前一次性启用. 启用后若未备份密钥, 芯片将无法恢复. 建议在生产阶段之前, 先在实验板上完成密钥生成和功能验证.
+====
+
+=== 总结与最佳实践
+
+* ESP32 的核心优势是 **单芯片集成 Wi-Fi + BLE** + **双核处理能力**, 适合需要网络连接的嵌入式应用
+* 低功耗场景优先使用 **ULP 协处理器 + Deep-sleep** 组合, 避免主 CPU 频繁唤醒
+* Wi-Fi 吞吐量受 **天线设计** 和 **射频布局** 影响大, 量产前务必做射频一致性测试
+* 多任务设计时, 将 **Wi-Fi/BT 协议栈绑定到 PRO_CPU**, 用户业务逻辑运行在 APP_CPU, 避免抢占协议栈定时器
+* Flash 加密和 Secure Boot **推荐同步启用**, 单独使用任一功能留下的攻击面较大

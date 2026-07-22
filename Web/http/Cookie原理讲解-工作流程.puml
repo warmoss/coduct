@@ -1,0 +1,24 @@
+@startuml
+actor 浏览器
+participant 服务器
+
+== 首次请求 ==
+浏览器 -> 服务器: GET /index.html
+note right of 服务器: 生成 Session ID
+服务器 --> 浏览器: 200 OK\nSet-Cookie: sessionId=abc123; Path=/; HttpOnly
+
+== 后续请求 ==
+浏览器 -> 服务器: GET /profile\nCookie: sessionId=abc123
+note right of 服务器: 根据 Cookie 识别用户
+服务器 --> 浏览器: 200 OK\n用户信息页面
+
+== 修改 Cookie ==
+浏览器 -> 服务器: POST /login\nCookie: sessionId=abc123
+服务器 --> 浏览器: 302 Redirect\nSet-Cookie: sessionId=xyz789; Path=/; Max-Age=3600
+note right of 浏览器: 更新本地 Cookie
+
+== 清除 Cookie ==
+浏览器 -> 服务器: GET /logout\nCookie: sessionId=xyz789
+服务器 --> 浏览器: 200 OK\nSet-Cookie: sessionId=; Path=/; Max-Age=0
+note right of 浏览器: Cookie 过期, 被删除
+@enduml

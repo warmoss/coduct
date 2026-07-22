@@ -1,0 +1,21 @@
+= 业务
+
+include::如何防止短链被遍历.adoc[]
+
+include::如何高效检查百万单词是否包含在某个字符串中.adoc[]
+
+include::如何将收货地址解析成国标编码.adoc[]
+
+include::如何高效随机读取一张表中的数据.adoc[]
+
+include::数据库连接池参数配置原理.adoc[]
+
+include::OAuth2.1原理讲解.adoc[]
+
+include::OpenID原理讲解.adoc[]
+
+include::桥接器设计模式原理讲解.adoc[]
+
+include::中介者设计模式原理讲解.adoc[]
+
+include::备忘录设计模式原理讲解.adoc[]

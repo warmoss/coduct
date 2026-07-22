@@ -1,0 +1,249 @@
+== rollup原理讲解
+
+Rollup 是一个面向 ES Module(ESM) 的 JavaScript 模块打包工具. 与 Webpack 等传统打包器不同, Rollup 充分利用 ES Module 的静态结构特性, 实现了业界领先的 **Tree Shaking(树摇优化)** 和高效的代码拆分能力. 它被广泛应用于 JavaScript 库的构建, 同时也是 Vite 底层使用的生产构建工具.
+
+=== 核心概念
+
+**Bundle(打包产物)::** Rollup 的输出文件. 一个入口可以生成一个或多个 bundle.
+
+**Chunk::** 代码拆分后的产物片段. 动态导入(`import()`)会生成独立的 Chunk.
+
+**Module(模块)::** 一个源代码文件, 通过 import/export 与其他模块连接.
+
+**Plugin(插件)::** 扩展 Rollup 功能的中间件, 可在构建的各生命周期中拦截和处理模块.
+
+**Tree Shaking::** 基于 ES Module 静态分析, 去除未被引用的"死代码", 大幅减小输出体积.
+
+=== 核心原理
+
+==== ES Module 的静态结构
+
+Rollup 的强大能力源自 ES Module 的一个重要特性: **静态结构**.
+
+CommonJS 的 `require` 可以在运行时动态加载模块:
+
+[source, javascript]
+----
+const module = Math.random() > 0.5 ? require('a') : require('b');
+----
+
+而 ES Module 的 `import` 和 `export` 必须在**模块顶层**声明, 且导入导出的**名称是确定的**:
+
+[source, javascript]
+----
+import { readFile } from 'fs'; // 编译时即可确定
+export const VERSION = '1.0.0'; // 编译时即可确定
+----
+
+这一约束使得 Rollup 可以在**不执行代码**的前提下, 仅通过语法分析(Syntax Analysis)就构建出完整的模块依赖图. 这正是 Tree Shaking 的前提.
+
+==== Tree Shaking 的原理
+
+Tree Shaking 本质上是一个 **死代码消除(Dead Code Elimination)** 过程, 分为三步:
+
+. **构建模块依赖图(Module Graph):** Rollup 从入口文件开始, 递归解析所有 import 语句, 建立一颗完整的模块依赖树.
+
+. **标记导出使用情况:** 遍历依赖图, 记录每个模块中被**实际引用**的导出. 未被引用的导出会被标记为"dead".
+
+. **移除死代码:** 在生成输出时, 只保留被标记为"live"的代码, 剪除所有不可达的声明和语句.
+
+[source, javascript]
+----
+// math.js
+export const add = (a, b) => a + b;
+export const sub = (a, b) => a - b; // 未被引用, 会被移除
+
+// main.js
+import { add } from './math.js';
+console.log(add(1, 2));
+----
+
+最终输出仅包含 `add` 函数, `sub` 被完全消除.
+
+==== Tree Shaking 的局限性
+
+* **副作用问题:** Rollup 默认认为所有模块可能有副作用(如修改全局变量). 如果无法确定一个模块是否纯正, 即使未被引用也可能保留. 可通过 `package.json` 的 `"sideEffects": false` 声明无副作用.
+
+* **动态导入:** `import()` 是动态的, Rollup 无法在编译时确定具体导入哪些导出, 因此 Tree Shaking 不适用于动态导入的模块.
+
+* **CommonJS 模块:** 由于 CJS 的 `require` 是动态的, Rollup 很难静态分析其导出. 需要通过 `@rollup/plugin-commonjs` 插件将 CJS 转换为 ESM.
+
+==== 代码拆分(Code Splitting)
+
+Rollup 支持两种代码拆分方式:
+
+. **动态导入拆分:** 当遇到 `import('./foo.js')` 时, Rollup 会自动将 `foo.js` 及其依赖打包为独立的 Chunk.
+
+. **手动入口拆分:** 在配置中指定多个入口, 或通过 `output.manualChunks` 手动控制 Chunk 划分.
+
+[source, javascript]
+----
+// main.js
+if (condition) {
+  const module = await import('./heavy-module.js');
+  module.doSomething();
+}
+----
+
+Rollup 会将 `heavy-module.js` 打包为单独的 Chunk, 仅在运行时按需加载.
+
+==== 输出格式
+
+Rollup 的核心能力之一是灵活的输出格式控制. 它可以将同一份源代码编译输出为多种模块格式:
+
+**ESM(es):** 保留 `import/export` 语句, 适用于现代浏览器和 Node.js ESM 环境.
+
+**CommonJS(cjs):** 转换为 `require/module.exports`, 适用于 Node.js CJS 环境.
+
+**UMD(umd):** 兼容 AMD、CJS 和浏览器全局变量, 适用于浏览器直接引用.
+
+**IIFE(iife):** 自执行函数, 适用于 `<script>` 标签直接引入.
+
+[source, json]
+----
+{
+  "main": "dist/index.cjs.js",  // CommonJS 入口
+  "module": "dist/index.esm.js", // ESM 入口
+  "browser": "dist/index.umd.js" // 浏览器入口
+}
+----
+
+=== Rollup 的工作流程
+
+Rollup 的构建过程可以概括为以下几个阶段:
+
+. **输入解析阶段(Input Resolution):** 接收入口文件配置, 通过插件解析虚拟模块或非 JS 模块(如 CSS、JSON).
+
+. **模块加载阶段(Module Loading):** 从入口开始, 递归解析所有 `import` 依赖, 构建完整的模块图.
+
+. **模块转换阶段(Module Transformation):** 对每个模块应用插件转换(如 Babel 转译、TypeScript 编译).
+
+. **模块分析阶段(Module Analysis):** 分析模块依赖图和导出使用情况, 标记死代码.
+
+. **代码生成阶段(Code Generation):** 根据输出配置, 为每个 Chunk 生成最终的 JavaScript 代码, 完成 Tree Shaking.
+
+. **输出写入阶段(Output Emission):** 将生成的代码写入磁盘, 同时输出 sourcemap 等附属文件.
+
+=== 插件机制
+
+Rollup 的功能扩展完全通过插件系统实现. 每个插件可以"hook"到构建流程的不同阶段.
+
+==== 插件 Hook 生命周期
+
+[plantuml, "Rollup 插件 Hook 执行流程", format=png]
+----
+@startuml
+start
+:buildStart;
+:resolveId;
+:load;
+:transform;
+:moduleParsed;
+:resolveDynamicImport;
+fork
+  :generateBundle;
+  :writeBundle;
+fork again
+  :renderStart;
+  :renderChunk;
+  :augmentChunkHash;
+end fork
+:buildEnd;
+stop
+@enduml
+----
+
+==== 常用插件
+
+**@rollup/plugin-node-resolve::** 解析 `node_modules` 中的第三方包.
+
+**@rollup/plugin-commonjs::** 将 CommonJS 模块转换为 ESM, 使其能被 Rollup 处理和 Tree Shake.
+
+**@rollup/plugin-babel::** 集成 Babel 进行语法转译(如 JSX、TypeScript 等).
+
+**@rollup/plugin-terser::** 压缩输出代码, 减小体积.
+
+**@rollup/plugin-typescript::** 编译 TypeScript 文件.
+
+==== 插件示例
+
+[source, javascript]
+----
+import { defineConfig } from 'rollup';
+
+export default defineConfig({
+  input: 'src/index.js',
+  output: {
+    dir: 'dist',
+    format: 'esm'
+  },
+  plugins: [
+    resolve(),    // 解析 node_modules
+    commonjs(),   // 转换 CJS 为 ESM
+    babel({       // Babel 转译
+      babelHelpers: 'bundled'
+    })
+  ]
+});
+----
+
+=== Rollup 与 Webpack 的核心差异
+
+|===
+| 特性 | Rollup | Webpack
+
+| **模块系统** | 原生 ESM, 更利于 Tree Shaking | 支持 ESM、CJS、AMD 等多种格式
+| **Tree Shaking** | 原生深度支持, 效率极高 | 需配合 sideEffects 配置, 效率较低
+| **代码拆分** | 基于动态导入自动拆分 | 支持多种拆分策略(动态导入、SplitChunksPlugin)
+| **开发者体验** | 配置简洁, 适合库开发 | 配置丰富, 生态庞大, 适合应用开发
+| **HMR** | 不支持原生 HMR(Vite 补充) | 原生支持完整的 HMR
+| **应用场景** | JavaScript 库、组件库 | 大型 Web 应用、复杂资源处理
+|===
+
+=== Rollup 配置示例
+
+[source, javascript]
+----
+import { defineConfig } from 'rollup';
+import resolve from '@rollup/plugin-node-resolve';
+import commonjs from '@rollup/plugin-commonjs';
+import terser from '@rollup/plugin-terser';
+
+export default defineConfig({
+  input: 'src/index.js',
+  output: [
+    {
+      file: 'dist/index.esm.js',
+      format: 'esm'
+    },
+    {
+      file: 'dist/index.cjs.js',
+      format: 'cjs'
+    },
+    {
+      file: 'dist/index.umd.js',
+      format: 'umd',
+      name: 'MyLibrary'
+    }
+  ],
+  plugins: [
+    resolve(),
+    commonjs(),
+    terser()
+  ]
+});
+----
+
+=== 总结
+
+Rollup 的核心价值在于 **充分利用 ES Module 的静态特性, 实现极致的 Tree Shaking 和灵活的多格式输出.** 它的设计哲学是"小而精":
+
+* **Tree Shaking** 是 Rollup 的最强特性, 通过静态分析自动去除死代码, 输出体积最小化的产物.
+
+* **代码拆分** 基于动态导入自动完成, 无需额外配置.
+
+* **多格式输出** 使得 Rollup 成为 JavaScript 库开发的事实标准工具.
+
+* **插件机制** 提供了足够的扩展性, 但保持核心的简洁和专注.
+
+对于 JavaScript 库的作者, Rollup 是首选工具. 对于大型应用开发, 可以结合 Vite(开发时用 esbuild, 生产构建用 Rollup)来享受两方面的优势.

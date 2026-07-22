@@ -1,0 +1,282 @@
+== vite原理讲解
+
+Vite(法语, "快"的意思)是 Evan You 开发的下一代前端构建工具. 它从根本上改变了传统构建工具(如 Webpack)的开发模式, 利用浏览器原生 ES Module(ESM)支持, 在开发环境中实现了**按需编译**和**瞬时热更新**, 解决了大型项目中构建缓慢的痛点.
+
+Vite 采用**双引擎架构**: 开发环境使用 esbuild(Go 语言)进行依赖预构建, 直接利用浏览器原生 ESM 加载源码; 生产构建则使用 Rollup(JavaScript)进行优化打包. 这种设计既保证了开发时的极致速度, 又保留了生产构建的完整优化能力.
+
+了解 Vite 的底层原理后, 再来看看它的继任者 Rolldown 是如何统一双引擎架构的: <<Web/node/rolldown原理讲解.adoc, Rolldown 原理>>.
+
+=== 核心概念
+
+ES Module(ESM):: 浏览器原生支持的模块系统, 通过 `<script type="module">` 加载, 使用 `import`/`export` 语法. 浏览器直接解析 ESM, 无需打包即可按需请求.
+
+依赖预构建(Dep Pre-Bundling):: Vite 在开发服务器启动前, 使用 esbuild 将 node_modules 中的依赖(如 React、Vue)预打包为单个 ESM 文件, 减少模块请求数量.
+
+HMR(Hot Module Replacement):: 热模块替换, 在不刷新整个页面的情况下, 精确更新发生变更的模块, 保持应用状态.
+
+生产构建(Production Build):: 使用 Rollup 对源码进行全量打包, 执行 Tree Shaking、代码分割、压缩等优化, 生成可用于生产环境的静态资源.
+
+双引擎架构:: Vite 开发时用 esbuild(Go)做预构建, 生产时用 Rollup(JS)做打包. 两者各司其职, 但会导致开发与生产环境行为不一致.
+
+=== 核心原理
+
+==== 开发环境: 基于原生 ESM
+
+Vite 开发服务器的核心思想是: **不再打包, 让浏览器自己管理模块**.
+
+传统工具(如 Webpack)在开发时会将所有模块打包成一个 Bundle, 每次修改都需要重新打包, 项目越大越慢. Vite 的做法完全不同:
+
+. 源码中的 ESM `import` 语句直接发送给浏览器, 浏览器根据 URL 向 Vite 开发服务器发起 HTTP 请求
+
+. Vite 服务器按需转换被请求的模块(如编译 TypeScript、编译 Vue SFC), 即时返回 ESM 格式的代码
+
+. 浏览器原生解析 ESM, 遇到新的 `import` 就再发起新的请求
+
+[plantuml, "Vite 开发环境工作原理", format=png]
+----
+@startuml
+!theme plain
+skinparam backgroundColor #FEFEFE
+
+actor "浏览器" as browser
+participant "Vite Dev Server" as vite
+participant "esbuild" as esbuild
+participant "文件系统" as fs
+
+browser -> vite: GET /src/main.ts
+vite -> fs: 读取 main.ts
+vite -> vite: 编译 TypeScript → ESM
+vite --> browser: 返回 ESM 代码
+browser -> browser: 解析 ESM, 发现 import { createApp } from 'vue'
+browser -> vite: GET /@modules/vue
+vite -> esbuild: 预构建 vue(首次)
+esbuild --> vite: 预构建后的 ESM
+vite --> browser: 返回预构建的 vue
+browser -> browser: 继续解析新的 import...
+@enduml
+----
+
+===== 预构建(Dep Pre-Bundling)
+
+为什么需要预构建? 原因有二:
+
+. **兼容性:** node_modules 中的包可能以 CommonJS 或 UMD 格式发布, 浏览器无法直接识别. esbuild 将其转换为 ESM 格式.
+
+. **请求优化:** 一个小包可能有数十个内部模块, 如 `lodash-es` 有数百个文件. 若不预构建, 浏览器需要发起数百个 HTTP 请求, 严重影响性能. esbuild 将其合并为单个(或少数几个)ESM 文件.
+
+Vite 在开发服务器启动时执行预构建, 结果缓存在 `node_modules/.vite` 目录中. 以下情况会触发重新预构建:
+
+* `package.json` 的 `dependencies` 发生变更
+
+* lock 文件(`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`)发生变更
+
+* `.vite` 缓存目录被手动删除
+
+===== 依赖预构建的细节
+
+esbuild 预构建的过程:
+
+. 扫描入口文件, 收集所有从 `node_modules` 导入的依赖
+
+. 使用 esbuild 将每个依赖打包为独立的 ESM 文件
+
+. 将结果写入 `node_modules/.vite/deps/`, 并生成 `_metadata.json` 记录依赖映射
+
+[source, json]
+----
+// node_modules/.vite/deps/_metadata.json
+{
+  "hash": "a1b2c3d4",
+  "browserHash": "e5f6g7h8",
+  "optimized": {
+    "vue": {
+      "src": "/path/to/vue/index.js",
+      "file": "vue.js",
+      "needsInterop": false
+    },
+    "react": {
+      "src": "/path/to/react/index.js",
+      "file": "react.js",
+      "needsInterop": true
+    }
+  }
+}
+----
+
+浏览器中的 `import vue from 'vue'` 会被 Vite 服务器重写为 `import vue from '/@modules/vue.js'`, 指向预构建后的文件.
+
+===== HMR(热模块替换)
+
+Vite 的 HMR 之所以快, 核心在于: **基于 ESM 的精确失效链(Precise Invalidation Chain)**.
+
+传统 HMR(如 Webpack)需要将模块打包后替换, 且模块间依赖关系的跟踪成本较高. Vite 的 HMR 流程:
+
+. **文件变化检测:** Vite 使用 `chokidar` 监听文件变化, 通过 `WebSocket` 通知客户端
+
+. **模块失效:** 仅将变更的模块标记为"失效", 浏览器重新请求该模块. 由于 ESM 的静态结构, Vite 可以精确知道哪个模块依赖于变更的模块
+
+. **精准更新:** 只重新请求变化模块及其直接依赖链, 而非重新构建整个 Bundle
+
+[plantuml, "Vite HMR 流程", format=png]
+----
+@startuml
+!theme plain
+skinparam backgroundColor #FEFEFE
+
+participant "文件系统" as fs
+participant "Vite Dev Server" as server
+participant "WebSocket" as ws
+participant "浏览器客户端" as client
+participant "模块缓存" as cache
+
+fs -> server: 文件变更(main.ts)
+server -> server: 编译变更模块
+server -> ws: 发送 HMR 消息
+ws -> client: 通知模块变更
+client -> cache: 失效模块缓存
+client -> server: 重新请求变更模块
+server -> client: 返回新模块代码
+client -> client: 执行 HMR 回调
+client -> client: 更新视图(保持状态)
+@enduml
+----
+
+Vite 的 HMR 优势:
+
+按需编译:: 只编译变更的文件, 不像 Webpack 那样需要重新构建整个模块图
+精确失效:: 仅失效受影响的模块, 避免级联重建
+原生 ESM 速度:: 浏览器直接从 HTTP 缓存或服务器获取单个文件, 无需二次打包
+
+==== 生产构建: 基于 Rollup
+
+Vite 在生产环境使用 Rollup 进行打包, 因为原生 ESM 在浏览器中的加载性能仍有局限:
+
+* 大量 HTTP 请求对生产环境不可接受
+* 需要代码压缩、Tree Shaking、代码分割等优化
+* 需要兼容不支持 ESM 的旧浏览器
+
+Vite 的生产构建流程:
+
+. **Rollup 构建:** Vite 将内部配置(包括 CSS 处理、资源引用、代码分割策略)传递给 Rollup
+
+. **Tree Shaking:** Rollup 基于 ESM 静态分析, 去除未使用的代码. 原理详见 <<Web/node/rollup原理讲解.adoc, Rollup 原理讲解>>
+
+. **代码分割:** 通过动态 `import()` 自动拆分 Chunk, 支持 `output.manualChunks` 手动控制
+
+. **CSS 处理:** Vite 内置 CSS 支持, 可提取为独立 CSS 文件、压缩、处理 PostCSS 和 CSS Modules
+
+. **资源处理:** 图片、字体等静态资源自动 hash 并复制到输出目录
+
+双引擎架构虽然带来了开发和生产的一致性问题, 但 Rolldown 正在解决这个问题—详见 <<Web/node/rolldown原理讲解.adoc, Rolldown 原理>>.
+
+=== Vite vs 传统工具
+
+|===
+| 特性 | Vite(开发) | Webpack(开发)
+
+| **模块加载** | 原生 ESM, 按需加载 | Bundle 打包后加载
+| **冷启动速度** | 秒级(无需打包) | 分钟级(大型项目)
+| **HMR 速度** | 毫秒级(仅编译变更模块) | 秒级(需重新打包)
+| **构建工具** | esbuild(Go) 预构建 | 自身(C++/JS)打包
+| **文件级缓存** | 浏览器 HTTP 缓存 | 内存缓存
+| **配置复杂度** | 简洁, 零配置起步 | 配置繁多
+|===
+
+Vite 的冷启动速度远快于 Webpack, 因为:
+
+* **Webpack** 启动时需从入口开始, 递归构建完整的模块依赖图, 然后打包为一个 Bundle. 大型项目中这个过程可能需要数十秒到数分钟.
+
+* **Vite** 仅用 esbuild 预构建 `node_modules` 中的依赖(也是开发中最慢的部分), 源码完全不打包. 预构建通常只需 1-3 秒.
+
+=== 插件系统
+
+Vite 插件基于 Rollup 的插件接口设计, 同时添加了 Vite 特有的扩展 Hook.
+
+==== 插件 Hook 分类
+
+通用 Hook:: 与 Rollup 共享的 Hook, 如 `resolveId`, `load`, `transform`. 纯 Rollup 插件通常可直接在 Vite 中使用.
+
+Vite 特有 Hook:: `config`(修改配置)、`configResolved`(配置解析后)、`configureServer`(修改开发服务器)、`handleHotUpdate`(自定义 HMR 行为)等.
+
+==== 示例: 一个简单的 Vite 插件
+
+[source, javascript]
+----
+import { defineConfig } from 'vite';
+
+export default defineConfig({
+  plugins: [
+    {
+      name: 'example-plugin',
+      // 转换模块内容
+      transform(code, id) {
+        if (id.endsWith('.example')) {
+          return {
+            code: `export default ${JSON.stringify(code)}`,
+            map: null,
+          };
+        }
+      },
+      // 自定义 HMR 处理
+      handleHotUpdate({ file, server }) {
+        if (file.endsWith('.special')) {
+          server.ws.send({
+            type: 'custom',
+            event: 'special-file-changed',
+            data: { file },
+          });
+          return []; // 阻止默认 HMR
+        }
+      },
+    },
+  ],
+});
+----
+
+=== Vite 配置文件示例
+
+[source, javascript]
+----
+import { defineConfig } from 'vite';
+import vue from '@vitejs/plugin-vue';
+import { resolve } from 'path';
+
+export default defineConfig({
+  plugins: [vue()],
+  resolve: {
+    alias: {
+      '@': resolve(__dirname, 'src'),
+    },
+  },
+  build: {
+    target: 'es2020',
+    outDir: 'dist',
+    sourcemap: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['vue', 'vue-router'],
+        },
+      },
+    },
+  },
+  server: {
+    port: 3000,
+    proxy: {
+      '/api': 'http://localhost:8080',
+    },
+  },
+});
+----
+
+=== 总结
+
+Vite 的核心创新在于 **利用浏览器原生 ESM 绕过开发时的打包环节**, 实现了传统构建工具无法比拟的开发体验:
+
+* **开发环境**通过 esbuild 预构建 + 原生 ESM 加载 + 精确 HMR, 实现了秒级冷启动和毫秒级热更新
+
+* **生产构建**通过 Rollup 保证 Tree Shaking、代码分割、压缩等全套优化能力, 输出最小化的生产代码
+
+* **插件系统**兼容 Rollup 生态, 同时扩展了 Vite 特有的能力, 如自定义 HMR 和服务器中间件
+
+* **双引擎架构**虽带来了开发/生产行为不一致的权衡, 但 Rolldown 的出现将统一这一架构—届时 Vite 将用单一 Rust 引擎贯穿开发与生产

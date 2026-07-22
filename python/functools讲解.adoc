@@ -1,0 +1,351 @@
+== functools模块讲解
+
+`functools` 是 Python 标准库中面向**高阶函数**和**可调用对象操作**的模块, 提供了一系列用于函数式编程的工具函数和装饰器. 它解决了函数参数预绑定, 缓存计算结果, 保留装饰器元数据, 泛型函数分发等常见需求.
+
+=== 核心函数与装饰器
+
+`functools` 模块包含多个实用工具, 以下逐一说明其原理和典型用法.
+
+==== `partial` - 偏函数
+
+`partial` 用于**固定一个函数的某些参数**, 返回一个新的可调用对象, 简化重复传参.
+
+[source,python]
+----
+from functools import partial
+
+def power(base, exp):
+    return base ** exp
+
+square = partial(power, exp=2)
+cube = partial(power, exp=3)
+
+square(5)  # 25
+cube(5)    # 125
+----
+
+原理上, `partial` 对象内部保存原函数和预绑定参数, 调用时合并新传入参数后转发给原函数. 本质上相当于:
+
+[source,python]
+----
+def partial(func, /, *args, **kwargs):
+    def wrapper(*more_args, **more_kwargs):
+        return func(*args, *more_args, **kwargs, **more_kwargs)
+    return wrapper
+----
+
+适用场景: 回调函数传参, 事件处理器绑定上下文, 减少重复代码.
+
+==== `partialmethod` - 偏方法
+
+`partialmethod` 与 `partial` 类似, 但专用于**类的方法定义**:
+
+[source,python]
+----
+from functools import partialmethod
+
+class Connection:
+    def connect(self, host, port, timeout):
+        print(f"Connecting to {host}:{port} (timeout={timeout}s)")
+
+    connect_local = partialmethod(connect, host="localhost", port=8080)
+
+    @partialmethod
+    def connect_with_timeout(self, timeout):
+        return self.connect("localhost", 8080, timeout)
+
+conn = Connection()
+conn.connect_local(timeout=30)               # Connecting to localhost:8080 (timeout=30s)
+----
+
+与 `partial` 不同, `partialmethod` 只在方法查找时绑定, 而非在定义时绑定, 因此能正确处理实例方法.
+
+==== `reduce` - 累积归约
+
+`reduce` 对可迭代对象中的元素**从左到右累积应用一个二元函数**, 最终归约为单一值.
+
+[source,python]
+----
+from functools import reduce
+
+# 计算阶乘
+reduce(lambda a, b: a * b, range(1, 6))    # 120
+
+# 拼接字符串列表
+reduce(lambda a, b: f"{a}, {b}", ["a", "b", "c"])  # "a, b, c"
+
+# 带初始值
+reduce(lambda a, b: a + b, [1, 2, 3], 10)  # 16
+----
+
+`reduce` 等价于以下过程:
+
+. 取前两个元素(或初始值与第一个元素)应用函数
+. 将结果与下一个元素继续应用函数
+. 重复直至所有元素处理完毕
+
+NOTE: Python 3 中将 `reduce` 从内置函数移入 `functools`, 推荐优先使用 `for` 循环以提高可读性, 仅在归约逻辑清晰时才使用 `reduce`.
+
+==== `@lru_cache` 与 `@cache` - 函数结果缓存
+
+`@lru_cache` 是一个装饰器, 使用 **LRU(Least Recently Used, 最近最少使用)** 策略缓存函数的返回值. `@cache` (Python 3.9+) 是无容量限制的简化版.
+
+[source,python]
+----
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def fibonacci(n):
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+# 首次调用计算并缓存
+fibonacci(10)  # 55
+
+# 再次调用直接返回缓存结果
+fibonacci(10)  # 从缓存读取
+
+# 查看缓存统计
+fibonacci.cache_info()
+# CacheInfo(hits=9, misses=11, maxsize=128, currsize=11)
+----
+
+`lru_cache` 使用**字典**存储参数到结果的映射, 同时维护一个双向链表记录访问顺序. 当缓存满时, 淘汰链表尾部的最近最少使用条目.
+
+[maxsize] 参数:
+* `maxsize=None` - 无容量限制, 等价于 `@cache`
+* `maxsize=128` - 默认值, 限制缓存条目数
+* `typed=True` - 区分不同参数类型, 如 `fibonacci(3)` 和 `fibonacci(3.0)` 视为不同键
+
+[source,python]
+----
+# 手动清除缓存
+fibonacci.cache_clear()
+
+# 设置缓存大小限制并区分类型
+@lru_cache(maxsize=256, typed=True)
+def compute(x, y):
+    return x ** y
+----
+
+适用场景: 递归计算(如斐波那契数列), 纯函数计算, 数据库查询结果缓存, 配置解析结果缓存.
+
+WARNING: `@lru_cache` 仅适用于**纯函数**(相同输入始终产生相同输出且无副作用). 不适用于依赖外部状态或产生副作用的函数.
+
+==== `@wraps` - 保留装饰器元数据
+
+装饰器会将原函数替换为包装函数, 导致原函数的 `__name__`, `__doc__`, `__module__` 等元数据丢失. `@wraps` 将原函数的元数据复制到包装函数上.
+
+[source,python]
+----
+from functools import wraps
+
+def logger(func):
+    @wraps(func)                     # 保留 func 的元数据
+    def wrapper(*args, **kwargs):
+        print(f"Calling {func.__name__}")
+        return func(*args, **kwargs)
+    return wrapper
+
+@logger
+def add(a, b):
+    """Return the sum of two numbers."""
+    return a + b
+
+add.__name__  # 'add' (不加 @wraps 会返回 'wrapper')
+add.__doc__   # 'Return the sum of two numbers.'
+----
+
+`@wraps` 本质是对 `update_wrapper` 的调用, 即将源函数的 `__module__`, `__name__`, `__qualname__`, `__annotations__`, `__doc__`, `__dict__` 属性复制到包装函数, 并更新 `__wrapped__` 属性指向原函数.
+
+==== `@singledispatch` - 单分派泛函数
+
+`@singledispatch` 将普通函数转换为**泛函数(generic function)**, 允许根据第一个参数的类型执行不同的实现.
+
+[source,python]
+----
+from functools import singledispatch
+
+@singledispatch
+def serialize(obj):
+    """Default implementation."""
+    return str(obj)
+
+@serialize.register(int)
+def _(obj):
+    return f"int:{obj}"
+
+@serialize.register(list)
+def _(obj):
+    items = ", ".join(serialize(item) for item in obj)
+    return f"[{items}]"
+
+@serialize.register(dict)
+def _(obj):
+    items = ", ".join(f"{k}:{serialize(v)}" for k, v in obj.items())
+    return f"{{{items}}}"
+
+serialize(42)          # 'int:42'
+serialize([1, 2, 3])   # '[int:1, int:2, int:3]'
+serialize({"a": 1})    # '{a:int:1}'
+serialize("hello")     # 'hello' (默认实现)
+----
+
+注册类型支持**继承层次** - 若找不到精确匹配类型, 会查找其父类注册的实现:
+
+[source,python]
+----
+# 同时注册多个类型
+@serialize.register(tuple)
+@serialize.register(set)
+def _(obj):
+    return f"({', '.join(map(str, obj))})"
+----
+
+适用场景: JSON 序列化器, 类型适配器, 命令行参数解析.
+
+TIP: Python 3.12+ 支持 `@singledispatchmethod` 装饰器, 可应用于类方法实现类型分派.
+
+==== `cached_property` - 缓存属性
+
+`cached_property` (Python 3.8+) 将方法调用结果缓存为实例属性, 首次访问时计算, 后续直接返回缓存值.
+
+[source,python]
+----
+from functools import cached_property
+
+class DataSet:
+    def __init__(self, data):
+        self._data = data
+
+    @cached_property
+    def total(self):
+        """Expensive computation."""
+        print("Computing total...")
+        return sum(self._data)
+
+    @cached_property
+    def average(self):
+        return self.total / len(self._data)
+
+ds = DataSet([1, 2, 3, 4, 5])
+print(ds.total)    # Computing total... 15 (第一次计算)
+print(ds.total)    # 15 (直接返回缓存, 不打印)
+print(ds.average)  # 3.0
+----
+
+与 `@property` 的区别:
+
+[cols="2*"]
+|===
+| `@property` | `@cached_property`
+
+| 每次访问都执行方法 | 仅首次执行, 后续从 `__dict__` 读取
+| 适合轻量计算 | 适合耗时计算
+| 无法直接删除缓存 | 可 `del obj.attr` 清除缓存
+|===
+
+WARNING: `cached_property` 在**多线程环境**中存在竞态条件, 多个线程可能同时触发计算. 需要线程安全时, 使用 `threading.Lock` 加锁.
+
+==== `@total_ordering` - 自动补全比较方法
+
+`@total_ordering` 根据类中定义的 `__eq__` 和其中一个比较方法(`__lt__`, `__le__`, `__gt__`, `__ge__`), 自动推导出其他所有比较方法.
+
+[source,python]
+----
+from functools import total_ordering
+
+@total_ordering
+class Person:
+    def __init__(self, name, age):
+        self.name = name
+        self.age = age
+
+    def __eq__(self, other):
+        return self.age == other.age
+
+    def __lt__(self, other):
+        return self.age < other.age
+
+p1 = Person("Alice", 30)
+p2 = Person("Bob", 25)
+
+p1 > p2   # True (由 __lt__ 推导)
+p1 >= p2  # True
+p1 <= p2  # False
+----
+
+`@total_ordering` 通过填充缺失的比较方法实现完整比较协议, 但会增加额外的函数调用开销. 在性能敏感场景, 建议手动实现所有比较方法.
+
+=== 综合示例
+
+以下示例展示多个 `functools` 工具的协同使用:
+
+[source,python]
+----
+from functools import partial, lru_cache, wraps, singledispatch, cached_property
+from dataclasses import dataclass
+
+# 带缓存的纯函数
+@lru_cache(maxsize=256)
+def parse_config(filepath: str) -> dict:
+    """Parse configuration file (simulated)."""
+    print(f"Parsing {filepath}...")
+    return {"host": "localhost", "port": 8080}
+
+# 保留元数据的装饰器
+def measure_time(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        import time
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"{func.__name__} took {elapsed:.4f}s")
+        return result
+    return wrapper
+
+@measure_time
+def process(data):
+    return [x * 2 for x in data]
+
+# 缓存计算结果属性
+@dataclass
+class Report:
+    values: list
+
+    @cached_property
+    def summary(self):
+        return {
+            "min": min(self.values),
+            "max": max(self.values),
+            "avg": sum(self.values) / len(self.values),
+        }
+
+# 类型分派序列化
+@singledispatch
+def to_json(obj):
+    return str(obj)
+
+@to_json.register(dict)
+def _(obj):
+    return "{" + ", ".join(f"{k}:{to_json(v)}" for k, v in obj.items()) + "}"
+
+# 偏函数创建专用工具
+load_dev_config = partial(parse_config, "config.dev.yaml")
+load_prod_config = partial(parse_config, "config.prod.yaml")
+----
+
+=== 总结
+
+`functools` 模块的核心价值在于:
+
+* **参数预绑定** - `partial` 和 `partialmethod` 减少重复传参
+* **计算优化** - `@lru_cache` / `@cache` / `cached_property` 避免重复计算
+* **装饰器支持** - `@wraps` 保留函数元数据, 是编写装饰器的标准实践
+* **泛型编程** - `@singledispatch` 实现类型分派, 替代繁重的 `isinstance` 分支
+* **归约操作** - `reduce` 提供函数式归约能力
+* **比较协议** - `@total_ordering` 简化比较方法定义
+
+`functools` 的设计理念是提供轻量, 高效, 组合性强的函数式工具, 不引入框架级别的依赖. 在编写 Python 代码时, 优先考虑标准库解决方案, 再评估第三方依赖.

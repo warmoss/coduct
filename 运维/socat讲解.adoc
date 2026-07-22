@@ -1,0 +1,241 @@
+== socat 讲解
+
+socat（SOcket CAT）是一个强大的网络瑞士军刀工具，它在两个双向字节流之间建立双向数据传输通道。与 netcat 相比，socat 支持更多的地址类型和协议组合，被誉为网络工具中的"**多功能工具箱**"。
+
+=== 概念定义
+
+socat 的本质是一个**双向数据中继器**，它从一端读取数据写入另一端，同时从另一端读取数据写回这一端。
+
+* **地址 (Address)**:: socat 中的核心抽象，代表一个数据端点。可以是 TCP 端口、UDP 套接字、Unix 域套接字、文件、管道、PTY、SSL 连接等
+* **双通道架构**:: socat 同时维护两个独立的 I/O 方向，两端可以使用完全不同的地址类型和协议
+* **数据流**:: socat 不关心数据的格式和含义，它只是忠实地在两端之间传递原始字节流
+
+[source,shell]
+----
+socat [选项] <地址1> <地址2>
+----
+
+socat 的地址语法统一为 `协议:地址:端口` 的格式，例如：
+
+[source,shell]
+----
+TCP-LISTEN:8080            # 监听 TCP 8080 端口
+TCP:192.168.1.1:80         # 连接远程 TCP 端口
+UDP:1.2.3.4:53             # UDP 通信
+UNIX-LISTEN:/tmp/sock      # 监听 Unix 域套接字
+EXEC:/bin/sh               # 执行命令并连接其 stdio
+OPEN:file.txt,creat,rdonly # 打开文件
+----
+
+=== 核心特性
+
+==== 地址类型多样性
+
+socat 支持极其丰富的地址类型，覆盖了绝大多数网络和 I/O 场景：
+
+[cols="2m,5a"]
+|===
+| 地址类型 | 说明
+
+| `TCP:LISTEN` | TCP 服务端监听
+| `TCP:CONNECT` | TCP 客户端连接
+| `UDP-LISTEN` | UDP 服务端监听
+| `UDP-CONNECT` | UDP 数据发送
+| `OPENSSL` | SSL/TLS 加密连接
+| `UNIX-LISTEN` | Unix 域套接字服务端
+| `UNIX-CONNECT` | Unix 域套接字客户端
+| `EXEC` | 执行外部命令
+| `SYSTEM` | 通过 shell 执行命令
+| `PTY` | 创建伪终端
+| `FILE` | 读写文件
+| `PIPE` | 命名管道
+| `SOCKET` | 原始套接字
+| `SCTP` | SCTP 协议
+| `SOCKS` | SOCKS 代理
+| `PROXY` | HTTP/HTTPS 代理连接
+|===
+
+==== 灵活的数据处理选项
+
+socat 提供丰富的选项来控制数据流的行为，通过逗号分隔附加在地址后面：
+
+[source,shell]
+----
+# 重用地址、fork 处理多连接
+socat TCP-LISTEN:8080,reuseaddr,fork TCP:192.168.1.1:80
+
+# 设置读写超时
+socat TCP-LISTEN:8080,rcvtimeo=30 TCP:192.168.1.1:80
+----
+
+==== 协议转换和封装
+
+socat 可以在一端接收一种协议的数据，封装后通过另一种协议发送到另一端，实现**协议网关**的功能。
+
+=== 工作流程
+
+socat 的运行流程可概括为四个阶段：
+
+. **地址解析** -- 解析命令行中的两个地址描述，确定各端的协议类型、地址和选项
+. **资源初始化** -- 创建套接字、绑定端口、建立连接或打开文件，准备 I/O 资源
+. **数据中继循环** -- 使用 `select()` 或 `poll()` 同时监控两个方向的数据可读性，检测到数据后读取并写入另一端
+. **连接终止** -- 当一端关闭或发生错误时，socat 关闭对应方向的通道，根据选项决定是否终止另一端
+
+[plantuml, "socat 数据中继流程", format=png]
+----
+@startuml
+start
+:解析地址1 和 地址2;
+:初始化两端资源;
+
+while (连接活跃?) is (是)
+  :监控两端数据可读;
+  if (地址1 有数据?) then (是)
+    :从地址1 读取数据;
+    :写入地址2;
+  else (否)
+  endif
+  if (地址2 有数据?) then (是)
+    :从地址2 读取数据;
+    :写入地址1;
+  else (否)
+  endif
+endwhile (否)
+
+:关闭两端资源;
+stop
+@enduml
+----
+
+=== 典型使用场景
+
+==== TCP 端口转发
+
+将本地 8080 端口的所有流量转发到远程服务器的 80 端口：
+
+[source,shell]
+----
+socat TCP-LISTEN:8080,fork,reuseaddr TCP:remote-server:80
+----
+
+`fork` 选项使 socat 为每个连接创建子进程处理，`reuseaddr` 允许端口立即重用。
+
+==== 反向 Shell
+
+在一台机器上创建监听，另一台连接后获得 Shell 访问：
+
+[source,shell]
+----
+# 服务端（被控端）
+socat TCP-LISTEN:4444,reuseaddr EXEC:/bin/sh
+
+# 客户端（控制端）
+socat TCP:server-ip:4444 -
+----
+
+WARNING: 反向 Shell 功能可用于远程管理，也可能被用于攻击。仅在受控网络环境中使用。
+
+==== SSL 加密传输
+
+使用 OpenSSL 对通信进行加密，适合在不安全网络中传输敏感数据：
+
+[source,shell]
+----
+# 生成自签名证书
+openssl req -new -x509 -keyout key.pem -out cert.pem -days 365 -nodes
+
+# 服务端
+socat OPENSSL-LISTEN:443,cert=cert.pem,key=key.pem,fork TCP:localhost:80
+
+# 客户端
+socat OPENSSL:server-ip:443,cert=cert.pem,key=key.pem TCP:localhost:8080
+----
+
+==== Unix 域套接字代理
+
+将 Unix 域套接字暴露为 TCP 端口，方便远程调试：
+
+[source,shell]
+----
+socat TCP-LISTEN:3306,fork,reuseaddr UNIX-CONNECT:/var/run/mysqld/mysqld.sock
+----
+
+==== 端口映射到远程主机（类似 SSH -L）
+
+[source,shell]
+----
+socat TCP-LISTEN:8080,fork TCP:localhost:9999
+# 然后在另一个终端
+socat TCP-LISTEN:9999,fork TCP:target-server:80
+----
+
+==== UDP 组播和广播
+
+socat 支持 UDP 广播或多播通信：
+
+[source,shell]
+----
+# UDP 广播接收
+socat UDP-RECVFROM:1234,broadcast,fork -
+----
+
+==== 串口重定向到网络
+
+将本地串口设备转发到 TCP 端口，实现串口设备的网络化：
+
+[source,shell]
+----
+socat TCP-LISTEN:7000,fork FILE:/dev/ttyS0,nonblock,raw,echo=0
+----
+
+=== 高级选项
+
+[cols="2m,5a"]
+|===
+| 选项 | 说明
+
+| `fork` | 每个连接创建子进程处理，实现并发
+| `reuseaddr` | 允许地址重用
+| `rcvtimeo=N` | 读超时（秒）
+| `sndtimeo=N` | 写超时（秒）
+| `keepalive` | 启用 TCP keepalive
+| `nonblock` | 非阻塞模式
+| `raw` | 原始模式（串口）
+| `echo=0` | 关闭回显（串口/PTY）
+| `creat` | 创建文件（如果不存在）
+| `append` | 追加模式写入文件
+| `interval=N` | 间隔时间（秒）
+| `retry` | 连接失败时重试
+| `ignoreeof` | 忽略 EOF，保持通道打开
+| `end-close` | 另一端关闭时关闭本端
+|===
+
+=== 与 netcat 的对比
+
+[cols="2,2m,2m"]
+|===
+| 特性 | netcat | socat
+
+| 地址类型 | 10+ | 30+
+| SSL/TLS 支持 | 需 OpenSSL 版 | 原生支持
+| 协议转换 | 不支持 | 原生支持
+| 串口重定向 | 有限 | 完善
+| Unix 域套接字 | 有限 | 原生支持
+| 线程/并发 | 单线程 | fork 子进程
+| 数据选项 | 少量 | 丰富
+|===
+
+=== 总结
+
+socat 是一个**功能极其丰富的网络工具**，远超传统 netcat 的能力范围。核心要点：
+
+* **双向中继**是 socat 的根本工作模式，理解这一点就能灵活组合各种地址
+* **地址组合无限** -- 两端可以使用完全不同的地址类型，实现协议转换和跨网络通信
+* **适用场景广泛** -- 从简单的端口转发到复杂的 SSL 加密隧道、串口网络化、Unix 套接字代理
+* `fork` + `reuseaddr` 是最常用的选项组合，实现并发服务
+
+TIP: 调试时使用 `-v` 和 `-d` 选项查看详细的十六进制数据流和诊断信息： +
+[source,shell]
+----
+socat -v -d -d TCP-LISTEN:8080,fork TCP:target:80
+----

@@ -1,0 +1,600 @@
+== tsconfig讲解
+
+tsconfig.json 是 TypeScript 项目的配置文件, 用于指定编译选项、管理项目文件、配置输出目录等. 它告诉 TypeScript 编译器如何将 .ts 文件编译成 .js 文件.
+
+=== 基本结构
+
+[source, json]
+----
+{
+  "compilerOptions": {          // 核心编译选项
+    // 编译配置...
+  },
+  "include": [],                // 指定要编译的文件/目录模式
+  "exclude": [],                // 排除某些文件/目录
+  "extends": "",                // 继承另一个配置文件
+  "references": [],             // 项目引用(用于 monorepo)
+  "watchOptions": {}            // 监听模式选项
+}
+----
+
+=== compilerOptions(核心编译选项)
+
+==== 基础选项
+
+[cols="1,1,5"]
+|===
+|选项 |类型 |描述
+
+|target
+|string
+|编译目标 JS 版本, 如 "ES5", "ES6", "ES2020", "ESNext"
+
+|module
+|string
+|模块系统, 如 "CommonJS", "ES6", "AMD", "UMD", "NodeNext"
+
+|lib
+|string[]
+|需要引用的库文件列表, 如 ["ES2015", "DOM", "DOM.Iterable"]
+
+|outDir
+|string
+|输出目录, 如 "./dist"
+
+|rootDir
+|string
+|源码根目录, 用于控制输出目录结构
+
+|declaration
+|boolean
+|是否生成 .d.ts 声明文件
+
+|declarationDir
+|string
+|声明文件的输出目录
+
+|sourceMap
+|boolean
+|是否生成 .map.js 源映射文件
+
+|removeComments
+|boolean
+|是否移除注释
+
+|===
+
+==== 严格类型检查选项
+
+[cols="1,1,5"]
+|===
+|选项 |类型 |描述
+
+|strict
+|boolean
+|启用所有严格类型检查选项(推荐 true)
+
+|noImplicitAny
+|boolean
+|禁止隐式 any 类型
+
+|strictNullChecks
+|boolean
+|严格空值检查, 区分 null/undefined
+
+|strictFunctionTypes
+|boolean
+|严格检查函数类型
+
+|strictBindCallApply
+|boolean
+|严格检查 bind、call、apply
+
+|strictPropertyInitialization
+|boolean
+|严格检查类属性是否初始化
+
+|noImplicitThis
+|boolean
+|禁止不明确的 this
+
+|alwaysStrict
+|boolean
+|以严格模式解析并为每个文件生成 "use strict"
+
+|===
+
+==== 模块解析选项
+
+[cols="1,1,5"]
+|===
+|选项 |类型 |描述
+
+|moduleResolution
+|string
+|模块解析策略, "node" 或 "classic"
+
+|baseUrl
+|string
+|解析非相对模块名的基准目录
+
+|paths
+|object
+|路径映射, 类似 webpack 的 alias
+
+|rootDirs
+|string[]
+|将多个目录视为同一个虚拟目录
+
+|typeRoots
+|string[]
+|自定义类型定义文件位置
+
+|types
+|string[]
+|要包含的类型声明包名
+
+|allowSyntheticDefaultImports
+|boolean
+|允许从没有默认导出的模块默认导入
+
+|esModuleInterop
+|boolean
+|提供 CommonJS/AMD/UMD 兼容性
+
+|resolveJsonModule
+|boolean
+|允许导入 .json 文件
+
+|===
+
+==== 代码生成选项
+
+[cols="1,1,5"]
+|===
+|选项 |类型 |描述
+
+|noEmit
+|boolean
+|不生成输出文件, 仅做类型检查
+
+|noEmitOnError
+|boolean
+|有错误时不生成输出文件
+
+|emitDecoratorMetadata
+|boolean
+|生成装饰器元数据(用于 Angular、NestJS)
+
+|experimentalDecorators
+|boolean
+|启用实验性装饰器语法
+
+|jsx
+|string
+|控制 JSX 输出, "react", "react-jsx", "preserve"
+
+|jsxFactory
+|string
+|JSX 工厂函数, 如 "React.createElement"
+
+|jsxFragmentFactory
+|string
+|JSX 片段工厂函数
+
+|newLine
+|string
+|换行符, "LF" 或 "CRLF"
+
+|===
+
+==== 代码检查与辅助选项
+
+[cols="1,1,5"]
+|===
+|选项 |类型 |描述
+
+|noUnusedLocals
+|boolean
+|报告未使用的局部变量
+
+|noUnusedParameters
+|boolean
+|报告未使用的参数
+
+|noImplicitReturns
+|boolean
+|要求函数所有路径都有返回值
+
+|noFallthroughCasesInSwitch
+|boolean
+|禁止 switch 语句中 case 贯穿
+
+|noUncheckedIndexedAccess
+|boolean
+|索引访问时包含 undefined
+
+|skipLibCheck
+|boolean
+|跳过声明文件类型检查(加快编译速度)
+
+|forceConsistentCasingInFileNames
+|boolean
+|强制文件名大小写一致
+
+|===
+
+==== 其他常用选项
+
+[cols="1,1,5"]
+|===
+|选项 |类型 |描述
+
+|incremental
+|boolean
+|增量编译, 保存 .tsbuildinfo 文件
+
+|tsBuildInfoFile
+|string
+|增量编译信息文件路径
+
+|isolatedModules
+|boolean
+|将每个文件视为独立模块(用于 Babel、swc)
+
+|downlevelIteration
+|boolean
+|为 ES5 提供完整迭代器支持
+
+|===
+
+=== 顶层配置选项
+
+==== include / exclude
+
+支持Glob模式通配符
+
+[source, json]
+----
+{
+  "include": [
+    "src/**/*",           // src 下所有文件
+    "tests/**/*.ts"       // tests 下所有 .ts 文件
+  ],
+  "exclude": [
+    "node_modules",       // 排除依赖
+    "**/*.test.ts",       // 排除测试文件
+    "dist/**/*"           // 排除输出目录
+  ]
+}
+----
+
+==== extends
+
+继承另一个配置文件
+
+[source, json]
+----
+{
+  "extends": "@tsconfig/node18/tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist"
+  }
+}
+----
+
+**常用基础配置包:**
+
+* @tsconfig/node18: Node.js 18
+
+* @tsconfig/recommended: 推荐配置
+
+* @tsconfig/react-native: React Native
+
+==== references
+
+项目引用(用于 monorepo)
+
+[source, json]
+----
+{
+  "references": [
+    { "path": "../shared" },
+    { "path": "./utils" }
+  ]
+}
+----
+
+=== 实战配置示例
+
+==== Node.js 项目配置
+
+[source, json]
+----
+{
+  "compilerOptions": {
+    // 基础选项
+    "target": "ES2020",
+    "module": "CommonJS",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    
+    // 严格模式
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    
+    // 模块解析
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    
+    // 代码生成
+    "sourceMap": true,
+    "removeComments": false,
+    
+    // 代码检查
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
+----
+
+==== React 项目配置
+
+[source, json]
+----
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "lib": ["DOM", "DOM.Iterable", "ES2020"],
+    "jsx": "react-jsx",
+    "outDir": "./dist",
+    
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    
+    "moduleResolution": "node",
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@components/*": ["src/components/*"],
+      "@utils/*": ["src/utils/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "**/*.test.tsx"]
+}
+----
+
+==== 库/包开发配置
+
+[source, json]
+----
+{
+  "compilerOptions": {
+    "target": "ES2015",
+    "module": "CommonJS",
+    "declaration": true,
+    "declarationDir": "./types",
+    "outDir": "./lib",
+    "rootDir": "./src",
+    
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    
+    "moduleResolution": "node"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "**/*.test.ts"]
+}
+----
+
+==== Next.js 项目配置
+
+[source, json]
+----
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "node",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}
+----
+
+=== 高级技巧
+
+==== 多配置文件策略
+
+[source, json]
+----
+// tsconfig.base.json (基础配置)
+{
+  "compilerOptions": {
+    "strict": true,
+    "skipLibCheck": true
+  }
+}
+
+// tsconfig.dev.json (开发环境)
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "sourceMap": true,
+    "noEmit": true
+  }
+}
+
+// tsconfig.prod.json (生产环境)
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "sourceMap": false,
+    "removeComments": true
+  }
+}
+----
+
+==== 路径映射详解
+
+[source, json]
+----
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@components/*": ["src/components/*"],
+      "@utils/*": ["src/utils/*"],
+      "@assets/*": ["src/assets/*"],
+      "@types/*": ["types/*"]
+    }
+  }
+}
+----
+
+使用时需要在 webpack/rollup 中配置对应别名.
+
+==== 条件编译
+
+[source, json]
+----
+{
+  "compilerOptions": {
+    "types": ["node", "jest"]
+  },
+  // 不同环境不同配置
+  "ts-node": {
+    "compilerOptions": {
+      "module": "CommonJS"
+    }
+  }
+}
+----
+
+=== 常见问题解答
+
+==== Q1: esModuleInterop 有什么作用?
+
+它解决了 CommonJS 和 ES Module 的兼容问题:
+
+[source, json]
+----
+{
+  "esModuleInterop": true,  // 推荐开启
+  "allowSyntheticDefaultImports": true  // 配合使用
+}
+----
+
+开启后, 可以这样导入:
+
+[source, typescript]
+----
+import express from 'express';  // 而不是 import * as express from 'express'
+----
+
+==== Q2: strict: true 应该开启吗?
+
+**强烈推荐开启**. 它相当于同时开启:
+
+* noImplicitAny
+
+* strictNullChecks
+
+* strictFunctionTypes
+
+* strictBindCallApply
+
+* strictPropertyInitialization
+
+* noImplicitThis
+
+* alwaysStrict
+
+==== Q3: 为什么我的路径别名不生效?
+
+需要同时配置:
+
+. tsconfig.json 中的 paths
+
+. 构建工具(webpack、vite)中的 alias
+
+. 运行时可能还需要额外配置(如 jest、node)
+
+==== Q4: 如何排除测试文件但保留类型检查?
+
+[source, json]
+----
+{
+  "compilerOptions": {
+    "types": ["jest"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["**/*.test.ts", "**/*.spec.ts"]
+}
+----
+
+=== 总结
+
+[cols="1,5"]
+|===
+|场景 |推荐配置
+
+|Node.js 后端
+|target: "ES2020", module: "CommonJS", strict: true
+
+|React 前端
+|target: "ES2020", jsx: "react-jsx", strict: true
+
+|库/包开发
+|declaration: true, target: "ES2015"
+
+|Next.js 项目
+|使用框架自带配置, 补充自定义 paths
+
+|Monorepo
+|使用 references 项目引用
+
+|===
+
+**核心建议:**
+
+* 始终开启 strict: true
+
+* 使用 include 而非 files(除非项目很小)
+
+* 开启 esModuleInterop 和 skipLibCheck
+
+* 为不同环境配置不同的 tsconfig.json
+
+* 使用 extends 复用配置
+
+记住: tsconfig.json 是 TypeScript 项目的基石, 合理配置能显著提升开发体验和代码质量!

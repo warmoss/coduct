@@ -1,0 +1,350 @@
+== Python 枚举讲解
+
+枚举(Enumeration)是许多编程语言中用于定义一组**命名常量**的机制. Python 在 3.4 版本通过 `enum` 标准库引入了枚举支持, 为开发者提供了比普通全局常量更安全, 更语义化的替代方案.
+
+=== 为什么需要枚举
+
+在实际开发中, 常需要表示一组固定的有限取值, 如一周的天数, HTTP 状态码分类, 订单状态等. 传统方式使用全局变量定义常量:
+
+[source,python]
+----
+STATUS_PENDING = 1
+STATUS_PROCESSING = 2
+STATUS_COMPLETED = 3
+----
+
+这种方式存在以下问题:
+
+* **无类型约束** - 任何整数都可被传入函数, 无法在编译/检查时限制取值范围
+* **可变性风险** - 常量的值可能在运行时被意外修改
+* **缺乏语义** - 打印输出时看到的是数字 1, 而非有意义的名称
+* **重复值问题** - 多个常量可能被不小心赋予相同值
+
+枚举正是为解决这些问题而设计.
+
+=== 概念定义
+
+Python 枚举通过 `enum.Enum` 基类创建, 是一组**符号名称**与**唯一常量值**的绑定集合.
+
+`name` 属性:: 枚举成员的名称字符串, 如 `Color.RED.name` 返回 `"RED"`
+`value` 属性:: 枚举成员的值, 如 `Color.RED.value` 返回 `1`
+
+=== 基本用法
+
+==== 定义枚举
+
+通过继承 `Enum` 并定义类属性来创建枚举:
+
+[source,python]
+----
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+----
+
+==== 访问枚举成员
+
+[source,python]
+----
+# 通过名称访问
+Color.RED          # <Color.RED: 1>
+
+# 通过值访问
+Color(1)           # <Color.RED: 1>
+
+# 通过名称字符串访问
+Color['RED']       # <Color.RED: 1>
+
+# 获取 name 和 value
+Color.RED.name     # 'RED'
+Color.RED.value    # 1
+----
+
+==== 迭代枚举
+
+[source,python]
+----
+for color in Color:
+    print(color.name, color.value)
+# RED 1
+# GREEN 2
+# BLUE 3
+----
+
+`list(Color)` 返回所有枚举成员的有序列表(按定义顺序).
+
+==== 成员比较
+
+枚举成员支持**身份比较**(`is`)和**相等比较**(`==`):
+
+[source,python]
+----
+Color.RED is Color.RED       # True
+Color.RED == Color.RED       # True
+Color.RED == 1               # False (与值类型不同)
+Color.RED is Color(1)        # True (单例模式)
+----
+
+枚举成员是**单例(singleton)**的, 同一枚举类的同一个成员在内存中只有唯一实例.
+
+注意: 默认情况下枚举不支持排序比较(`<`, `>`), 除非使用 `IntEnum`.
+
+=== 核心特性
+
+==== `auto()` 自动赋值
+
+`enum.auto()` 自动为成员分配递增的整数值:
+
+[source,python]
+----
+from enum import Enum, auto
+
+class Status(Enum):
+    PENDING = auto()      # 1
+    PROCESSING = auto()   # 2
+    COMPLETED = auto()    # 3
+----
+
+`auto()` 从 1 开始递增, 可通过重写 `_generate_next_value_` 自定义规则.
+
+==== `@unique` 装饰器
+
+使用 `@unique` 确保所有枚举值唯一, 重复值会抛出 `ValueError`:
+
+[source,python]
+----
+from enum import Enum, unique
+
+@unique
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 2  # ValueError: duplicate values
+----
+
+==== 别名(Alias)
+
+如果不加 `@unique`, 多个名称可映射到同一个值, 后定义的成员被视为前者的**别名**:
+
+[source,python]
+----
+class Color(Enum):
+    RED = 1
+    CRIMSON = 1  # RED 的别名
+
+Color(1)          # <Color.RED: 1> (返回第一个定义的成员)
+Color.CRIMSON     # <Color.CRIMSON: 1> (名称不同)
+Color.CRIMSON is Color.RED  # True (同一实例)
+----
+
+迭代枚举时, 别名**不会**被遍历到, 可通过 `__members__` 获取全部:
+
+[source,python]
+----
+list(Color)                    # [Color.RED, ...] 不含 CRIMSON
+Color.__members__              # 包含所有名称的映射
+----
+
+==== `IntEnum` - 可比较的整数枚举
+
+`IntEnum` 的成员同时是 `int` 的子类, 可直接用于整数运算和比较:
+
+[source,python]
+----
+from enum import IntEnum
+
+class Priority(IntEnum):
+    LOW = 1
+    MEDIUM = 5
+    HIGH = 10
+
+Priority.LOW < Priority.HIGH  # True
+Priority.LOW + 1              # 2 (int 类型)
+----
+
+适用场景: 需要与现有整数常量兼容时.
+
+==== `StrEnum` - 字符串枚举
+
+`StrEnum` (Python 3.11+) 的成员同时是 `str` 的子类:
+
+[source,python]
+----
+from enum import StrEnum
+
+class Protocol(StrEnum):
+    HTTP = "http"
+    HTTPS = "https"
+
+Protocol.HTTP.upper()         # 'HTTP'
+----
+
+==== `Flag` - 位标志枚举
+
+`Flag` 支持按位运算组合多个成员, 适用于权限标记等场景:
+
+[source,python]
+----
+from enum import Flag, auto
+
+class Permission(Flag):
+    READ = auto()     # 1
+    WRITE = auto()    # 2
+    EXECUTE = auto()  # 4
+
+# 组合权限
+perm = Permission.READ | Permission.WRITE
+Permission.READ in perm       # True
+
+# 检查是否包含
+(perm & Permission.READ) == Permission.READ  # True
+----
+
+`Flag` 的值应使用 2 的幂次(`auto()` 自动处理), 以便位运算正确工作.
+
+=== 进阶用法
+
+==== 枚举成员的自定义方法
+
+枚举类可以定义方法, 每个成员都可调用:
+
+[source,python]
+----
+class Planet(Enum):
+    MERCURY = (3.303e23, 2.4397e6)
+    VENUS   = (4.869e24, 6.0518e6)
+    EARTH   = (5.976e24, 6.37814e6)
+
+    def __init__(self, mass, radius):
+        self.mass = mass       # kg
+        self.radius = radius   # m
+
+    @property
+    def surface_gravity(self):
+        G = 6.673e-11
+        return G * self.mass / (self.radius ** 2)
+
+Planet.EARTH.surface_gravity  # 9.802...
+----
+
+注意: `__init__` 的参数由枚举成员的值决定 -- 成员的值是一个元组, 拆包后传入 `__init__`.
+
+==== 混合类型(Mixed-in)枚举
+
+通过多重继承将枚举与其他类型组合:
+
+[source,python]
+----
+class OrderedEnum(int, Enum):
+    def __lt__(self, other):
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return self.value < other.value
+
+class Priority(OrderedEnum):
+    LOW = 1
+    MEDIUM = 5
+    HIGH = 10
+
+Priority.LOW < Priority.HIGH  # True
+----
+
+混合类型的继承顺序很重要: **基类型必须放在 `Enum` 前面**.
+
+==== `EnumMeta` 与 `__init_subclass__`
+
+可通过自定义元类或 `__init_subclass__` 扩展枚举行为:
+
+[source,python]
+----
+class BaseEnum(Enum):
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if not hasattr(cls, 'doc'):
+            raise TypeError(f"{cls.__name__} must define 'doc'")
+
+class Status(BaseEnum):
+    doc = "订单状态"
+    PENDING = 1
+    PROCESSING = 2
+----
+
+=== 枚举的全局唯一性与序列化
+
+==== 单例保证
+
+每个枚举成员在进程内是唯一的, 不同导入方式不会创建副本. 这使得 `is` 比较安全可靠.
+
+==== JSON 序列化
+
+枚举默认不可被 `json.dumps` 序列化, 需自定义编码器:
+
+[source,python]
+----
+import json
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+
+class ColorEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Color):
+            return obj.name
+        return super().default(obj)
+
+json.dumps(Color.RED, cls=ColorEncoder)  # '"RED"'
+----
+
+更简洁的方式是使用 `IntEnum` 或自定义 `__json__` 方法.
+
+==== `__repr__` 与 `__str__`
+
+[source,python]
+----
+repr(Color.RED)   # "<Color.RED: 1>"
+str(Color.RED)    # "Color.RED"
+----
+
+可重写 `__str__` 或 `__repr__` 自定义输出格式.
+
+=== 常见陷阱与最佳实践
+
+* **避免同时使用 `Enum` 和 `type` 名称冲突** - 枚举成员的名称不应与 Python 内置名称冲突
+* **值类型一致性** - 同一枚举类的所有成员值应尽量使用相同类型, 避免混淆
+* **使用 `auto()` 而非手工编号** - 减少维护成本, 避免编号冲突
+* **优先用 `Flag` 而非手工位运算** - `Flag` 提供更清晰的语义和自动值分配
+* **不要混用枚举值比较** - 不要用 `Color.RED == 1` 这种比较, 应使用 `Color.RED.value == 1` 或直接 `Color.RED == Color(1)`
+* **枚举不可变** - 枚举创建后不能添加, 删除或修改成员
+
+=== 总结
+
+|===
+| 特性 | 说明 | 适用场景
+
+| `Enum`
+| 基本枚举, 值类型任意
+| 大部分场景
+
+| `IntEnum`
+| 成员同时为 `int` 子类, 支持整数比较
+| 需要与现有整型常量兼容
+
+| `StrEnum`
+| 成员同时为 `str` 子类(3.11+)
+| 需要与字符串值兼容
+
+| `Flag`
+| 支持位运算的标志枚举
+| 权限, 选项组合
+
+| `auto()`
+| 自动分配递增值
+| 简化枚举定义
+|===
+
+Python 枚举提供了一种类型安全、语义清晰的常量管理方式。合理使用枚举能显著提升代码的可读性、可维护性和健壮性。建议在表示固定有限取值集时优先使用枚举，而非散落的全局常量或魔术数字。

@@ -1,0 +1,212 @@
+== Spring线程池讲解
+
+Spring 框架中的线程池, 不仅包括 Spring 对 JDK 线程池的封装, 还包括其特有的、与自身生态无缝集成的异步执行功能.
+
+=== 核心概念: 为什么需要 Spring 线程池?
+虽然 JDK 提供了 *java.util.concurrent.ThreadPoolExecutor* 这样功能强大的线程池实现, 但直接在 Spring 中使用它存在一些不便:
+
+. *硬编码:* 需要手动创建和配置线程池 bean, 并在代码中通过 *@Autowired* 注入使用, 但执行任务仍需调用 *execute()* 或 *submit()* 方法.
+
+. *与 Spring 容器整合不深:* 线程池的生命周期、属性配置(如从外部配置文件读取)不够方便.
+
+. *不支持注解驱动:* 无法简单地通过一个注解就让一个方法异步执行.
+
+因此, Spring 通过两个核心接口/类对 JDK 线程池进行了封装和增强:
+
+. *TaskExecutor:* 这是一个接口, 它抽象了执行器的概念. 它唯一的方法是 *void execute(Runnable task)*. 它的地位类似于 *java.util.concurrent.Executor*.
+
+. *ThreadPoolTaskExecutor:* 这是 *TaskExecutor* 的最常用实现, 它包装了 JDK 的 *ThreadPoolExecutor*, 并提供了更好的与 Spring 整合的特性, 如依赖注入、外部化配置.
+
+此外, Spring 提供了 *@Async 注解*, 它可以标记一个方法, 使其在被调用时 *异步执行*, 即由后台线程池中的线程来执行, 而非调用者线程. 这才是 Spring 线程池技术的精髓所在.
+
+=== 核心组件详解
+==== TaskExecutor 接口
+它只是一个简单的执行接口, 目的是将任务执行策略(同步、异步、使用线程池等)与调用代码解耦. Spring 提供了多个实现:
+
+* *SyncTaskExecutor:* *同步* 执行, 不在新线程中运行(主要用于测试和简单场景).
+
+* *SimpleAsyncTaskExecutor:* 为每个任务 *创建一个新线程*, 不复用线程(*非线程池*, 谨慎使用).
+
+* *ConcurrentTaskExecutor:* 对 JDK *Executor* 的适配器, 不常用.
+
+* *ThreadPoolTaskExecutor:* *最常用!* 真正的线程池实现.
+
+==== ThreadPoolTaskExecutor (重点)
+这个类是对 JDK *ThreadPoolExecutor* 的包装, 并提供了将其配置为 Spring Bean 的便捷方式. 它的配置参数与 *ThreadPoolExecutor* 一一对应.
+
+关键配置参数::
+
+* *corePoolSize:* *核心线程数.* 线程池维护的最小线程数量, 即使它们是空闲的也不会被销毁(除非设置了 *allowCoreThreadTimeOut*).
+
+* *maxPoolSize:* *最大线程数.* 线程池允许创建的最大线程数.
+
+* *queueCapacity:* *任务队列容量.* 用于存放等待执行的任务的阻塞队列大小.
+
+** *工作流程:* 当新任务提交时,
+
+. 如果当前运行线程数 < *corePoolSize*, 则立即创建新线程执行任务.
+
+. 如果达到 *corePoolSize*, 则将任务放入队列等待.
+
+. 如果队列已满 (*queueCapacity*), 且运行线程数 < *maxPoolSize*, 则创建新线程执行任务.
+
+. 如果队列已满且运行线程数已达到 *maxPoolSize*, 则根据拒绝策略处理新任务.
+
+* *keepAliveSeconds:* *线程空闲时间.* 超过核心线程数的那些线程, 在空闲超过这个时间后会被销毁.
+
+* *threadNamePrefix:* 线程名称前缀. 方便日志跟踪和问题排查.
+
+* *RejectedExecutionHandler:* *拒绝策略.* 当线程池和队列都已满时, 如何处理新提交的任务. 常见策略有:
+
+** *AbortPolicy(默认):* 抛出 *RejectedExecutionException* 异常.
+
+** *CallerRunsPolicy:* 由调用者线程(提交任务的线程)自己执行该任务.
+
+** *DiscardPolicy:* 直接丢弃任务, 不抛异常.
+
+** *DiscardOldestPolicy:* 丢弃队列中最旧的任务, 然后尝试重新提交当前任务.
+
+=== 如何使用: 配置与 @Async 注解
+==== 步骤 1: 配置线程池 Bean
+在配置类中定义一个 *ThreadPoolTaskExecutor* Bean.
+
+[source, java, linenums]
+----
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import java.util.concurrent.Executor;
+
+@Configuration
+@EnableAsync // 关键! 启用异步方法执行功能
+public class AsyncConfig {
+
+    @Bean(name = "taskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        // 配置参数
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(200);
+        executor.setKeepAliveSeconds(60);
+        executor.setThreadNamePrefix("MyAsyncThread-");
+        // 拒绝策略: 由调用线程处理
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        // 初始化
+        executor.initialize();
+        return executor;
+    }
+}
+----
+
+==== 步骤 2: 使用 @Async 注解标记异步方法
+在 Service 层的方法上添加 *@Async* 注解. 该方法返回值可以是 *void* 或 *Future* 类型.
+
+[source, java, linenums]
+----
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import java.util.concurrent.CompletableFuture;
+
+@Service
+public class MyService {
+
+    // 无返回值的异步任务
+    @Async("taskExecutor") // 指定使用上面配置的线程池 Bean 名称
+    public void asyncMethodWithoutReturn() {
+        // 模拟耗时操作
+        try {
+            Thread.sleep(5000);
+            System.out.println("异步方法执行完成, 线程: " + Thread.currentThread().getName());
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+
+    // 有返回值的异步任务, 使用 Future 接收
+    @Async("taskExecutor")
+    public CompletableFuture<String> asyncMethodWithReturn() {
+        // 模拟耗时操作
+        try {
+            Thread.sleep(3000);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        return CompletableFuture.completedFuture("异步任务结果");
+    }
+}
+----
+
+*注意:* *@Async* 注解的原理是基于 AOP 代理. 因此, *异步方法必须是 public 的*, 并且 *同一个类内部的方法调用*(例如 *this.asyncMethod()*)不会生效, 因为它绕过了代理.
+
+==== 步骤 3: 调用异步方法
+在 Controller 或其他 Service 中像调用普通方法一样调用即可.
+
+[source, java, linenums]
+----
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+import javax.annotation.Resource;
+
+@RestController
+public class MyController {
+
+    @Resource
+    private MyService myService;
+
+    @GetMapping("/async")
+    public String triggerAsync() {
+        System.out.println("控制器线程: " + Thread.currentThread().getName());
+        myService.asyncMethodWithoutReturn(); // 调用后立即返回, 不会阻塞
+        return "任务已提交! ";
+    }
+}
+----
+
+访问 */async* 端点, 你会立即看到返回 "*任务已提交!* ", 而控制台在 5 秒后会打印出 *"异步方法执行完成, 线程: MyAsyncThread-1*", 证明任务是异步执行的.
+
+=== 处理异常
+在 *@Async* 方法中, 异常不会返回给调用者. 你有两种方式处理异常:
+
+. *在方法内部自行 try-catch.*
+
+. *配置一个 AsyncUncaughtExceptionHandler* 来统一处理所有未捕获的异步异常.
+
+[source, java, linenums]
+----
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        // ... 同上配置
+        return executor;
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -> {
+            // 这里可以记录日志、发送告警等
+            System.err.println("异步方法 '" + method.getName() + "' 发生异常: " + ex.getMessage());
+        };
+    }
+}
+----
+
+=== 最佳实践与总结
+. *合理配置参数:* 没有放之四海而皆准的配置. *corePoolSize* 通常设置为 CPU 核心数, *maxPoolSize* 根据 I/O 密集型或 CPU 密集型任务调整, *queueCapacity* 不宜过大以免耗尽内存.
+
+. *务必指定线程池 Bean 名称:* 在 *@Async* 中明确指定使用哪个线程池(如 *@Async("taskExecutor")*), 否则 Spring 会使用默认的 *SimpleAsyncTaskExecutor*(非池化, 为每个任务创建新线程), 这在生产环境是灾难性的.
+
+. *使用有意义的线程名称前缀:* 在日志中能快速定位问题.
+
+. *选择合适的拒绝策略:* *CallerRunsPolicy* 通常是一个不错的选择, 它可以在线程池饱和时起到简单的削峰填谷作用, 不会完全拒绝请求.
+
+. *注意生命周期:* 在 Web 应用关闭时, 线程池需要优雅关闭(等待正在执行的任务完成). *ThreadPoolTaskExecutor* 本身实现了 *Lifecycle* 接口, 在 Spring 容器关闭时会自动触发 *shutdown()*.
+
+=== 总结
+
+Spring 线程池的核心是 *ThreadPoolTaskExecutor* + *@Async* 注解. 它极大地简化了在 Spring 应用中使用异步编程的复杂度, 让你通过声明式的配置和注解, 就能轻松地将耗时任务丢到后台线程池中执行, 从而提高应用的吞吐量和响应速度.

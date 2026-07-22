@@ -1,0 +1,235 @@
+== Double原理详解
+
+=== 概述
+
+**double** 类型遵循 **IEEE 754 双精度浮点数标准**, 使用64位(8字节)存储数据.
+
+==== 内存布局
+
+[source, text]
+----
+S(1位) 符号位
+E(11位) 指数部分
+M(52位) 尾数部分
+----
+
+==== 三部分详解
+
+. **符号位 (Sign)**
+
+** 1位: 0表示正数, 1表示负数
+
+. **指数位 (Exponent)**
+
+** 11位, 范围 0-2047
+
+** 采用 偏移码表示法: 实际指数 = E - 1023
+
+** 特殊值:
+
+*** E = 0: 非规格化数
+
+*** E = 1 ~ 2046: 规格化数
+
+*** E = 2047: 特殊值(无穷大或NaN)
+
+. **尾数位 (Mantissa/Fraction)**
+
+** 52位, 表示小数部分
+
+** 规格化数有 隐含的1: 实际值为 1.M
+
+** 非规格化数没有隐含的1: 实际值为 0.M
+
+=== 数值计算公式
+
+规格化数(stem:[E in [1, 2046]])::
+
+stem:[(-1)^S xx 1.M xx 2^((E-1023))]
+
+非规格化数(stem:[E = 0])::
+
+stem:[(-1)^S xx 0.M xx 2^(-1022)]
+
+特殊值::
+
+* stem:[E = 2047], stem:[M = 0]: stem:[+-infty](由S决定)
+
+* stem:[E = 2047], stem:[M != 0]: NaN(不是一个数)
+
+=== 范围与精度
+
+==== 数值范围
+
+[source, java]
+----
+double max = Double.MAX_VALUE;     // 1.7976931348623157E308
+double min = Double.MIN_NORMAL;    // 2.2250738585072014E-308
+double min_value = Double.MIN_VALUE; // 4.9E-324 (非规格化最小正数)
+----
+
+==== 精度特性
+
+* 十进制有效数字: 约15-17位
+
+* 相邻可表示数的间隔: stem:[ulp = 2^((E-1023-52))]
+
+=== 代码示例与验证
+
+==== 查看double的位模式
+
+[source, java]
+----
+public class DoubleAnalysis {
+    public static void main(String[] args) {
+        double d = 3.14;
+        long bits = Double.doubleToLongBits(d);
+        
+        System.out.println("数值: " + d);
+        System.out.println("二进制: " + Long.toBinaryString(bits));
+        System.out.println("十六进制: " + Long.toHexString(bits));
+        
+        // 解析各部分
+        int sign = (int) ((bits >> 63) & 0x1);
+        int exponent = (int) ((bits >> 52) & 0x7FF);
+        long mantissa = bits & 0xFFFFFFFFFFFFFL;
+        
+        System.out.println("符号位: " + sign);
+        System.out.println("指数位: " + exponent + " (实际指数: " + (exponent - 1023) + ")");
+        System.out.println("尾数位: " + mantissa);
+    }
+}
+----
+
+==== 精度问题演示
+
+[source, java]
+----
+public class PrecisionDemo {
+    public static void main(String[] args) {
+        // 经典的浮点数精度问题
+        System.out.println(0.1 + 0.2); // 输出: 0.30000000000000004
+        
+        // 为什么?
+        System.out.println("0.1的二进制表示: " + 
+            Long.toBinaryString(Double.doubleToLongBits(0.1)));
+        System.out.println("0.2的二进制表示: " + 
+            Long.toBinaryString(Double.doubleToLongBits(0.2)));
+        
+        // 大数加小数的问题
+        double big = 1.0e20;
+        double small = 1.0;
+        System.out.println(big + small - big); // 可能输出 0.0
+    }
+}
+----
+
+=== 特殊值与操作
+
+==== NaN 的特殊性
+
+[source, java]
+----
+Double.NaN != Double.NaN  // true!
+Double.isNaN(Double.NaN)  // true
+
+// 任何包含NaN的运算都返回NaN
+System.out.println(Double.NaN + 1.0);  // NaN
+----
+
+==== 无穷大运算
+
+[source, java]
+----
+Double.POSITIVE_INFINITY + 1.0      // Infinity
+Double.POSITIVE_INFINITY * 2.0      // Infinity
+1.0 / 0.0                           // Infinity
+-1.0 / 0.0                          // -Infinity
+Double.POSITIVE_INFINITY + Double.NEGATIVE_INFINITY  // NaN
+----
+
+=== 最佳实践与注意事项
+
+==== 比较浮点数
+
+[source, java]
+----
+// 错误的比较方式
+double a = 0.1 + 0.2;
+double b = 0.3;
+System.out.println(a == b);  // false!
+
+// 正确的比较方式
+final double EPSILON = 1e-10;
+boolean equal = Math.abs(a - b) < EPSILON;
+----
+
+==== 使用 BigDecimal 处理精确计算
+
+[source, java]
+----
+import java.math.BigDecimal;
+
+BigDecimal bd1 = new BigDecimal("0.1");
+BigDecimal bd2 = new BigDecimal("0.2");
+BigDecimal sum = bd1.add(bd2);
+System.out.println(sum);  // 0.3(精确)
+----
+
+==== 避免的陷阱
+
+[source, java]
+----
+java
+// 1. 不要用浮点数作为循环计数器
+for (double d = 0.0; d < 1.0; d += 0.1) {
+    // 可能少循环一次或多循环一次
+}
+
+// 2. 不要用浮点数作为Map的Key
+Map<Double, String> map = new HashMap<>();
+map.put(0.1 + 0.2, "value");
+System.out.println(map.get(0.3));  // null
+
+// 3. 注意类型转换
+int i = (int) 1.999999999999999;  // 结果为1, 不是2
+----
+
+=== 性能考虑
+
+* double运算通常由硬件直接支持, 速度很快
+
+* 但除法、开方等复杂运算较慢
+
+* 在大量计算中, 注意避免不必要的装箱/拆箱
+
+[source, java]
+----
+// 使用基本类型
+double[] array = new double[1000];  // 高效
+
+// 避免使用包装类
+Double[] boxedArray = new Double[1000];  // 低效, 有装箱开销
+----
+
+=== 总结
+
+Java的double类型提供了:
+
+. **大范围:** 约±10^308
+
+. **有限精度:** 约15-17位十进制精度
+
+. **特殊值:** NaN、±Infinity
+
+. **标准兼容:** 符合IEEE 754
+
+使用时需要注意:
+
+* 精度损失不可避免
+
+* **比较需使用容差, 永远不要使用 `==` 直接比较**
+
+* 精确计算用BigDecimal
+
+* 了解特殊值的处理规则

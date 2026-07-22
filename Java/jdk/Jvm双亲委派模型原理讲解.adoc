@@ -1,0 +1,180 @@
+== Jvm双亲委派模型原理讲解
+
+=== 为什么需要双亲委派模型?
+
+Java 虚拟机加载类文件时, 面临一个核心安全挑战: **如何防止恶意代码冒充核心 Java API**? 假设用户在 classpath 中放置了一个自定义的 `java.lang.String` 类, JVM 如果直接加载它, 整个 Java 运行时环境的安全基石就会崩溃.
+
+**双亲委派模型(Parent Delegation Model) 就是为了解决这个安全问题而设计的类加载机制.** 它通过严格的层级委托关系, 确保核心类库的加载始终由最顶层的类加载器控制, 防止用户自定义的类篡改核心 API.
+
+=== 类加载器层级
+
+JVM 在启动时会创建三个内置的类加载器, 它们形成了严格的父子层级关系:
+
+Bootstrap ClassLoader(C/C++ 实现):: 负责加载 JDK 运行时镜像中的核心模块(如 `java.base` 模块中的 `java.lang.*`、`java.util.*`), 是所有类加载器的**最顶层**.
+
+Platform ClassLoader(Java 实现):: 负责加载 JDK 平台模块(如 `java.sql`、`java.xml`、`java.logging` 等). 其父加载器为 Bootstrap ClassLoader. **Java 9 起取代了原有的 Extension ClassLoader.**
+
+Application ClassLoader(Java 实现):: 负责加载 `classpath`(用户类路径)和 `--module-path` 上的所有应用程序类. 其父加载器为 Platform ClassLoader, 也是开发者**默认使用的类加载器**.
+
+自定义类加载器:: 开发者通过继承 `java.lang.ClassLoader` 实现的类加载器, 通常将 Application ClassLoader 设为父加载器.
+
+[plantuml, "类加载器层级结构", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+skinparam ranksep 40
+
+rectangle "Bootstrap ClassLoader\n(C/C++, 核心模块)" as bootstrap
+rectangle "Platform ClassLoader\n(Java, 平台模块)" as ext
+rectangle "Application ClassLoader\n(Java, classpath/module-path)" as app
+rectangle "自定义 ClassLoader" as custom
+
+bootstrap <-- ext : 委托
+ext <-- app : 委托
+app <-- custom : 委托
+@enduml
+----
+
+=== 双亲委派的工作流程
+
+当一个类加载器收到加载类的请求时, 它**不会立即自己尝试加载**, 而是先将请求委托给父加载器处理.
+
+. 当前类加载器收到加载类 `com.example.Foo` 的请求.
+. 它首先检查该类是否已被自己加载过, 已加载则直接返回.
+. 若未加载, 则将请求**委托给父加载器**处理.
+. 父加载器重复步骤 2-3, 递归向上委托, 直到**Bootstrap ClassLoader**.
+. Bootstrap ClassLoader 尝试在它的加载路径中查找并加载类.
+.. 如果能找到, 则加载并返回.
+.. 如果找不到, 将控制权**退回给子加载器**.
+. 子加载器尝试在自己的加载路径中查找并加载类.
+.. 如果能找到, 则加载并返回.
+.. 如果找不到, 继续向下传递, 直到最初发起请求的类加载器.
+. 如果所有加载器都找不到该类, 抛出 `ClassNotFoundException`.
+
+[plantuml, "双亲委派加载流程", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+
+participant "自定义 ClassLoader" as custom
+participant "Application\nClassLoader" as app
+participant "Platform\nClassLoader" as ext
+participant "Bootstrap\nClassLoader" as boot
+
+custom -> custom: 收到加载请求\n检查是否已加载
+custom -> app: 1. 委托父加载器
+app -> app: 检查是否已加载
+app -> ext: 2. 委托父加载器
+ext -> ext: 检查是否已加载
+ext -> boot: 3. 委托父加载器
+boot -> boot: 4. 尝试加载
+
+alt 找到类
+  boot --> ext: 返回 Class 对象
+  ext --> app: 返回 Class 对象
+  app --> custom: 返回 Class 对象
+else 未找到
+  boot --> ext: 返回 null
+  ext -> ext: 5. 自己尝试加载
+  alt Platform 找到
+    ext --> app: 返回 Class 对象
+  else 未找到
+    ext --> app: 返回 null
+    app -> app: 6. 自己尝试加载
+    alt Application 找到
+      app --> custom: 返回 Class 对象
+    else 未找到
+      app --> custom: 返回 null
+      custom -> custom: 7. 自己尝试加载
+      alt 自定义找到
+        custom --> custom: 返回 Class 对象
+      else 未找到
+        custom --> custom: 抛出 ClassNotFoundException
+      end
+    end
+  end
+end
+@enduml
+----
+
+=== 为什么这样设计?
+
+双亲委派模型带来了三个核心优势:
+
+* **安全性:** 防止核心 API 被篡改. 用户自定义的 `java.lang.String` 永远不会被加载, 因为 Bootstrap ClassLoader 总会优先加载 JDK 自带的 `java.lang.String`.
+
+* **避免重复加载:** 同一个类只会被加载一次. 父加载器加载过的类, 子加载器无需再次加载.
+
+* **保证类的唯一性:** JVM 中类的全限定名 + 加载该类的 ClassLoader 实例共同确定一个类的身份. 双亲委派确保了核心类在所有代码中由同一个加载器加载, 保持了类型的一致性和唯一性.
+
+=== 破坏双亲委派模型
+
+虽然双亲委派是默认机制, 但某些场景需要打破它:
+
+==== 线程上下文类加载器 (Thread Context ClassLoader)
+
+**SPI(Service Provider Interface)** 机制是一个典型的破坏场景. 以 `JDBC` 为例:
+
+* `java.sql.DriverManager` 位于 `java.sql` 模块(由 Platform ClassLoader 加载).
+* 而具体的数据库驱动实现(如 `com.mysql.cj.jdbc.Driver`)位于 classpath(由 Application ClassLoader 加载).
+
+按照双亲委派, Platform ClassLoader 无法"向下"委托给 Application ClassLoader 加载第三方驱动. 解决方式是引入 **线程上下文类加载器(Thread Context ClassLoader)**, 它允许核心类"逆向"使用当前线程设置的类加载器来加载类.
+
+[source,java]
+----
+// Thread 类中保存了 contextClassLoader
+// DriverManager 通过它加载第三方驱动
+Thread currentThread = Thread.currentThread();
+ClassLoader contextClassLoader = currentThread.getContextClassLoader();
+Class<?> driverClass = contextClassLoader.loadClass("com.mysql.cj.jdbc.Driver");
+----
+
+==== 热部署与热替换
+
+Tomcat、Jetty 等 Web 容器需要为每个 Web 应用部署不同的版本(如同时部署依赖不同版本 Spring 的两个应用). 此时:
+
+* 每个 Web 应用使用独立的 WebAppClassLoader, **优先自己加载** Web 应用 `WEB-INF/lib` 和 `WEB-INF/classes` 下的类.
+* 对于公共类库(如 Servlet API), 仍委托给 Common ClassLoader 加载.
+
+这是对双亲委派的"逆序" -- 优先自己加载, 找不到再委托给父加载器.
+
+=== 如何实现自定义类加载器
+
+自定义类加载器的核心是重写 `findClass()` 方法, 而不是 `loadClass()`. `loadClass()` 实现了双亲委派的逻辑, 而 `findClass()` 是让子类定义查找类文件的具体行为.
+
+[source,java]
+----
+public class MyClassLoader extends ClassLoader {
+
+    private final String classPath;
+
+    public MyClassLoader(String classPath, ClassLoader parent) {
+        super(parent);                          // <1>
+        this.classPath = classPath;
+    }
+
+    @Override
+    protected Class<?> findClass(String name) throws ClassNotFoundException {
+        String fileName = classPath + File.separator
+            + name.replace('.', File.separator) + ".class";
+        try {
+            byte[] bytes = Files.readAllBytes(Paths.get(fileName));
+            return defineClass(name, bytes, 0, bytes.length); // <2>
+        } catch (IOException e) {
+            throw new ClassNotFoundException(name, e);
+        }
+    }
+}
+----
+<1> 指定父加载器, 不指定则默认为 Application ClassLoader
+<2> `defineClass()` 将字节数组转换为 Class 对象
+
+WARNING: **永远不要重写 `loadClass()` 方法**, 除非你有明确的理由破坏双亲委派. `loadClass()` 是双亲委派模型的入口, 重写它将破坏整个委托机制.
+
+=== 总结
+
+* **双亲委派模型**是 JVM 的默认类加载策略, 通过自底向上的委托和自顶向下的加载确保类和类加载器的唯一性.
+* 三个内置类加载器形成 **Bootstrap -> Platform -> Application** 层级, 各自负责不同范围的类库. (Java 9 起 Platform ClassLoader 取代了 Extension ClassLoader)
+* 核心优势是 **安全性**(防止核心 API 被篡改)、**避免重复加载**和**保证类型唯一性**.
+* 线程上下文类加载器和 Web 容器热部署通过**逆向委托**或**优先自己加载**的方式打破双亲委派模型.
+* 自定义类加载器应重写 `findClass()` 而非 `loadClass()`, 以保持双亲委派模型.

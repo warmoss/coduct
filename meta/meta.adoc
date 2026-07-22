@@ -1,0 +1,16 @@
+:nofooter:
+:encoding: utf-8
+:lang: 中文
+:stem:
+:icons: font
+:source-highlighter: highlightjs
+// :source-highlighter: rouge
+:rouge-style: pastie
+:sectnums:
+:sectlinks:
+:sectnumlevels: 4
+:toc:
+:toc-title: 目录
+:toclevels: 1
+:doctype: book
+// :data-uri:

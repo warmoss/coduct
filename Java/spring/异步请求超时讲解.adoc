@@ -1,0 +1,239 @@
+== 异步请求超时讲解
+
+=== 为什么会发生超时?
+异步请求的超时通常发生在以下情况:
+
+. *业务处理过慢*: 后台任务(如数据库查询、远程 API 调用)的执行时间超过了预设的阈值.
+
+. *外部系统无响应*: 所依赖的外部服务宕机或网络出现问题, 导致任务无法完成.
+
+. *消息丢失*: 在事件驱动的架构中(使用 *DeferredResult*), 用于设置结果的消息可能未能成功送达.
+
+. *资源竞争*: 任务在队列中等待执行的时间过长.
+
+=== 超时设置的位置
+超时可以在两个层级进行设置:
+
+*Servlet 容器层级(全局默认):* 在 *web.xml* 中为所有异步 Servlet 设置一个默认超时时间.
+
+*单个请求层级(更常见、更灵活):* 在代码中为每个 *AsyncContext* 或 *DeferredResult* 单独设置超时时间.
+
+==== 容器全局默认超时(web.xml)
+在 Servlet 3.0 规范中, 可以在 *web.xml* 中配置默认的超时时间(以毫秒为单位). 如果单个请求没有设置超时, 则会使用这个全局设置.
+
+[source, xml, linenums]
+----
+<web-app ...>
+    <async-supported>true</async-supported>
+    <default-context-param>
+        <param-name>async-timeout</param-name>
+        <param-value>30000</param-value> <!-- 30秒 -->
+    </default-context-param>
+    ...
+</web-app>
+----
+
+*注意:* 现代 Spring Boot 应用通常使用嵌入式 Servlet 容器, 并且更倾向于使用编程方式或应用配置来设置超时, 而不是修改 *web.xml*.
+
+==== 单个请求超时设置
+这是最常用和推荐的方式, 因为它提供了更精细的控制.
+
+==== 原生 Servlet API (AsyncContext)
+[source, java, linenums]
+----
+@WebServlet(urlPatterns = "/async", asyncSupported = true)
+public class NativeAsyncServlet extends HttpServlet {
+    @Override
+    protected void doGet(HttpServletRequest req, HttpServletResponse resp) {
+        AsyncContext asyncContext = req.startAsync();
+        // 为这个特定的异步请求设置超时为 20 秒
+        asyncContext.setTimeout(20000); // 单位: 毫秒
+
+        // ... 将 asyncContext 传递给其他线程执行任务 ...
+    }
+}
+----
+
+==== Spring 的 DeferredResult
+[source, java, linenums]
+----
+@RestController
+public class MyController {
+
+    @GetMapping("/asyncData")
+    public DeferredResult<String> getData() {
+        // 在构造函数中设置超时时间(5000毫秒)和超时后返回的结果
+        DeferredResult<String> deferredResult =
+            new DeferredResult<>(5000L, "Timeout! Please try again.");
+
+        // ... 将 deferredResult 保存起来, 等待其他线程设置结果 ...
+
+        return deferredResult;
+    }
+}
+----
+
+==== Spring 的 Callable
+
+对于 *Callable*, 通常不直接在每个 *Callable* 上设置超时, 而是通过配置 Spring MVC 的全局异步请求超时.
+
+在 *application.yml* 中:
+
+[source, yaml, linenums]
+----
+spring:
+  mvc:
+    async: # 配置异步请求处理的超时时间(毫秒)
+      request-timeout: 15000 # 这个设置会对所有返回Callable和DeferredResult的控制器方法生效
+----
+
+这个配置会对所有返回 *Callable* 和 *DeferredResult* 的控制器方法生效, 除非它们在代码中被单独覆盖(如 *DeferredResult* 在构造函数中自己设置了超时).
+
+=== 超时后会发生什么?
+当异步请求的超时时间到达后, Servlet 容器或 Spring 框架会触发一个超时事件. 接下来会发生什么, 取决于你是否监听了这个事件.
+
+如果没有监听超时事件::
+
+* 容器会简单地 *完成请求*.
+
+* 如果响应还未被提交, 客户端可能会收到一个 *HTTP 500 错误* 或一个空的响应.
+
+* 这是一种不优雅的处理方式, 应该避免.
+
+如果监听了超时事件::
+
+* 你可以控制超时后发送给客户端的内容, 进行资源清理, 并优雅地结束请求.
+
+=== 如何优雅地处理超时? (核心部分)
+无论是原生 Servlet 还是 Spring, 都提供了回调(Callback)机制来监听超时事件.
+
+==== 原生 Servlet API - 使用 AsyncListener
+你可以为 *AsyncContext* 添加一个 *AsyncListener* 来监听超时、完成、错误等事件.
+
+[source, java, linenums]
+----
+@WebServlet(urlPatterns = "/async", asyncSupported = true)
+public class NativeAsyncWithTimeoutServlet extends HttpServlet {
+
+    @Override
+    protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        AsyncContext asyncContext = req.startAsync();
+        asyncContext.setTimeout(10000); // 10秒超时
+
+        // 添加异步监听器
+        asyncContext.addListener(new AsyncListener() {
+            @Override
+            public void onTimeout(AsyncEvent event) throws IOException {
+                // 超时发生时调用
+                HttpServletResponse response = (HttpServletResponse) event.getSuppliedResponse();
+                response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE); // 503
+                response.getWriter().write("Request timed out. Please retry.");
+                System.out.println("Request timed out! Cleaning up...");
+                // 在这里可以进行必要的资源清理
+                event.getAsyncContext().complete(); // 必须标记完成!
+            }
+
+            @Override
+            public void onComplete(AsyncEvent event) throws IOException {
+                // 正常完成时调用
+                System.out.println("Request completed successfully.");
+            }
+
+            @Override
+            public void onError(AsyncEvent event) throws IOException {
+                // 发生错误时调用
+                System.out.println("Request error: " + event.getThrowable());
+                event.getAsyncContext().complete(); // 发生错误也要标记完成
+            }
+
+            @Override
+            public void onStartAsync(AsyncEvent event) throws IOException {
+                // 开始异步处理时调用(不常用)
+            }
+        });
+
+        // 委派任务...
+        new Thread(() -> {
+            try {
+                Thread.sleep(15000); // 模拟一个15秒的任务, 这会触发超时
+                asyncContext.getResponse().getWriter().write("Result");
+                asyncContext.complete();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+}
+----
+
+*关键点:* 在 *onTimeout* 方法中, 你必须调用 *event.getAsyncContext().complete()* 来最终结束这个请求, 否则连接可能不会关闭.
+
+==== Spring DeferredResult - 使用 onTimeout() 方法
+Spring 的 *DeferredResult* 提供了非常简洁的回调方法.
+
+[source, java, linenums]
+----
+@RestController
+public class OrderController {
+
+    private Map<String, DeferredResult<String>> tasks = new ConcurrentHashMap<>();
+
+    @GetMapping("/placeOrder")
+    public DeferredResult<String> placeOrder(@RequestParam String orderId) {
+        // 设置 8 秒超时, 并定义超时默认返回值
+        DeferredResult<String> deferredResult = new DeferredResult<>(8000L, "Order processing timeout. Please check status later.");
+
+        // 注册超时回调
+        deferredResult.onTimeout(() -> {
+            System.err.println("Order [" + orderId + "] processing timed out! Performing cleanup...");
+            // 1. 从缓存中移除这个 DeferredResult, 防止内存泄漏
+            tasks.remove(orderId);
+            // 2. 可以记录日志、发送警报等
+            // 注意: 不需要手动调用 setResult, 因为我们在构造函数中已经提供了超时结果.
+            // 超时后, Spring 会自动使用 "Order processing timeout..." 这个默认结果.
+        });
+
+        // 注册完成回调(无论成功或超时都会调用, 适合做资源清理)
+        deferredResult.onCompletion(() -> {
+            System.out.println("Order [" + orderId + "] request lifecycle completed.");
+            tasks.remove(orderId); // 确保最终一定会被清理
+        });
+
+        tasks.put(orderId, deferredResult);
+        return deferredResult;
+    }
+
+    @GetMapping("/completeOrder")
+    public String completeOrder(@RequestParam String orderId, @RequestParam String status) {
+        DeferredResult<String> result = tasks.get(orderId);
+        if (result != null) {
+            result.setResult("Order " + orderId + " is " + status);
+            return "Result set";
+        }
+        return "Order not found or already completed/timed out";
+    }
+}
+----
+
+Spring 的超处理优势::
+
+* *自动结果发送:* 如果在创建 *DeferredResult* 时提供了超时默认结果(*new DeferredResult<>(timeout, timeoutResult)*), Spring 会在超时时自动将该结果发送给客户端. 你无需在 *onTimeout* 中手动调用 *setResult*.
+
+* *简洁的回调 API:* *onTimeout*, *onCompletion*, *onError* 方法让回调逻辑非常清晰.
+
+* *与异常处理集成:* 超时可以被 *@ControllerAdvice* 全局异常处理器捕获(作为 *AsyncRequestTimeoutException*), 但你通常不需要这么做, 因为使用回调是更直接的方式.
+
+=== 最佳实践与总结
+. *总是设置超时:* 这是最重要的规则. 绝不让异步请求无限期地运行.
+
+. *明智地选择超时时间:* 根据业务逻辑的预期和最坏情况(而不是最佳情况)来设置超时时间.
+
+. *一定要清理资源:* 在 *onTimeout* 和 *onCompletion* 回调中, 务必释放任何与请求相关的资源(如从缓存中移除 *DeferredResult* 引用、关闭数据库连接等), 这是防止内存泄漏的关键.
+
+. *提供有意义的超时响应:* 返回一个对客户端友好的错误信息或状态码(如 HTTP 503), 而不是让请求静默失败.
+
+. *记录和监控:* 记录超时事件, 这对于发现系统性能瓶颈和外部依赖问题至关重要.
+
+. *在 Spring 中优先使用 DeferredResult 的回调:* 相比全局异常处理, 使用 *onTimeout* 回调是处理单个异步请求超时更直接、更清晰的方式.
+
+通过理解和正确实现超时处理, 你的异步服务将变得更加健壮、可靠和可维护.

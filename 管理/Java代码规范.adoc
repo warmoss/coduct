@@ -1,0 +1,324 @@
+== Java代码规范
+
+统一的代码规范是团队协作的基石. 它能降低代码阅读成本, 减少不必要的争论, 让新人更快融入团队. 本文基于业界主流规范 (Google Java Style 和阿里巴巴 Java 开发手册) 并结合团队实践制定, 适用于项目中的所有 Java 代码.
+
+=== 命名规范
+
+好的命名是自文档化的基础. 命名应**清晰表达意图**, 避免缩写和拼音.
+
+包名:: 全小写, 以 com/org 开头, 后跟项目名和模块名. _例:_ `com.company.order`, `org.project.common`
+类名:: **大驼峰 (PascalCase)** , 名词或名词短语. _例:_ `OrderService`, `UserRepository`, `StringUtils`
+接口名:: 大驼峰, 形容词或能力描述. _例:_ `Serializable`, `Comparable`, `OrderRepository`
+方法名:: **小驼峰 (camelCase)** , 动词或动词短语. _例:_ `getUserById()`, `saveOrder()`, `isValid()`
+变量名:: 小驼峰, 意义明确. 避免单字母 (`i`, `j` 仅在局部循环中允许)
+常量名:: **全大写 + 下划线**分隔. _例:_ `MAX_RETRY_COUNT`, `DEFAULT_TIMEOUT_MS`
+布尔类型:: 用 `is`, `has`, `can`, `should` 开头. _例:_ `isDeleted`, `hasPermission`, `canSend`
+泛型参数:: 单大写字母: `T` (Type), `E` (Element), `K` / `V` (Key / Value), `R` (Return)
+
+[source,java]
+----
+// Bad
+public List getData(String id, String nm) { ... }
+int i; // 仅局部循环允许
+
+// Good
+public List<Order> findOrdersByUserId(String userId, String orderName) { ... }
+boolean isActive;
+----
+
+=== 代码格式
+
+统一的格式让代码更像同一人书写, 减少审阅时的格式干扰.
+
+. 缩进: 使用 **4 个空格**, 禁止使用 Tab
+. 行宽: **120 字符**, 超过时换行并对齐
+. 大括号: 左大括号不换行, 右大括号独占一行 (`K&R 风格`)
+. 空行: 方法之间空 1 行; 逻辑分组之间空 1 行; 类内成员变量与方法之间空 1 行
+. 导入: 禁止使用 `*` 通配符导入; 按静态导入 -> Java 标准库 -> 第三方库 -> 项目内部排序; 每组之间空 1 行
+
+[source,java]
+----
+import static com.google.common.base.Preconditions.checkNotNull;
+
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.stereotype.Service;
+
+import com.company.order.service.OrderService;
+----
+
+=== 注释规范
+
+注释应回答"为什么"而非"是什么"——好的代码本身就能说明"是什么".
+
+类注释:: 每个公开类必须有 Javadoc, 说明类的职责和线程安全性
+方法注释:: 公开 API 方法必须有 Javadoc, 包含 `@param`, `@return`, `@throws`
+行内注释:: 仅在代码意图不够清晰时使用; 不要注释显而易见的内容
+TODO 注释:: 格式为 `// TODO: 用户名-yyyyMMdd 待办事项描述`
+无用代码:: **直接删除**, 不要注释掉——Git 历史中可找回
+
+[source,java]
+----
+/**
+ * 订单服务, 负责订单的创建, 支付和取消.
+ * 线程安全, 所有公开方法通过数据库锁保证数据一致性.
+ *
+ * @author zhangsan
+ */
+public class OrderService {
+
+    /**
+     * 创建订单, 返回订单号.
+     *
+     * @param request 创建订单请求, 不可为空
+     * @return 生成的订单号
+     * @throws IllegalArgumentException 请求参数不合法时抛出
+     */
+    public String createOrder(@NonNull CreateOrderRequest request) {
+        // TODO: zhangsan-20240501 补充库存预扣逻辑
+        return doCreate(request);
+    }
+}
+----
+
+=== 编程规范
+
+==== 异常处理
+
+* **优先使用业务异常**而非返回 null 或错误码; 自定义异常继承 `RuntimeException`
+* 捕获异常时指定具体类型, 禁止 `catch (Exception e)`
+* 资源操作使用 **try-with-resources** 确保释放
+* 日志中记录异常完整堆栈: `log.error("处理订单失败, orderId={}", orderId, e)`
+
+[source,java]
+----
+// Bad
+try {
+    // ...
+} catch (Exception e) { // 捕获范围过大
+    return null; // 吞掉异常
+}
+
+// Good
+try (InputStream is = new FileInputStream(path)) {
+    return process(is);
+} catch (FileNotFoundException e) {
+    log.warn("文件不存在, path={}", path);
+    throw new BusinessException("文件不存在", e);
+}
+----
+
+==== 集合处理
+
+* **使用泛型**, 禁止裸类型
+* 优先使用 `List.of()`, `Set.of()`, `Map.of()` 创建不可变集合
+* 遍历删除使用 `Iterator.remove()` 或 `removeIf()`, 禁止在 `for-each` 中 `remove`
+* `Map` 遍历使用 `entrySet()`, 避免重复 `get(key)`
+
+[source,java]
+----
+// Bad
+for (String key : map.keySet()) {
+    String value = map.get(key); // 重复查找
+    // ...
+}
+
+// Good
+for (Map.Entry<String, String> entry : map.entrySet()) {
+    String key = entry.getKey();
+    String value = entry.getValue();
+}
+----
+
+==== 并发编程
+
+* 使用 `java.util.concurrent` 包下的工具, 避免直接 `new Thread()`
+* 线程池通过 `ThreadPoolExecutor` 或 `Executors.newFixedThreadPool()` 创建, **禁止**使用 `Executors.newCachedThreadPool()` (最大线程数无限)
+* 使用 `synchronized` 锁时在**最小的作用域**加锁; 使用 `Lock` 接口时务必在 `finally` 中解锁
+* 优先使用 `ConcurrentHashMap` 而非 `Hashtable` 或 `synchronizedMap`
+* 使用 `CompletableFuture` 编排异步任务, 而非手动管理 `Future`
+
+[source,java]
+----
+private final ThreadPoolExecutor executor = new ThreadPoolExecutor(
+    CORE_POOL_SIZE,
+    MAX_POOL_SIZE,
+    60L, TimeUnit.SECONDS,
+    new LinkedBlockingQueue<>(QUEUE_SIZE),
+    new ThreadPoolExecutor.AbortPolicy()
+);
+
+public CompletableFuture<Order> getOrderAsync(Long orderId) {
+    return CompletableFuture.supplyAsync(() -> findOrder(orderId), executor)
+        .exceptionally(ex -> {
+            log.error("查询订单失败, orderId={}", orderId, ex);
+            throw new BusinessException("查询失败");
+        });
+}
+----
+
+==== Optional 使用
+
+* `Optional` 用于**返回值**, 不用作参数或字段类型
+* 链式使用 `map()`, `filter()`, `orElse()` / `orElseGet()`, 避免 `isPresent()` + `get()` 组合
+* 仅在需要抛出异常时使用 `orElseThrow()`
+
+[source,java]
+----
+// Bad
+if (user.isPresent()) {
+    String name = user.get().getName();
+}
+
+// Good
+String name = user.map(User::getName)
+    .filter(n -> n.length() > 0)
+    .orElse("默认用户");
+----
+
+==== Stream 与 Lambda
+
+* 链式操作超过 3 个时换行, 每行一个 `.` 调用
+* 避免在 `forEach` 中修改外部变量; 使用 `collect()` 收集结果
+* 复杂逻辑提取为 **独立方法**, 保持 Stream 链路的可读性
+
+[source,java]
+----
+List<Order> paidOrders = orders.stream()
+    .filter(Order::isPaid)
+    .filter(o -> o.getAmount().compareTo(BigDecimal.ZERO) > 0)
+    .sorted(Comparator.comparing(Order::getCreateTime).reversed())
+    .collect(Collectors.toList());
+----
+
+==== 日期时间处理
+
+* **必须**使用 `java.time` 包 (`LocalDate`, `LocalDateTime`, `Instant`, `ZonedDateTime`), 禁止使用 `Date` 和 `Calendar`
+* 数据库存储使用 `TIMESTAMP` 或 `DATETIME`; 对应 Java 类型使用 `LocalDateTime` 或 `OffsetDateTime`
+* 跨时区场景使用 `Instant` 或 `ZonedDateTime`, 序列化时带时区信息
+
+==== 日志规范
+
+* 使用 **SLF4J** 门面, 日志实现为 Logback 或 Log4j2
+* 日志级别规范:
+  ** `ERROR`: 影响功能的异常, 需要人工介入
+  ** `WARN`: 意料之外但不影响主流程的异常, 可自动恢复
+  ** `INFO`: 关键业务流程标记 (订单创建, 支付完成等)
+  ** `DEBUG`: 开发调试信息, 禁止在线上开启
+* 使用占位符 `{}`, 避免字符串拼接: `log.info("订单 {} 已支付", orderId)`
+
+==== 对象与序列化
+
+* 为数据类重写 `equals()` 和 `hashCode()` (使用 Objects 工具类或 Lombok `@Data`)
+* 实现 `Serializable` 的类必须指定 `serialVersionUID`
+* DTO / VO 与 DO 之间转换使用 `MapStruct`, 避免手写大量 `setter`
+
+[source,java]
+----
+public class OrderDO implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    private Long id;
+    private String orderNo;
+    private BigDecimal amount;
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        OrderDO orderDO = (OrderDO) o;
+        return Objects.equals(id, orderDO.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id);
+    }
+}
+----
+
+=== 项目结构规范
+
+推荐使用 **分层架构** 或 **领域驱动分包**, 按团队规模选择.
+
+==== 分层架构包结构
+
+[source]
+----
+com.company.project
+├── common          // 通用工具, 常量, 异常定义
+├── config          // 配置类 (Spring @Configuration)
+├── controller      // 控制器层 (REST API)
+├── service         // 服务层 (业务逻辑)
+│   └── impl        // 服务实现
+├── repository      // 数据访问层 (MyBatis Mapper / JPA Repository)
+├── model           // 数据模型
+│   ├── entity      // 数据库实体
+│   ├── dto         // 数据传输对象
+│   └── vo          // 视图对象
+└── aspect          // 切面 (AOP)
+----
+
+==== 领域驱动分包结构
+
+[source]
+----
+com.company.order
+├── application     // 应用服务, 用例编排
+├── domain          // 领域层
+│   ├── entity      // 领域实体
+│   ├── valueobject // 值对象
+│   ├── service     // 领域服务
+│   └── repository  // 仓储接口
+└── infrastructure  // 基础设施
+    ├── persistence // 持久化实现
+    ├── client      // 外部服务调用
+    └── messaging   // 消息发送
+----
+
+=== 代码评审 (Code Review) 规范
+
+代码评审是质量保障的关键环节. 评审时应关注以下要点:
+
+. **正确性**: 逻辑是否完备? 边界情况是否处理? 并发安全是否考虑?
+. **可读性**: 命名是否清晰? 是否需要注释? 职责是否单一?
+. **可测试性**: 单元测试是否覆盖? 依赖是否可注入?
+. **性能**: 是否有不必要的循环? 数据库查询是否合理? 缓存是否利用?
+. **安全**: 输入是否校验? SQL 注入 / XSS 防范? 敏感数据是否脱敏?
+
+==== 提交规范
+
+Commit Message 使用以下格式:
+
+[source]
+----
+<type>(<scope>): <简短描述>
+
+<详细说明> (可选)
+
+<关联 Issue> (可选)
+----
+
+type 取值:
+
+* `feat`: 新功能
+* `fix`: Bug 修复
+* `refactor`: 重构
+* `test`: 测试
+* `docs`: 文档
+* `style`: 格式调整
+* `perf`: 性能优化
+* `chore`: 构建/工具变更
+
+=== 总结
+
+Java 代码规范的核心原则可以归纳为:
+
+* **可读性优先**: 代码写给人读, 顺便给机器执行
+* **一致性**: 团队统一风格, 减少认知负荷
+* **防御性**: 写代码时假设调用方会犯错, 做好校验和保护
+* **持续改进**: 通过 Code Review 不断积累团队最佳实践, 定期更新规范
+
+规范是工具而非束缚, 当遇到规范无法覆盖的场景时, 团队讨论达成共识即可补充或修订.

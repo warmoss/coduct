@@ -1,0 +1,11 @@
+= 运维
+
+include::Ansible讲解.adoc[]
+
+include::阿里云存储设备讲解.adoc[]
+
+include::Kubernetes原理讲解.adoc[]
+
+include::crictl讲解.adoc[]
+
+include::socat讲解.adoc[]

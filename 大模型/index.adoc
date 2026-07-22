@@ -1,0 +1,37 @@
+= 大模型
+
+include::大模型原理讲解.adoc[]
+
+include::大模型记忆原理讲解.adoc[]
+
+include::大模型MCP原理讲解.adoc[]
+
+include::大模型RAG原理讲解.adoc[]
+
+include::大模型工作流原理讲解.adoc[]
+
+include::OpenSpec原理讲解.adoc[]
+
+include::superpowers原理讲解.adoc[]
+
+include::LangGraph原理讲解.adoc[]
+
+include::prompt写作指南.adoc[]
+
+include::Agent Instructions讲解.adoc[]
+
+include::skills写作指南.adoc[]
+
+include::AGENT.md写作指南.adoc[]
+
+include::大模型系统角色与用户角色的区别讲解.adoc[]
+
+include::大模型如何做到system角色优先级更高的.adoc[]
+
+include::大模型如何做到调用工具的.adoc[]
+
+include::大模型如何做到调用MCP的.adoc[]
+
+include::stainless原理讲解.adoc[]
+
+include::大模型反向传导原理讲解.adoc[]

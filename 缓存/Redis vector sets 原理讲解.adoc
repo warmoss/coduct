@@ -1,0 +1,192 @@
+== Redis vector sets 原理讲解
+
+接下来, 我们来详细讲解一下 Redis 向量数据库(通常指 RedisSearch 的向量搜索功能)的原理.
+
+首先需要明确一个核心概念: Redis 本身不原生支持向量索引. 我们通常所说的 "Redis 向量搜索" 是通过 Redis 的一个官方模块 RedisSearch 来实现的. 因此, 本文讲解的原理就是 RedisSearch 向量索引的原理.
+
+=== 核心思想
+
+将向量数据存储在 Redis 中, 并利用 RedisSearch 模块为这些向量构建高效的索引(通常是 HNSW), 从而实现快速的近似最近邻搜索.
+
+=== 数据存储: 如何表示"向量集"?
+
+在 RedisSearch 中, 你首先需要创建一个 索引. 这个索引可以包含多个字段, 其中一种类型就是 VECTOR 字段.
+
+**步骤:**
+
+==== 创建包含 VECTOR 字段的索引
+
+使用 FT.CREATE 命令. 你需要指定向量字段的名称、使用的算法(如 HNSW 或 FLAT)、向量的维度、距离度量方式(如余弦相似度 COSINE、欧氏距离 L2、内积 IP)等参数.
+
+[source, bash]
+----
+FT.CREATE my_vec_index 
+  ON HASH 
+  PREFIX 1 doc: 
+  SCHEMA 
+    content TEXT 
+    embedding VECTOR 
+      HNSW 
+      6 
+      TYPE FLOAT32 
+      DIM 768 
+      DISTANCE_METRIC COSINE
+----
+
+* my_vec_index: 索引名称.
+
+* PREFIX 1 doc:: 索引所有以 doc: 为前缀的 Hash 键.
+
+* embedding VECTOR ...: 定义了一个名为 embedding 的向量字段.
+
+** HNSW: 使用的索引算法(最常用).
+
+** DIM 768: 向量维度为 768.
+
+** TYPE FLOAT32: 向量元素是 32 位浮点数.
+
+** DISTANCE_METRIC COSINE: 使用余弦相似度作为距离度量.
+
+==== 存储数据
+
+像普通的 Redis Hash 一样存储你的数据, 但其中包含一个序列化后的向量.
+
+[source, bash]
+----
+HSET doc:1 
+  content "This is a document about machine learning" 
+  embedding "\x9a\x99\xb9?\x9a\x99\x19?..." # 二进制形式的 768 维向量
+----
+
+RedisSearch 会自动索引这个 doc:1 文档, 并为 embedding 字段构建向量索引.
+
+=== 核心原理: HNSW 索引算法
+
+RedisSearch 默认且最常用的向量索引算法是 **HNSW**. 理解 HNSW 是理解整个原理的关键.
+
+**HNSW** 的全称是 **Hierarchical Navigable Small Worlds**.
+
+我们可以用一个生动的比喻来理解它:
+
+**想象一个世界地图:**
+
+* **第 0 层:** 是所有城市的集合(数据点).
+
+* **第 1 层:** 是主要省会城市和交通枢纽. 这一层的城市数量更少, 但它们之间有"高速公路"连接, 可以快速跨区域移动.
+
+* **第 2 层:** 是国家级核心城市(如北京、上海、纽约). 这一层的城市更少, 连接它们的则是"国际航班", 可以极快地在大洲之间穿梭.
+
+* **...以此类推, 层数越高, 节点越少, 连接越"高速".**
+
+**HNSW 的工作原理:**
+
+. **分层结构:** HNSW 将数据图组织成多层. 最底层(第 0 层)包含所有向量. 越往上, 节点数量呈指数级减少, 形成一个金字塔结构.
+
+. **搜索过程(查找最近邻):**
+
+** **入口点:**  从最高层的某个随机节点开始.
+
+** **高速下降:**  在当前层, 贪婪地朝着目标向量的方向移动, 找到离目标最近的节点. 然后"下楼梯"到下一层.
+
+** **逐层精确:**  重复这个过程, 直到下到第 0 层. 在第 0 层, 继续在局部区域内贪婪搜索, 直到无法找到更近的邻居为止.
+
+** **优点:**  这个过程避免了在全量数据中进行暴力比对, 而是通过"高速公路"快速定位到目标区域, 再进行精细搜索, 效率极高.
+
+. **构建过程(插入新向量):**
+
+** 随机为这个新向量分配一个层级(越高层概率越小).
+
+** 从最高层开始, 找到该层的最近邻, 然后下到下一层.
+
+** 在每一层, 都找到 M 个最近邻, 并与它们建立连接.
+
+** 通过这种机制, 新向量被"编织"进这个分层的图网络中.
+
+**为什么 HNSW 如此强大?**
+
+* **高效率:** 搜索时间复杂度接近 O(log N), 远优于暴力搜索的 O(N).
+
+* **高召回率:** 在牺牲少量准确性的前提下, 能获得非常高的召回率, 非常适合推荐、搜索等场景.
+
+* **成熟稳定:** 是目前业界最主流的近似最近邻搜索算法之一.
+
+=== 搜索过程: 如何执行查询?
+
+使用 FT.SEARCH 命令进行向量查询.
+
+==== K-近邻搜索
+
+查找与给定查询向量最相似的 K 个文档.
+
+[source, bash]
+----
+FT.SEARCH my_vec_index 
+  "(*)=>[KNN 10 @embedding $query_vec]" 
+  PARAMS 2 query_vec "\x9a\x99\xb9?\x9a\x99\x19?..." 
+  DIALECT 2 
+  RETURN 2 content __embedding_score
+----
+
+* [KNN 10 @embedding $query_vec]: 这是核心查询部分. 表示在 embedding 字段上, 查找与 $query_vec 最相似的 10 个邻居.
+
+* PARAMS 2 ...: 传入查询向量的二进制数据.
+
+* DIALECT 2: 使用新的查询语法 dialect.
+
+* RETURN 2 content __embedding_score: 返回文档的 content 字段和向量相似度得分.
+
+==== 混合搜索
+
+将向量搜索和传统的关键词搜索、过滤结合, 这是 RedisSearch 的一大优势.
+
+[source, bash]
+----
+FT.SEARCH my_vec_index 
+  "((@content:machine learning))=>[KNN 10 @embedding $query_vec AS score]" 
+  PARAMS 2 query_vec "..." 
+  DIALECT 2 
+  SORTBY score 
+  RETURN 3 content score
+----
+
+* (@content:machine learning): 先过滤出 content 字段包含 "machine learning" 的文档.
+
+* =>[KNN ...]: 然后在这些过滤后的文档中, 进行向量相似度搜索.
+
+* AS score: 将相似度得分命名为 score.
+
+* SORTBY score: 最后按相似度得分排序.
+
+=== 总结: 技术栈与优缺点
+
+技术栈::
+
+Redis -> RedisSearch Module -> VECTOR Field -> HNSW/FLAT Algorithm
+
+优点::
+
+* **极高性能:** Redis 的内存存储 + HNSW 高效算法, 带来微秒级的搜索延迟.
+
+* **数据共存:** 向量索引和原始数据(如 JSON/Hash)存储在同一个 Redis 实例中, 简化了架构. 可以轻松实现混合查询.
+
+* **成熟可靠:** 基于 Redis 和 HNSW 这两个非常成熟的技术, 稳定性和性能有保障.
+
+* **部署简单:** 无需引入额外的向量数据库, 运维成本低.
+
+缺点::
+
+* **内存消耗大:** 向量数据和索引全部存放在内存中, 成本较高. 数据量受限于内存大小.
+
+* **持久化依赖 Redis:** 数据持久化机制依赖于 Redis 本身的 RDB 和 AOF, 不如一些专用向量数据库灵活.
+
+* **功能相对单一:** 相比于专业的向量数据库(如 Milvus, Pinecone), 在集群化、数据管理、高级查询功能上可能稍弱.
+
+适用场景::
+
+** 需要极低延迟的在线推荐、搜索系统.
+
+** 数据量在内存可容纳范围内(例如千万级以下).
+
+** 希望技术栈简单, 不希望引入过多外部组件的场景.
+
+** 需要强事务性或与现有 Redis 数据模型紧密结合的场景.

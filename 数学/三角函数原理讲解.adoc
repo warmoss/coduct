@@ -1,0 +1,227 @@
+== 三角函数原理讲解
+
+三角函数是描述**角度与边长比值关系**的函数, 是连接几何与代数的核心工具. 从解三角形到信号处理, 从傅里叶变换到三维图形渲染, 三角函数无处不在. 下面从定义出发, 逐步深入其核心原理.
+
+=== 概念定义
+
+三角函数有两种递进的定义方式: 从**直角三角形**中的边长比出发, 推广到**单位圆**上的任意角.
+
+==== 锐角三角函数: 直角三角形定义
+
+对于直角三角形中的一个锐角 stem:[theta], 三条边有特定命名:
+
+* **斜边(Hypotenuse)**: 直角所对的边, 也是三角形中最长的边. 记作 stem:[h].
+* **对边(Opposite)**: 角 stem:[theta] 所对的边. 记作 stem:[o].
+* **邻边(Adjacent)**: 角 stem:[theta] 的邻边, 非斜边. 记作 stem:[a].
+
+由此定义六个基本三角函数:
+
+[cols="3*", options="header"]
+|===
+| 函数 | 缩写 | 定义
+| sine (正弦) | stem:[\sin\theta] | stem:[\frac{o}{h}]
+| cosine (余弦) | stem:[\cos\theta] | stem:[\frac{a}{h}]
+| tangent (正切) | stem:[\tan\theta] | stem:[\frac{o}{a}]
+| cotangent (余切) | stem:[\cot\theta] | stem:[\frac{a}{o}]
+| secant (正割) | stem:[\sec\theta] | stem:[\frac{h}{a}]
+| cosecant (余割) | stem:[\csc\theta] | stem:[\frac{h}{o}]
+|===
+
+其中最常用的是 stem:[\sin]、stem:[\cos] 和 stem:[\tan].
+
+==== 任意角三角函数: 单位圆定义
+
+直角三角形定义局限在 stem:[0^\circ] 到 stem:[90^\circ] 的锐角范围. 要描述任意角度的三角函数, 需要引入**单位圆**(半径为1的圆, 圆心在原点).
+
+在单位圆上, 角度 stem:[\theta] 从正 stem:[x] 轴逆时针旋转, 与圆的交点坐标为 stem:[P(x, y)]:
+
+* stem:[\cos\theta = x] - 交点的横坐标
+* stem:[\sin\theta = y] - 交点的纵坐标
+* stem:[\tan\theta = \frac{y}{x}] (stem:[x \ne 0]) - 斜率
+
+这个定义的威力在于: 角度可以取任意实数(包括负角和大于 stem:[360^\circ] 的角), stem:[\sin] 和 stem:[\cos] 的值域被自然地限制在 stem:[-1, 1] 区间内. 同时, 三角函数的**正负符号**也由坐标象限直接决定:
+
+[cols="4*", options="header"]
+|===
+| 象限 | stem:[\sin] | stem:[\cos] | stem:[\tan]
+| I (0-90°) | + | + | +
+| II (90-180°) | + | - | -
+| III (180-270°) | - | - | +
+| IV (270-360°) | - | + | -
+|===
+
+NOTE: 单位圆定义是理解三角函数一切性质的基石. 周期、奇偶、诱导公式都可通过单位圆直观推导.
+
+=== 核心原理
+
+==== 基本恒等式
+
+从单位圆定义可以推导出三角函数的核心恒等式(对任意定义域内的角度成立):
+
+* **勾股恒等式(毕达哥拉斯恒等式)**: stem:[\sin^2\theta + \cos^2\theta = 1] — 单位圆上点的坐标满足圆方程.
+* **商数关系**: stem:[\tan\theta = \frac{\sin\theta}{\cos\theta}], stem:[\cot\theta = \frac{\cos\theta}{\sin\theta}].
+* **倒数关系**: stem:[\sec\theta = \frac{1}{\cos\theta}], stem:[\csc\theta = \frac{1}{\sin\theta}].
+
+由勾股恒等式可以衍生:
+
+. stem:[1 + \tan^2\theta = \sec^2\theta] -- 两边除以 stem:[\cos^2\theta].
+. stem:[1 + \cot^2\theta = \csc^2\theta] -- 两边除以 stem:[\sin^2\theta].
+
+==== 周期性
+
+三角函数是**周期函数**:
+
+* stem:[\sin\theta] 和 stem:[\cos\theta] 的周期是 stem:[2\pi] (stem:[360^\circ]): stem:[\sin(\theta + 2\pi) = \sin\theta], stem:[\cos(\theta + 2\pi) = \cos\theta].
+* stem:[\tan\theta] 和 stem:[\cot\theta] 的周期是 stem:[\pi] (stem:[180^\circ]): stem:[\tan(\theta + \pi) = \tan\theta].
+
+从单位圆视角看, 旋转一周后回到同一点, 坐标值必然重复, 周期性一目了然.
+
+==== 奇偶性
+
+* stem:[\sin\theta] 是**奇函数**: stem:[\sin(-\theta) = -\sin\theta] -- 单位圆上纵坐标关于原点对称.
+* stem:[\cos\theta] 是**偶函数**: stem:[\cos(-\theta) = \cos\theta] -- 单位圆上横坐标关于 stem:[y] 轴对称.
+* stem:[\tan\theta] 是**奇函数**: stem:[\tan(-\theta) = -\tan\theta].
+
+==== 诱导公式
+
+诱导公式描述了不同象限角之间的转换关系, 其记忆口诀是 **"奇变偶不变, 符号看象限"**:
+
+* *奇变偶不变*: 如果加的角度是 stem:[\frac{\pi}{2}] 的**奇数**倍, 函数名变为余函数(stem:[\sin \leftrightarrow \cos], stem:[\tan \leftrightarrow \cot]); 如果是**偶数**倍, 函数名不变.
+* *符号看象限*: 将式子中的角度视为**锐角**, 判断原函数在对应象限的符号, 决定结果的正负.
+
+示例: 计算 stem:[\sin(\pi + \theta)]:
+
+. stem:[\pi] 是 stem:[\frac{\pi}{2}] 的偶数倍(2倍) -> 函数名不变, 仍为 stem:[\sin].
+. 把 stem:[\theta] 视为锐角, stem:[\pi + \theta] 在第三象限, stem:[\sin] 在第三象限为负 -> 结果为负.
+. 结论: stem:[\sin(\pi + \theta) = -\sin\theta].
+
+==== 和差角公式
+
+和差角公式是三角恒等变换的核心, 大多数倍角公式、积化和差公式都可由此推导:
+
+* stem:[\sin(A \pm B) = \sin A \cos B \pm \cos A \sin B]
+* stem:[\cos(A \pm B) = \cos A \cos B \pm \sin A \sin B]
+* stem:[\tan(A \pm B) = \frac{\tan A \pm \tan B}{1 \pm \tan A \tan B}]
+
+由和差角公式可以推导出常用公式:
+
+* **倍角公式**: stem:[\sin 2A = 2 \sin A \cos A], stem:[\cos 2A = \cos^2 A - \sin^2 A = 2\cos^2 A - 1 = 1 - 2\sin^2 A].
+* **半角公式**: stem:[\sin^2\frac{A}{2} = \frac{1 - \cos A}{2}], stem:[\cos^2\frac{A}{2} = \frac{1 + \cos A}{2}].
+* **积化和差**: stem:[\sin A \cos B = \frac{1}{2}[\sin(A+B) + \sin(A-B)]].
+
+=== 三角函数的图像
+
+==== 正弦函数 stem:[y = \sin x]
+
+正弦曲线是**波形**的基本形态, 描述最简单的周期振动:
+
+* *定义域*: stem:[(-\infty, +\infty)]
+* *值域*: stem:[-1, 1]
+* *周期*: stem:[2\pi]
+* *零点*: stem:[x = k\pi] (stem:[k \in \mathbb{Z}])
+* *最大值*: stem:[x = \frac{\pi}{2} + 2k\pi] 时, stem:[y = 1]
+* *最小值*: stem:[x = \frac{3\pi}{2} + 2k\pi] 时, stem:[y = -1]
+
+==== 余弦函数 stem:[y = \cos x]
+
+余弦曲线本质上是正弦曲线向左平移 stem:[\frac{\pi}{2}]:
+
+* *定义域*: stem:[(-\infty, +\infty)]
+* *值域*: stem:[-1, 1]
+* *周期*: stem:[2\pi]
+* *零点*: stem:[x = \frac{\pi}{2} + k\pi]
+* *最大值*: stem:[x = 2k\pi] 时, stem:[y = 1]
+* *最小值*: stem:[x = \pi + 2k\pi] 时, stem:[y = -1]
+
+==== 正切函数 stem:[y = \tan x]
+
+正切曲线由 stem:[\frac{\sin x}{\cos x}] 定义, 在 stem:[\cos x = 0] 处有垂直渐近线:
+
+* *定义域*: stem:[x \ne \frac{\pi}{2} + k\pi]
+* *值域*: stem:[(-\infty, +\infty)]
+* *周期*: stem:[\pi]
+* *渐近线*: stem:[x = \frac{\pi}{2} + k\pi]
+* *零点*: stem:[x = k\pi]
+
+==== 一般形式的正弦波
+
+实际问题中的正弦波通常写作一般形式:
+
+stem:[y = A \sin(\omega x + \phi) + B]
+
+其中各参数的含义:
+
+* stem:[A]: **振幅**, 控制波形的高度倍率(stem:[A > 0]).
+* stem:[\omega]: **角频率**, 控制波形的周期缩放. 周期 stem:[T = \frac{2\pi}{\omega}].
+* stem:[\phi]: **初相**, 控制波形在 stem:[x] 轴上的水平偏移.
+* stem:[B]: **垂直位移**, 控制波形整体的上下平移.
+
+[source,python]
+----
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 参数: 振幅、角频率、初相、垂直位移
+A, omega, phi, B = 2, 3, np.pi/4, 0.5
+
+x = np.linspace(0, 2*np.pi, 1000)
+y = A * np.sin(omega * x + phi) + B
+
+plt.plot(x, y)
+plt.grid(True)
+plt.title(f"y = {A}sin({omega}x + {phi:.2f}) + {B}")
+plt.show()
+----
+
+=== 应用场景
+
+==== 解三角形: 正弦定理与余弦定理
+
+在任意三角形中, 三角函数提供了边长和角度之间的转换桥梁.
+
+**正弦定理**:
+
+stem:[\frac{a}{\sin A} = \frac{b}{\sin B} = \frac{c}{\sin C} = 2R]
+
+其中 stem:[R] 为三角形的外接圆半径. 正弦定理适用于: 已知两角一边, 或已知两边及其中一边的对角.
+
+**余弦定理**:
+
+stem:[c^2 = a^2 + b^2 - 2ab \cos C]
+
+余弦定理是勾股定理的推广. 当 stem:[C = 90^\circ] 时, stem:[\cos C = 0], 退化为 stem:[c^2 = a^2 + b^2]. 余弦定理适用于: 已知两边及夹角, 或已知三边求角.
+
+==== 信号处理: 傅里叶分析
+
+任何周期信号都可以分解为不同频率、不同振幅的正弦波之和 — 这正是**傅里叶级数**的核心思想:
+
+stem:[f(t) = a_0 + \sum_{n=1}^\infty a_n \cos(n\omega t) + b_n \sin(n\omega t)]
+
+这一数学原理驱动了音频压缩(MP3)、图像压缩(JPEG)、通信调制等现代技术.
+
+==== 计算机图形学: 旋转与波形
+
+* **旋转矩阵**: 二维空间中点 stem:[(x, y)] 绕原点旋转角度 stem:[\theta] 后的坐标:
++
+[source,python]
+----
+def rotate_point(x, y, theta):
+    cos_t, sin_t = cos(theta), sin(theta)
+    x_new = x * cos_t - y * sin_t
+    y_new = x * sin_t + y * cos_t
+    return x_new, y_new
+----
+* **波形模拟**: 游戏和动画中的波浪、光线跳动等效果, 本质上是对正弦/余弦函数的参数化驱动.
+
+=== 常见误区
+
+* **角度单位混淆**: 数学中三角函数默认使用**弧度**(radian)而非角度(degree). stem:[180^\circ = \pi\ \text{rad}]. 弧度制的优势在于导数公式简洁: stem:[\frac{d}{dx}\sin x = \cos x] 仅在弧度制下成立.
+* **混淆 stem:[\sin^{-1}x] 的含义**: stem:[\sin^{-1}x] 通常表示**反正弦函数**(arcsine), 即反函数, 而不是 stem:[\frac{1}{\sin x}]. 后者应写作 stem:[(\sin x)^{-1}] 或 stem:[\csc x].
+* **忽略定义域限制**: 使用 stem:[\tan x] 和 stem:[\sec x] 时需注意 stem:[\cos x \neq 0]; 使用 stem:[\cot x] 和 stem:[\csc x] 时需注意 stem:[\sin x \neq 0].
+
+=== 总结
+
+* 三角函数的**单位圆定义**是其一切性质的基础, 统一了锐角与任意角的三角比.
+* 三个核心恒等式(勾股恒等式、商数关系、倒数关系)构成了三角变换的基石.
+* 和差角公式是三角恒等变换的核心引擎, 倍角、半角、积化和差等公式皆由其派生.
+* 三角函数的应用贯穿**几何**(解三角形)、**物理**(振动与波动)、**工程**(信号处理)和**计算机科学**(图形学)等多个领域.

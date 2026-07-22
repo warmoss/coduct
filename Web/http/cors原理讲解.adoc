@@ -1,0 +1,297 @@
+== CORS原理讲解
+
+=== 为什么需要 CORS?
+
+浏览器有一个重要的安全机制 -- **同源策略**. 它限制了来自不同源的文档或脚本与当前源的资源进行交互. 如果没有这个策略, 恶意网站可以随意读取其他网站的敏感数据.
+
+但在现代 Web 开发中, 前后端分离、跨域 API 调用、第三方 CDN 资源加载等场景非常普遍. 例如:
+
+* 前端部署在 `https://app.example.com`, 后端 API 部署在 `https://api.example.com`
+* 页面需要加载来自其他域名的字体文件、图片或脚本
+* 单页应用(SPA)调用第三方开放平台的接口
+
+这就产生了一个矛盾: 安全需要"同源", 业务需要"跨域". **CORS** 就是解决这个矛盾的官方标准方案.
+
+=== 什么是同源策略?
+
+**同源策略** 是浏览器最核心的安全基石. 它规定: 只有当两个 URL 的 **协议、域名、端口** 全部相同时, 才被视为"同源", 浏览器才允许脚本读取或操作对方的资源.
+
+[source, text]
+----
+https://app.example.com:443/page.html
+    |       |       |        |
+  协议    域名    端口     路径
+----
+
+**同源判断示例:**
+
+|===
+| URL | 是否同源 | 原因
+
+| `https://app.example.com/api`
+| 是
+| 协议、域名、端口都相同
+
+| `http://app.example.com/api`
+| 否
+| 协议不同(https vs http)
+
+| `https://api.example.com/api`
+| 否
+| 域名不同
+
+| `https://app.example.com:8080/api`
+| 否
+| 端口不同(443 vs 8080)
+|===
+
+同源策略主要限制以下行为:
+
+. DOM 访问: 禁止跨域页面操作彼此的 DOM(如 `iframe` 中访问父页面元素)
+. AJAX 请求: 禁止跨域发起 `XMLHttpRequest` 或 `fetch` 请求读取响应数据
+. Cookie/Storage 访问: 禁止跨域读取对方的 Cookie、LocalStorage 等
+
+注意: 同源策略并不限制 `script`、`img`、`link` 等标签的跨域加载行为, 因为它们使用的是 **GET** 请求且无法读取响应内容. 这也是 JSONP 能绕过同源策略实现跨域请求的原理.
+
+=== 什么是 CORS?
+
+**CORS(Cross-Origin Resource Sharing, 跨域资源共享)** 是一种基于 HTTP 头的机制, 它通过在请求和响应中添加特定的头部字段, 让服务器声明哪些跨域来源被允许访问其资源.
+
+**核心思想:** 由服务器"显式授权"浏览器放行跨域请求. 浏览器负责检查授权, 服务器负责声明授权.
+
+CORS 将跨域请求分为两类:
+
+==== 简单请求
+
+**简单请求** 满足以下所有条件:
+
+* 请求方法为 `GET`、`HEAD` 或 `POST` 之一
+* 除了浏览器自动设置的头部(如 `Accept`、`Content-Type` 等)外, 未手动设置其他请求头
+* `Content-Type` 的值只能是 `application/x-www-form-urlencoded`、`multipart/form-data` 或 `text/plain` 之一
+* 请求中未使用 `ReadableStream` 对象
+* 未使用 `XMLHttpRequest.upload` 事件监听
+
+对于简单请求, 浏览器会直接发送实际请求, 在请求头中添加 `Origin` 字段. 服务器通过响应头 `Access-Control-Allow-Origin` 告知浏览器是否放行.
+
+==== 预检请求
+
+**预检请求** 是指不满足简单请求条件的跨域请求. 浏览器会在正式请求之前, 先发送一个 **OPTIONS** 方法的请求(称为预检请求), 询问服务器是否允许该实际的跨域请求.
+
+以下情况会触发预检请求:
+
+* 使用 `PUT`、`DELETE`、`PATCH`、`CONNECT` 等非简单方法
+* 设置了自定义请求头(如 `Authorization`、`X-Custom-Header`)
+* `Content-Type` 不是上述三种简单类型(如 `application/json`)
+* 请求中使用了 `ReadableStream` 或 `XMLHttpRequest.upload` 事件监听
+
+预检请求通过后, 浏览器才会发送实际的跨域请求.
+
+=== CORS 核心 HTTP 头
+
+CORS 的核心机制由以下 HTTP 头实现, 相关详细定义可参考 <<HTTP头讲解.adoc, HTTP 头讲解>>.
+
+==== 请求头
+
+* `Origin:` 必需. 指示请求来自哪个源(协议 + 域名 + 端口). 浏览器自动添加, 无法通过脚本修改.
+
+* `Access-Control-Request-Method:` 预检请求中使用, 告知服务器实际请求将使用的方法.
+
+* `Access-Control-Request-Headers:` 预检请求中使用, 告知服务器实际请求将携带的自定义头部列表.
+
+==== 响应头
+
+* `Access-Control-Allow-Origin:` 必需. 指定允许访问资源的源. 可以是具体源(如 `https://app.example.com`) 或通配符 `*`(表示所有源). 注意: 当请求携带凭据(Cookie)时, 不能使用 `*`.
+
+* `Access-Control-Allow-Methods:` 预检响应中使用, 指定服务器允许的 HTTP 方法列表, 多个用逗号分隔.
+
+* `Access-Control-Allow-Headers:` 预检响应中使用, 指定服务器允许的自定义头部列表.
+
+* `Access-Control-Expose-Headers:` 指定浏览器可以访问的响应头白名单. 默认情况下, JavaScript 只能访问 `Cache-Control`、`Content-Language`、`Content-Type`、`Expires`、`Last-Modified`、`Pragma` 等简单响应头.
+
+* `Access-Control-Max-Age:` 预检响应中使用, 指定预检请求的结果可以被缓存多长时间(单位秒). 减少频繁的预检请求可以提升性能.
+
+* `Access-Control-Allow-Credentials:` 指定是否允许浏览器携带凭据(Cookie、HTTP 认证、客户端证书等). 值为 `true` 时需要与 `Access-Control-Allow-Origin: <具体源>` 配合使用.
+
+=== CORS 工作流程
+
+==== 简单请求流程
+
+. 浏览器发现请求跨域, 自动在请求头添加 `Origin` 字段
+. 服务器收到请求, 决定是否允许该来源
+. 服务器在响应头中添加 `Access-Control-Allow-Origin` 字段
+. 浏览器检查响应头: 如果 `Access-Control-Allow-Origin` 匹配 `Origin`, 则放行; 否则拒绝 JavaScript 访问响应数据
+
+[plantuml, "简单请求流程", format=png]
+----
+@startuml
+actor 浏览器
+participant 服务器
+
+浏览器 -> 服务器: GET /api/data\nOrigin: https://app.example.com
+服务器 --> 浏览器: 200 OK\nAccess-Control-Allow-Origin: https://app.example.com
+note right of 浏览器: 检查通过, 放行
+@enduml
+----
+
+==== 预检请求流程
+
+. 浏览器发现跨域请求不是简单请求, 先发送 OPTIONS 预检请求
+. 预检请求携带 `Origin`、`Access-Control-Request-Method`、`Access-Control-Request-Headers`
+. 服务器返回预检响应, 包含允许的方法、头部和缓存时长
+. 浏览器验证预检响应: 如果允许, 则发送实际请求; 否则报错
+. 实际请求走简单请求流程
+
+[plantuml, "预检请求流程", format=png]
+----
+@startuml
+actor 浏览器
+participant 服务器
+
+浏览器 -> 服务器: OPTIONS /api/data\nOrigin: https://app.example.com\nAccess-Control-Request-Method: PUT\nAccess-Control-Request-Headers: X-Custom-Header
+服务器 --> 浏览器: 204 No Content\nAccess-Control-Allow-Origin: https://app.example.com\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE\nAccess-Control-Allow-Headers: X-Custom-Header\nAccess-Control-Max-Age: 3600
+
+note right of 浏览器: 预检通过, 发送实际请求
+
+浏览器 -> 服务器: PUT /api/data\nOrigin: https://app.example.com\nX-Custom-Header: value
+服务器 --> 浏览器: 200 OK\nAccess-Control-Allow-Origin: https://app.example.com
+note right of 浏览器: 检查通过, 放行
+@enduml
+----
+
+=== 带凭据的跨域请求
+
+当跨域请求需要携带 Cookie 或 HTTP 认证信息时, 需要在客户端和服务端同时做额外配置.
+
+==== 客户端设置
+
+[source, javascript]
+----
+// fetch 方式
+fetch('https://api.example.com/data', {
+    credentials: 'include'
+});
+
+// XMLHttpRequest 方式
+var xhr = new XMLHttpRequest();
+xhr.withCredentials = true;
+----
+
+==== 服务端设置
+
+服务端必须满足以下条件, 否则浏览器将拒绝响应:
+
+* `Access-Control-Allow-Origin` 不能为 `*`, 必须指定具体源
+* `Access-Control-Allow-Credentials` 必须为 `true`
+
+[source, text]
+----
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Credentials: true
+----
+
+=== 服务端配置示例
+
+==== Nginx 配置
+
+[source, nginx]
+----
+server {
+    listen 80;
+    server_name api.example.com;
+
+    location / {
+        # 允许的源, 根据实际域名配置
+        set $cors_origin "";
+        if ($http_origin ~* (https://app\.example\.com|https://admin\.example\.com)) {
+            set $cors_origin $http_origin;
+        }
+
+        add_header Access-Control-Allow-Origin $cors_origin;
+        add_header Access-Control-Allow-Methods 'GET, POST, PUT, DELETE, OPTIONS';
+        add_header Access-Control-Allow-Headers 'Authorization, Content-Type, X-Custom-Header';
+        add_header Access-Control-Max-Age 3600;
+        add_header Access-Control-Allow-Credentials true;
+
+        # 处理预检请求
+        if ($request_method = 'OPTIONS') {
+            return 204;
+        }
+    }
+}
+----
+
+==== Spring Boot 配置
+
+[source, java]
+----
+@Configuration
+public class CorsConfig {
+
+    @Bean
+    public WebMvcConfigurer corsConfigurer() {
+        return new WebMvcConfigurer() {
+            @Override
+            public void addCorsMappings(CorsRegistry registry) {
+                registry.addMapping("/api/**")
+                    .allowedOrigins("https://app.example.com")
+                    .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
+                    .allowedHeaders("*")
+                    .allowCredentials(true)
+                    .maxAge(3600);
+            }
+        };
+    }
+}
+----
+
+==== 通用 Java Servlet 过滤器
+
+[source, java]
+----
+@WebFilter("/api/*")
+public class CorsFilter implements Filter {
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response,
+                         FilterChain chain) throws IOException, ServletException {
+        HttpServletResponse resp = (HttpServletResponse) response;
+        HttpServletRequest req = (HttpServletRequest) request;
+
+        resp.setHeader("Access-Control-Allow-Origin", "https://app.example.com");
+        resp.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        resp.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+        resp.setHeader("Access-Control-Max-Age", "3600");
+        resp.setHeader("Access-Control-Allow-Credentials", "true");
+
+        if ("OPTIONS".equalsIgnoreCase(req.getMethod())) {
+            resp.setStatus(HttpServletResponse.SC_NO_CONTENT);
+            return;
+        }
+
+        chain.doFilter(request, response);
+    }
+}
+----
+
+=== 常见误区与注意事项
+
+* **CORS 是服务端策略, 不是客户端策略.** 浏览器负责执行, 但授权声明由服务端做出. 仅修改客户端代码无法解决跨域问题.
+
+* **`Access-Control-Allow-Origin: *` 与凭据不能共存.** 如果需要携带 Cookie, 必须指定具体源.
+
+* **预检请求不发 Cookie.** 预检请求(OPTIONS)通常不会携带 Cookie, 因此服务端在处理预检请求时应避免需要身份验证的逻辑.
+
+* **304 响应也需要 CORS 头.** 如果 CDN 或反向代理返回了 304 Not Modified 缓存响应, 该响应也必须包含正确的 `Access-Control-Allow-Origin`, 否则浏览器会拒绝.
+
+* **不要在生产环境使用 `*`.** 除非 API 是完全公开的, 否则应始终指定允许的具体源, 避免安全风险.
+
+* **`Access-Control-Max-Age` 有浏览器上限.** 虽然服务端可以设置较大的值(如 86400), 但不同浏览器有各自的硬性上限(Chrome 为 600 秒, Firefox 为 86400 秒).
+
+=== 总结
+
+CORS 是现代 Web 开发中必不可少的安全机制, 它通过 HTTP 头在浏览器端实现了可控的跨域资源共享. 理解 CORS 的关键在于:
+
+* **同源策略** 是浏览器安全的基石, CORS 是它唯一的官方豁免机制
+* **简单请求** 直接发送, **预检请求** 先问后发
+* 服务端通过 `Access-Control-*` 系列响应头声明授权策略
+* 带凭据的请求需要服务端和客户端协同配置

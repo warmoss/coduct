@@ -1,0 +1,295 @@
+== SHA原理讲解
+
+=== 什么是SHA
+
+定义:: SHA(Secure Hash Algorithm)是美国国家标准与技术研究院(NIST)发布的一系列**密码学哈希函数**标准, 用于将任意长度的数据映射为**固定长度**的摘要值(Digest).
+
+核心特性::
+* **单向性:** 从输入数据容易计算出摘要, 但从摘要**几乎不可能**逆向推导出原始数据
+* **抗碰撞性:** 找到两个不同输入产生相同摘要在计算上是**不可行的**
+* **固定输出:** 无论输入多大, 输出长度固定(如 SHA-256 输出 256 位)
+* **雪崩效应:** 输入微小的变化(1个比特)会导致输出约50%的比特发生变化
+
+应用场景:: SHA 是现代密码学中最基础的工具之一, 被广泛用于数据完整性校验、数字签名、密码存储(配合盐值)、文件指纹等场景.
+
+=== SHA家族演进
+
+SHA 算法家族经历了多次迭代, 每一代都在安全性上有质的提升.
+
+[[sha-family]]
+.SHA 家族演进
+[cols="1,2,2,2,4"]
+|===
+| 算法 | 输出长度 | 状态 | 发布年份 | 说明
+
+| SHA-0
+| 160 位
+| **已废弃**
+| 1993
+| 发布后不久被发现存在严重安全缺陷, 被 SHA-1 取代
+
+| SHA-1
+| 160 位
+| **已淘汰**
+| 1995
+| 2005年起理论攻击被不断改进, 2017年Google公开了首个成功碰撞实例
+
+| SHA-2 (SHA-224/256/384/512)
+| 224~512 位
+| **推荐**
+| 2001
+| 当前事实标准, 无已知有效攻击; 安全性取决于输出长度
+
+| SHA-3 (Keccak)
+| 224~512 位
+| **推荐**
+| 2015
+| 底层结构完全不同(Sponge构造), 作为 SHA-2 的备选方案
+
+|===
+
+WARNING: 任何场景下都**不应使用 SHA-0 或 SHA-1**. 两者的碰撞攻击已具备实际可行性, 使用它们将带来严重的安全风险.
+
+=== SHA-2 核心原理 -- 以 SHA-256 为例
+
+SHA-256 是 SHA-2 家族中最常用的成员, 输出 256 位(32 字节)的摘要值. 理解其工作原理有助于把握整个哈希函数家族的设计哲学.
+
+==== 预处理阶段
+
+在计算哈希值之前, 需要对输入消息进行预处理:
+
+. **消息填充(Padding):**
+   * 在消息末尾追加一个 `1` 位, 然后追加若干 `0` 位, 使得填充后的长度模 512 等于 448
+   * 最后 64 位存放原始消息的长度(以位为单位)
+   * 保证了消息长度成为 512 位的整数倍
+
+. **解析消息块:**
+   * 将填充后的消息分割为 **512 位(64 字节)** 的块
+   * 每个块独立参与哈希计算
+
+==== 初始化
+
+. **初始哈希值(H0):** 8 个 32 位常量, 取自前 8 个质数的平方根的小数部分的前 32 位
+
+. **轮常数(Kt):** 64 个 32 位常量列表, 取自前 64 个质数的立方根的小数部分的前 32 位
+
+==== 压缩函数主循环
+
+SHA-256 的核心是**压缩函数**, 每个 512 位消息块经过 64 轮迭代计算:
+
+[source,plaintext]
+----
+输入: 消息块 M(512位), 当前哈希值 H(8个32位字)
+
+1.  扩展消息调度: 将 512 位 M 扩展为 64 个 32 位字 W[0..63]
+    * 前 16 个字直接取自消息块
+    * 后 48 个字通过特定公式递推生成
+
+2.  初始化工作变量: a = H[0], b = H[1], ..., h = H[7]
+
+3.  主循环(64 轮): 每轮执行
+    T1 = h + Σ1(e) + Ch(e, f, g) + K[t] + W[t]
+    T2 = Σ0(a) + Maj(a, b, c)
+    h = g; g = f; f = e; e = d + T1
+    d = c; c = b; b = a; a = T1 + T2
+
+4.  更新哈希值: H[0] += a, H[1] += b, ..., H[7] += h
+----
+
+关键数学运算::
+* **Ch(e, f, g):** 选择函数 -- `(e AND f) XOR (NOT e AND g)`
+* **Maj(a, b, c):** 多数函数 -- `(a AND b) XOR (a AND c) XOR (b AND c)`
+* **Σ0(a):** 右旋 2, 13, 22 位的异或
+* **Σ1(e):** 右旋 6, 11, 25 位的异或
+
+这些运算组合了**非线性函数(Ch, Maj)**和**线性扩散(Σ0, Σ1)**, 共同实现了混淆和扩散效果.
+
+==== 工作流程总览
+
+[plantuml,"SHA-256处理流程",format=png]
+----
+@startuml
+start
+:接收输入消息;
+:消息填充(补1补0补长度);
+:分割为512位消息块;
+repeat
+  :初始化工作变量 a,b,c,d,e,f,g,h;
+  :生成64个调度字 W[0..63];
+  repeat
+    :执行第t轮压缩函数;
+    :更新 a..h 工作变量;
+  repeatwhile (t < 64)
+  :更新哈希值 H[0..7];
+repeatwhile (所有块处理完毕)
+:输出最终摘要(256位);
+stop
+@enduml
+----
+
+=== SHA-3 核心原理 -- Sponge 构造
+
+SHA-3 与前代有本质不同, 它基于 **Keccak** 算法的 **Sponge(海绵)** 构造, 而不是 Merkle-Damgård 结构.
+
+海绵结构::
+* **吸收阶段(Absorb):** 将输入消息分成若干块, 逐块"吸收"到内部状态中(通过 XOR 和置换函数 f)
+* **挤压阶段(Squeeze):** 从内部状态中"挤出"所需长度的输出
+
+.Sponge 构造示意
+[plantuml,"SHA-3 Sponge结构",format=png]
+----
+@startuml
+left to right direction
+
+rectangle "消息块1" as M1
+rectangle "消息块2" as M2
+rectangle "消息块n" as Mn
+rectangle "输出1" as O1
+rectangle "输出2" as O2
+
+M1 --> f
+M2 --> f
+Mn --> f
+
+f --> O1
+O1 --> f
+f --> O2
+
+note top of M1 : 吸收阶段(Absorb)
+note top of O1 : 挤压阶段(Squeeze)
+
+@enduml
+----
+
+SHA-3 的优势::
+* 与 SHA-2 结构完全不同, 即使 SHA-2 被攻破, SHA-3 仍安全
+* 天然抵抗长度扩展攻击(Length Extension Attack)
+* 软件和硬件实现效率高
+
+=== SHA-2 与 SHA-3 对比
+
+[cols="2,5,5"]
+|===
+| 特性 | SHA-2 (SHA-256) | SHA-3 (Keccak-256)
+
+| 底层结构
+| Merkle-Damgård
+| Sponge 构造
+
+| 输出长度
+| 256 位
+| 256 位
+
+| 抗长度扩展攻击
+| 否(需额外防护)
+| 是(天然免疫)
+
+| 硬件效率
+| 优秀
+| 优秀
+
+| 软件效率
+| 优秀
+| 良好
+
+| 安全冗余
+| 高(实战检验近20年)
+| 高(结构完全不同)
+
+|===
+
+NOTE: 当前大多数系统推荐使用 **SHA-256** 或 **SHA-3-256**. SHA-2 的广泛支持和成熟度使其仍是首选, 而 SHA-3 提供了重要的多样化安全备份.
+
+=== 常见应用场景
+
+数据完整性校验:: 下载文件时提供 SHA-256 摘要, 用户验证文件是否被篡改.
+
+数字签名:: 先对消息做 SHA 哈希, 再对摘要做签名, 大幅提升签名效率(而非直接签名整个消息).
+
+密码存储:: 配合盐值(Salt)使用 **SHA-256(或更强的 bcrypt/argon2)** 存储密码哈希, 避免明文存储.
+
+区块链:: 比特币使用 **SHA-256** 作为工作量证明(PoW)的核心哈希函数, 以太坊使用 **Keccak-256**(SHA-3 的前身).
+
+TLS/SSL:: 在证书签名和握手协议中使用 SHA-256 确保消息完整性.
+
+Git:: 使用 SHA-1(目前正逐步迁移至 SHA-256)作为提交和对象的唯一标识.
+
+=== 安全注意事项
+
+长度扩展攻击:: SHA-2 基于 Merkle-Damgård 结构, 理论上存在长度扩展攻击. 在需要防止此类攻击的场景(HMAC、数字签名), 应使用 HMAC 构造或直接使用 SHA-3.
+
+量子计算威胁:: Grover 算法可将 SHA-256 的有效安全强度从 256 位降至 128 位. 对于长期安全需求, 建议使用 **SHA-384 或 SHA-512**.
+
+输出长度选择:: 
+* **SHA-224:** 用于兼容性, 安全强度约 112 位
+* **SHA-256:** 目前最推荐, 安全强度 128 位, 足够大多数场景
+* **SHA-384/SHA-512:** 安全强度 192/256 位, 用于极高安全需求或合规要求
+
+碰撞攻击现状:: 截至 2024 年, SHA-2 家族无公开有效碰撞攻击. SHA-1 的首个公开碰撞由 Google 在 2017 年完成(SHAttered 攻击), 破坏了 SHA-1 的抗碰撞性.
+
+=== 代码示例
+
+.SHA-256 摘要计算
+[source,java]
+----
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
+
+public class Sha256Example {
+
+    private static String sha256(byte[] input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(input);
+            return HexFormat.of().formatHex(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("SHA-256 not available", e);
+        }
+    }
+
+    public static void main(String[] args) {
+        String message = "Hello, SHA-256!";
+        String hash = sha256(message.getBytes());
+        System.out.println("消息: " + message);
+        System.out.println("SHA-256: " + hash);
+    }
+}
+----
+
+.SHA-3 摘要计算(Java 9+)
+[source,java]
+----
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
+
+public class Sha3Example {
+
+    private static String sha3256(byte[] input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA3-256");
+            byte[] hash = digest.digest(input);
+            return HexFormat.of().formatHex(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("SHA3-256 not available", e);
+        }
+    }
+
+    public static void main(String[] args) {
+        String message = "Hello, SHA-3!";
+        String hash = sha3256(message.getBytes());
+        System.out.println("消息: " + message);
+        System.out.println("SHA3-256: " + hash);
+    }
+}
+----
+
+=== 总结
+
+SHA 是密码学哈希函数的事实标准, 经历了从 SHA-0 到 SHA-3 的演进::
+* **SHA-2(SHA-256/SHA-512)** 是当前最广泛使用且安全的哈希函数家族, 适用于绝大多数场景
+* **SHA-3** 作为结构独立的备选方案, 提供额外的安全保障
+* 始终**避免使用 SHA-0 和 SHA-1**, 它们已不再安全
+* 根据安全需求选择合适的输出长度: SHA-256 满足大多数场景, SHA-512 用于更高安全要求
+* SHA 本身提供**完整性**保证, 在需要**真实性**保证时应配合 HMAC 或数字签名使用

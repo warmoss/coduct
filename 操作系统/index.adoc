@@ -1,0 +1,27 @@
+= 操作系统
+
+include::socket状态讲解.adoc[]
+
+include::文件描述符讲解.adoc[]
+
+include::中断原理讲解.adoc[]
+
+include::epoll原理讲解.adoc[]
+
+include::网卡工作原理讲解.adoc[]
+
+include::防火墙原理讲解.adoc[]
+
+include::WAF原理讲解.adoc[]
+
+include::NAT原理讲解.adoc[]
+
+include::HostOnly网络原理讲解.adoc[]
+
+include::虚拟网卡原理讲解.adoc[]
+
+include::ubuntu cgroup原理讲解.adoc[]
+
+include::ubuntu负载原理讲解.adoc[]
+
+include::ubuntu Socket Activation 原理讲解.adoc[]

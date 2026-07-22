@@ -1,0 +1,276 @@
+== reveal讲解
+
+=== Reveal.js 是什么?
+
+**Reveal.js** 是一个基于 HTML5 的开源演示文稿框架, 使用 JavaScript, CSS 和 HTML 技术栈, 让开发者能够用 Web 技术创建精美的演示文稿. 与传统的 PowerPoint, Keynote 等 GUI 工具不同, 它以纯文本(HTML)的方式定义幻灯片内容, 天然适合版本控制和协作开发.
+
+**核心思想: 用 Web 技术做演示.**
+
+* **对比 PowerPoint/Keynote:** 传统工具提供"所见即所得"的编辑器, 通过鼠标拖拽排版; 适合设计师和非技术用户. 但二进制文件难以做版本对比和协作.
+* **Reveal.js 的哲学:** 将演示文稿视为"代码". 每一页幻灯片就是一个 HTML `section` 元素. 排版和动画效果通过 CSS 与 JavaScript 配置控制. 这意味着你可以像管理代码一样管理演示文稿——用 Git 做版本管理, 用 IDE 编写, 用 CI/CD 自动构建发布.
+
+=== 核心概念
+
+理解 Reveal.js, 需要掌握以下核心概念:
+
+幻灯片 (Slide)::
+  演示文稿的基本单元, 用一个 `<section>` 元素表示. 在垂直方向上嵌套的 `<section>` 形成垂直幻灯片. 导航默认按水平方向(右箭头)行进, 到达包含子幻灯片的页面后, 按下箭头进入垂直序列.
+
+片段 (Fragment)::
+  幻灯片内逐条展示的元素. 通过为元素添加 `class="fragment"` 实现"逐步显示"效果. 常用于列表逐条出现、图片渐入等场景, 避免一次性展示太多信息.
+
+过渡 (Transition)::
+  幻灯片切换时的动画效果. Reveal.js 内置了 `slide`(滑动), `fade`(淡入淡出), `convex`(凸出), `concave`(凹陷), `zoom`(缩放) 等多种过渡方式, 可通过配置或 `data-transition` 属性为单页指定.
+
+主题 (Theme)::
+  统一的视觉样式包. Reveal.js 内置了 `black`(深色), `white`(浅色), `league`(暗紫), `sky`(蓝白天), `beige`(米色), `serif`(衬线), `simple`(极简), `blood`(血红), `night`(暗夜), `moon`(月球), `solarized`(亮黄) 等主题, 通过 CSS 变量系统实现快速换肤.
+
+演讲者笔记 (Speaker Notes)::
+  仅演讲者可见的备注内容, 写在 `<aside class="notes">` 元素中. 在演示时按键盘 `S` 键会打开一个单独的演讲者窗口, 显示当前幻灯片、下一页预览、笔记内容和时间.
+
+=== 核心特性与原理
+
+==== 水平与垂直导航
+
+Reveal.js 将演示文稿组织为一个**二维网格**:
+
+[source,html]
+----
+<div class="reveal">
+  <div class="slides">
+    <!-- 水平幻灯片 -->
+    <section>水平幻灯片 1</section>
+    <section>
+      <!-- 水平幻灯片 2, 包含垂直子幻灯片 -->
+      <section>垂直幻灯片 2.1</section>
+      <section>垂直幻灯片 2.2</section>
+    </section>
+    <section>水平幻灯片 3</section>
+  </div>
+</div>
+----
+
+导航逻辑:
+
+* **水平方向 (左右箭头):** 遍历顶级 `<section>` 元素.
+* **垂直方向 (上下箭头):** 在包含子幻灯片的父 `<section>` 内部, 遍历其子 `<section>`.
+* **总页码:** 水平进度 + "." + 垂直进度, 如 `2.1` 表示第 2 组水平幻灯片的第 1 张垂直子页.
+
+这种二维结构非常适合有**章节分层**需求的演示. 例如, 每个大标题作为水平页, 其下的子内容作为垂直页.
+
+==== Fragment 动画系统
+
+Fragment 是 Reveal.js 最常用的交互特性之一. 其工作原理如下:
+
+. 为 HTML 元素添加 `class="fragment"`.
+. Reveal.js 为每个 fragment 元素生成一个序号 (`data-fragment-index`).
+. 页面加载时, 所有 fragment 元素默认不可见(或处于默认态).
+. 每次按下方向键(或点击)时, 按序号依次显示下一个 fragment.
+. 当所有 fragment 展示完毕后, 再次按方向键跳转到下一张幻灯片.
+
+[source,html]
+----
+<section>
+  <h2>核心优势</h2>
+  <p class="fragment">版本控制友好</p>
+  <p class="fragment">跨平台展示</p>
+  <p class="fragment">可定制性强</p>
+</section>
+----
+
+Reveal.js 提供了多种 fragment 类型, 通过额外的 CSS 类控制:
+
+* `fragment fade-out`: 淡出(默认是淡入)
+* `fragment highlight-red`: 高亮为红色
+* `fragment grow`: 放大
+* `fragment shrink`: 缩小
+* `fragment strike`: 添加删除线
+
+==== 插件架构
+
+Reveal.js 采用**插件化架构**, 核心库只负责基础渲染和导航, 扩展功能通过插件实现. 内置插件包括:
+
+|===
+|插件名称|功能
+
+|`highlight`
+|代码语法高亮, 基于 highlight.js
+
+|`markdown`
+|支持在 HTML 中使用 Markdown 语法编写幻灯片内容
+
+|`math`
+|数学公式渲染, 支持 KaTeX 或 MathJax
+
+|`notes`
+|演讲者笔记功能
+
+|`search`
+|演示过程中搜索文本
+
+|`zoom`
+|Alt+点击缩放幻灯片
+
+|`pdf`
+|将演示文稿导出为 PDF
+
+|===
+
+插件通过 `Reveal.initialize()` 的 `plugins` 数组注册:
+
+[source,js]
+----
+Reveal.initialize({
+  plugins: [RevealMarkdown, RevealHighlight, RevealNotes]
+})
+----
+
+==== 主题系统与 CSS 变量
+
+Reveal.js 使用 **CSS 变量**(Custom Properties)实现主题系统. 每个主题定义一组变量, 如 `--r-background-color`, `--r-heading-color`, `--r-main-font` 等. 用户可以通过覆盖这些变量轻松定制主题:
+
+[source,css]
+----
+/* 自定义主题 */
+.reveal {
+  --r-background-color: #1a1a2e;
+  --r-heading-color: #e94560;
+  --r-main-color: #eee;
+  --r-main-font: "Source Sans Pro", sans-serif;
+}
+----
+
+这种机制避免了复杂的 CSS 优先级覆盖, 使自定义主题变得简单可维护.
+
+==== 演示文稿导出为 PDF
+
+Reveal.js 提供了将演示文稿导出为 PDF 的能力, 其原理是:
+
+. 在 URL 后添加 `?print-pdf` 参数.
+. Reveal.js 会自动将所有幻灯片垂直排列, 每页一张.
+. 浏览器自带的"打印"功能(Ctrl+P)会将页面渲染为 PDF.
+. 在打印对话框中, 建议将"边距"设为"无"以去除额外留白.
+
+这一特性使得同一个 HTML 文件既可以做现场演示, 也可以生成 PDF 分发给观众.
+
+=== 工作流程与使用
+
+==== 快速开始
+
+. 下载或克隆 Reveal.js 仓库:
++
+[source,shell]
+----
+git clone https://github.com/hakimel/reveal.js.git
+----
+
+. 在 `index.html` 的 `<div class="slides">` 内编写幻灯片.
+. 打开浏览器访问该 HTML 文件, 或启动本地服务器:
++
+[source,shell]
+----
+npm start
+----
+
+==== API 与编程控制
+
+Reveal.js 通过全局 `Reveal` 对象提供编程接口, 支持通过 JavaScript 控制演示进程:
+
+[source,js]
+----
+// 初始化
+Reveal.initialize({
+  controls: true,      // 显示导航控件
+  progress: true,      // 显示进度条
+  history: true,       // 使用 URL hash 记录位置
+  center: true,        // 内容垂直居中
+  transition: "slide", // 过渡效果
+  autoSlide: 5000      // 自动翻页(毫秒)
+})
+
+// 导航控制
+Reveal.slide(3)           // 跳转到第 4 张(0-indexed)
+Reveal.left()             // 向左
+Reveal.right()            // 向右
+Reveal.up()               // 向上
+Reveal.down()             // 向下
+Reveal.next()             // 下一步
+Reveal.prev()             // 上一步
+Reveal.nextFragment()     // 下一个 fragment
+Reveal.prevFragment()     // 上一个 fragment
+
+// 事件监听
+Reveal.on("slidechanged", event => {
+  console.log("当前页:", event.indexh, event.indexv)
+})
+----
+
+==== 集成 Markdown 编写
+
+通过 `markdown` 插件, 可以在 `<section>` 中使用 `markdown` 属性来编写 Markdown 内容:
+
+[source,html]
+----
+<section data-markdown>
+  <textarea data-template>
+    ## 标题
+
+    * 项目 1
+    * 项目 2
+
+    > 引用内容
+  </textarea>
+</section>
+----
+
+这使得编写内容更加快捷, 尤其适合以文字为主的演示文稿.
+
+==== 大规模演示文件拆分
+
+对于大型演示, 所有幻灯片写在一个 HTML 文件中会导致难以维护. 推荐的做法:
+
+. 使用 `data-markdown` 属性指向外部 Markdown 文件:
++
+[source,html]
+----
+<section data-markdown="slides/intro.md"></section>
+<section data-markdown="slides/architecture.md"></section>
+----
+
+. 或使用构建工具(如 Gulp, Webpack)在构建阶段合并多个 HTML/Markdown 片段.
+
+这与软件工程中的"模块化"原则一致, 每个文件只关注一个主题.
+
+=== 优点与适用场景
+
+优点::
+
+* **版本控制友好:** 纯文本格式, 可直接用 Git 管理变更历史.
+* **跨平台:** 只要有浏览器即可展示, 无需安装特定软件.
+* **可定制性极强:** 全栈 Web 技术, 可实现任何视觉效果.
+* **在线分享便捷:** 部署到静态服务器即可通过 URL 分享.
+* **免费开源:** MIT 许可证, 可自由使用和修改.
+
+局限::
+
+* **学习曲线:** 需要一定的 HTML/CSS/JS 基础知识.
+* **排版编辑:** 调整元素位置需要写 CSS, 不如 GUI 工具直观.
+* **打印兼容:** 虽然支持 PDF 导出, 但复杂动画和透明效果在纸质输出时可能丢失.
+
+适用场景::
+
+* **技术分享与培训:** 开发者社区、内部技术讲座.
+* **开源项目文档:** 项目主页与 Presentation 合一.
+* **在线课程:** 嵌入网页的课件, 结合 iframe 演示代码.
+* **会议演讲:** 支持演讲者笔记和远程控制.
+
+=== 总结
+
+Reveal.js 将"演示"与"代码"两个世界连接起来. 它让开发者可以用自己熟悉的工具(编辑器、Git、命令行)来创建和维护演示文稿. 其核心价值在于:
+
+* **HTML 即幻灯片** - 用 `section` 元素组织内容, 结构清晰.
+* **插件化架构** - 功能按需加载, 核心轻量.
+* **CSS 变量主题** - 切换和定制主题成本极低.
+* **编程控制 API** - 可与其他 Web 应用深度集成.
+
+无论是个人技术分享, 还是团队内部培训, Reveal.js 都是一个高效、现代、可控的选择.

@@ -1,0 +1,302 @@
+== stainless原理讲解
+
+Stainless 是一个**API 开发生态平台**, 能从 OpenAPI 规范自动生成**地道、类型安全的 SDK**(支持 TypeScript, Python, Go, Java 等 8+ 语言)、**动态文档站点**(基于 Astro)以及 **Code Mode MCP 服务器**, 让 AI Agent 能像熟练工程师一样使用你的 API. 它由前 Stripe 代码生成团队创建, 客户包括 OpenAI, Cloudflare, Anthropic 等顶级 API 公司.
+
+Stainless 的核心理念: **一次定义 API 规范, 自动产出 SDK, 文档和 Agent 接口**, 彻底消除手动维护多个客户端库的痛苦.
+
+[[stainless-intro]]
+[plantuml, "Stainless 平台概览", format=png]
+----
+@startuml
+rectangle "OpenAPI Spec" as spec
+rectangle "Stainless 平台" as platform {
+  (SDK Generator) as sdk
+  (Docs Platform) as docs
+  (MCP Server) as mcp
+}
+database "npm/PyPI/Maven" as repos
+rectangle "开发者" as dev
+rectangle "AI Agent" as agent
+
+spec --> platform: 输入
+sdk --> repos: 自动发布
+sdk --> dev: 直接使用
+docs --> dev: 查阅文档
+mcp --> agent: Agent 调用
+@enduml
+----
+
+=== 什么是 Stainless
+
+Stainless(不锈钢):: 一个**规范驱动的 API 开发生态平台**, 由 Alex Rattray 于 2022 年初创立, 2026 年 5 月被 Anthropic 收购. 它能从 OpenAPI 3.x 规范自动生成高质量的 SDK, 开发者文档和 MCP 服务器.
+
+Stainless 解决的核心问题: **API 提供者需要为每个语言维护独立的 SDK, 成本极高且容易与 API 规范不同步**. 传统方案中, 要么手写 SDK(昂贵且难以维护), 要么使用通用代码生成器(生成粗劣的封装, 开发者体验差).
+
+[cols="2,3,3"]
+|===
+| 对比维度 | Otto/OpenAPI Generator | Stainless
+
+| 代码质量
+| 通用型封装, 类型信息缺失, 大量样板代码
+| **地道语言习惯**, 完整类型定义, 零样板代码
+| 可定制性
+| 需要写复杂的 mustache 模板
+| **直接编辑生成代码**, 下次生成时变更自动保留
+| 维护成本
+| 每次重新生成需手动合并定制逻辑
+| 通过 GitHub PR 自动发布更新, 定制代码自动合并
+| 语言支持
+| 30+ 语言(但质量参差不齐)
+| 8 种语言(每种都针对语言习惯深度优化)
+| 额外能力
+| 仅 SDK 生成
+| SDK + 文档平台 + MCP 服务器三合一
+|===
+
+Stainless 的团队此前在 Stripe 构建了业界知名的代码生成系统, 因此对"什么是优秀 SDK"有着深刻理解——**优质的 SDK 应该感觉像是该语言的专家手写的**.
+
+=== 核心原理: 规范驱动的代码生成
+
+Stainless 的工作模式基于 **OpenAPI 规范 → 内部 AST → 语言代码生成器** 的三层管道.
+
+==== 第一层: OpenAPI 规范解析
+
+Stainless 接受 OpenAPI 3.x 规范的 YAML/JSON 文件作为输入. 它会智能推断规范中的隐含模式:
+
+* 自动标准化命名规则(如 `snake_case` 在 Python 中, `camelCase` 在 TypeScript 中)
+* 自动检测认证方式(ApiKey, Bearer, OAuth 等)
+* 自动推断分页机制(游标分页、偏移分页)
+* 自动识别文件上传端点(multipart/form-data)
+* 自动识别 SSE 流式端点
+
+==== 第二层: 内部抽象语法树
+
+Stainless 将规范解析为内部 AST(抽象语法树), 这是所有下游生成的**单一事实源**. 开发者可以通过 `stainless.yaml` 配置文件在此层注入定制逻辑:
+
+[source,yaml]
+----
+# stainless.yaml
+organization:
+  name: taskninja
+targets:
+  typescript:
+    package_name: taskninja-ts
+    production_repo: taskninja/taskninja-ts
+    publish:
+      npm: true
+  python:
+    edition: python.2025-10-08
+    production_repo: stainless-sdks/taskninja-python
+    publish:
+      pypi: true
+resources:
+  accounts:
+    methods:
+      create: post /accounts  # 自定义方法映射
+client_settings:
+  idempotency:
+    header: "Idempotency-Key"  # 幂等性配置
+pagination:
+  - type: cursor               # 分页配置
+----
+
+==== 第三层: 多语言代码生成器
+
+Stainless 为每种支持的语言维护独立的代码生成器, 确保输出**地道的语言习惯**:
+
+[source,typescript]
+----
+// Stainless 生成的 TypeScript SDK - 简洁、类型安全
+import { APIResource } from '../core/resource';
+import { APIPromise } from '../core/api-promise';
+import { RequestOptions } from '../internal/request-options';
+
+export class PetResource extends APIResource {
+  update(body: PetUpdateParams, options?: RequestOptions): APIPromise<Pet> {
+    return this._client.put('/pet', { body, ...options });
+  }
+}
+----
+
+对比传统生成器:
+
+[source,typescript]
+----
+// 传统代码生成器 - 大量样板代码, 难以阅读和维护
+export class PetApi {
+  protected _basePath = defaultBasePath;
+  protected defaultHeaders: any = {};
+  protected _useQuerystring: boolean = false;
+  // ... 数十行认证、序列化、请求构建代码
+  public updatePet(body: Pet, options: any = {}): Promise<{ response: http.ClientResponse; body?: any; }> {
+    const localVarPath = this.basePath + '/pet';
+    let localVarQueryParameters: any = {};
+    let localVarHeaderParams: any = Object.assign({}, this.defaultHeaders);
+    // ... 大量模板代码
+  }
+}
+----
+
+=== 三大核心产品
+
+Stainless 围绕 API 开发生态提供三个核心产品: **SDK Generator**, **Docs Platform** 和 **MCP Server**.
+
+==== SDK Generator: 自动生成地道 SDK
+
+SDK Generator 是 Stainless 的旗舰产品, 支持 TypeScript, Python, Go, Java, Kotlin, Ruby, C#, PHP 共 8 种语言. 其核心竞争力包括:
+
+流式(Streaming)支持:: 对 SSE 流式端点提供一等支持, 开发者可以用 `for await...of` 直接消费流
+
+[source,typescript]
+----
+const stream = await client.responses.create({
+  model: 'gpt-5',
+  input: 'Hello!',
+  stream: true,
+});
+for await (const event of stream) {
+  console.log(event);
+}
+----
+
+自动分页:: 为游标和偏移分页生成自动迭代器
+
+[source,python]
+----
+async def main() -> None:
+    # 自动迭代所有页, 无需手动处理翻页
+    async for card in client.cards.list():
+        print(card.id)
+----
+
+文件上传:: 支持 multipart/form-data 文件上传及进度跟踪
+
+Webhook 验证:: 自动验证 webhook 签名并解析负载
+
+类型安全:: 全类型定义, 编译期即可捕获 API 错误
+
+==== Docs Platform: 动态 API 文档平台
+
+Docs Platform 基于 **Astro** 框架构建, 能够自动从 OpenAPI 规范生成与 SDK 同步的开发者文档站点.
+
+* 基于 Astro 开源框架, 支持 React, Svelte, Vue 等 UI 框架自定义
+* AI 驱动的混合搜索, 支持复制为 Markdown 和 `llms.txt` 生成
+* 支持 CSS 变量主题定制和 Tailwind 集成
+* 可部署在 Stainless 托管(Cloudflare 全球网络)或自托管(Vercel, Fly.io 等)
+* 通过 Astro 集成钩子和中间件实现无限可扩展性
+
+==== MCP Server: Code Mode 智能接口
+
+这是 Stainless 最创新的产品, 详见下节.
+
+=== SDK Code Mode: 重新定义 MCP 服务器
+
+Stainless 的 Code Mode 是其 MCP 服务器的核心创新, 解决了传统 MCP 服务器的一个根本性问题: **工具爆炸**.
+
+==== 传统 MCP 的问题
+
+大多数 MCP 服务器采用"每端点一工具"的模式:
+
+[source,json]
+----
+{
+  "tools": [
+    { "name": "list_incidents", "description": "列出事件" },
+    { "name": "get_incident", "description": "获取事件详情" },
+    { "name": "create_incident", "description": "创建事件" },
+    { "name": "update_incident", "description": "更新事件" },
+    { "name": "delete_incident", "description": "删除事件" },
+    // ... 数百个工具定义
+  ]
+}
+----
+
+这导致两个严重问题:
+
+1. **上下文窗口膨胀**: 数百个工具定义占满大模型的上下文, 留给实际问题的空间所剩无几
+2. **认知负担大**: Agent 需要在数百个工具中选择正确的一个, 决策路径过长
+
+==== Code Mode 的方案
+
+Stainless Code Mode 反其道而行, 只暴露**两个工具**:
+
+[source,json]
+----
+{
+  "tools": [
+    {
+      "name": "search_docs",
+      "description": "搜索 SDK 文档, 理解 API 的方法、参数和示例"
+    },
+    {
+      "name": "execute",
+      "description": "在安全沙箱中执行 TypeScript 代码, 使用 Stainless 生成的 SDK"
+    }
+  ]
+}
+----
+
+==== Code Mode 的工作流程
+
+. **连接与初始化**: Agent 连接 MCP Server, 获取两个工具和简单的启动指引(认证方式, SDK 设置, 常见模式)
+. **理解目标**: Agent 分析用户请求, 确定需要哪些信息(实体、资源、过滤器、期望输出)
+. **搜索文档**: Agent 调用 `search_docs` 精确定位相关 SDK 方法、参数签名和代码示例
+. **编写代码**: Agent 使用搜索结果编写 TypeScript 代码, 调用 SDK 完成任务
+. **执行与迭代**: Server 先做类型检查, 然后在 Cloudflare Workers 沙箱中执行, 返回结果或错误信息; Agent 根据错误修正代码并重试
+. **返回答案**: Agent 将执行结果汇总为用户友好的回答, 仅返回提炼后的输出(如计数、ID、总计、链接)
+
+[[code-mode-flow]]
+[plantuml, "Code Mode 工作流程", format=png]
+----
+@startuml
+actor 用户 as User
+participant "AI Agent" as Agent
+participant "Stainless MCP Server" as Server
+participant "SDK 文档" as Docs
+participant "Cloudflare Worker" as Sandbox
+
+User -> Agent: 查询需求
+Agent -> Server: 调用 search_docs("查询关键词")
+Server -> Docs: 搜索 SDK 文档
+Docs --> Server: 返回方法签名和示例
+Server --> Agent: 返回文档结果
+Agent -> Agent: 编写 TypeScript 代码
+Agent -> Server: 调用 execute(code)
+Server -> Sandbox: 类型检查 + 沙箱执行
+Sandbox --> Server: 返回结果
+Server --> Agent: 返回执行结果
+Agent -> User: 给出最终答案
+@enduml
+----
+
+==== Code Mode 的优势
+
+根据 Stainless 官方数据, Code Mode 相比传统 MCP 方案:
+
+* **任务准确率 94-97%**: Agent 使用地道 SDK 编写代码, 而非猜测端点参数
+* **工具调用减少 3 倍**: 无需在多步骤中发现和选择工具
+* **节省 10 万+ tokens**: 上下文窗口不会因数百个工具定义而膨胀
+* **随 API 规模可扩展**: 无论 API 有 10 个还是 1000 个端点, Code Mode 的性能恒定——Agent 通过 `search_docs` 按需发现所需方法, 而非一次性加载所有端点
+
+=== Stainless 加入 Anthropic
+
+2026 年 5 月 18 日, Stainless 宣布**加入 Anthropic**. 创始人 Alex Rattray 表示, AI 已经深刻改变了软件创建和使用方式, Stainless 的使命——将一流的开发者体验带给每家公司——在 Anthropic 能够更好地实现.
+
+对于现有客户:
+
+* 生成的 SDK 和文档的所有权完全归客户, 可继续自由修改和扩展
+* 托管产品将逐步关闭, 客户可访问 `app.stainless.com/transition` 获取迁移指引
+* Stainless 团队将专注于 Claude Platform 的能力建设, 特别是连接 Agent 与外部 API
+
+据估计, **全球约四分之一的专业软件开发人员**曾使用过 Stainless 生成的 SDK 或访问过其创建的文档站点.
+
+=== 总结
+
+Stainless 的核心理念对 API 经济和 AI Agent 生态有深远影响:
+
+* **规范驱动的一次定义、多端产出**: 从 OpenAPI 规范自动生成 SDK, 文档和 MCP 服务器
+* **代码质量优先**: 每个语言的生成器深度优化, 输出地道、类型安全的客户端库
+* **Code Mode 创新**: 以"让 Agent 写代码"替代"让 Agent 选工具", 从根本上解决了 MCP 的工具爆炸问题
+* **被 Anthropic 收购**: 其技术和团队将融入 Claude Platform, 持续改进 Agent 与外部 API 的连接体验
+
+对于正在构建 API 的团队, Stainless 的方法论——**以规范为核心, 自动产出优质开发者体验**——即使在产品转型后, 其设计思想仍然值得借鉴.

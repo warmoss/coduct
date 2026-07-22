@@ -1,0 +1,85 @@
+== 欧几里得算法讲解
+
+**欧几里得算法**(又称**辗转相除法**)是计算两个正整数最大公约数(GCD)的高效方法, 由古希腊数学家欧几里得在其著作《几何原本》中首次系统阐述.
+
+=== 核心思想
+
+* **基本原理:** 两个整数的最大公约数等于其中较小的数和两数相除余数的最大公约数.
+
+* **用公式表示:**
+
+[stem]
+++++
+gcd(a, b) = {
+    (|a|, if b = 0 and a in ZZ),
+    (gcd(b, a mod b), if b != 0 and a >= b and a in ZZ and b in ZZ)
+:}
+++++
+
+=== 数学证明
+
+==== 定理
+
+两个整数的最大公约数等于其中较小的那个数和两数相除余数的最大公约数
+
+==== 证明
+
+stem:[gcd(a, b) = gcd(b, a mod b), a >= b, a in ZZ, b in ZZ, b != 0]
+
+. stem:[a >= b, a in ZZ, b in ZZ, b != 0]
+. => stem:[a // b = k ... r, r = a mod b]
+. => stem:[a = kb + r]
+. => stem:[r = a - kb]
+. 设 stem:[d = gcd(a, b)]
+. => stem:[d|a, d|b]
+. => 因为 stem:[r = a - kb] 所以 stem:[d|r]
+. => stem:[gcd(b, r) = d]
+. => stem:[gcd(b, r) = gcd(b, a mod b) = d = gcd(a, b)]
+. => stem:[gcd(a, b) = gcd(b, a mod b)]
+
+=== 算法实现
+
+==== 递归
+
+[source, python]
+----
+def gcd(a, b):
+    if b == 0:
+        return a
+    else:
+        return gcd(b, a % b)
+----
+
+==== 迭代
+
+[source, python]
+----
+def gcd(a, b):
+    while b != 0:
+        a, b = b, a % b
+    return a
+----
+
+=== 扩展应用
+
+* **求解线性丢番图方程:** 扩展欧几里得算法可求解 stem:[ax + by = gcd(a, b)] 的整数解.
+
+* **约简分数:** 用最大公约数化简分子分母.
+
+* **模运算中的逆元:** 若 stem:[gcd(a, m) = 1], 则 stem:[a] 在模 stem:[m] 下有乘法逆元.
+
+=== 时间复杂度
+
+算法的时间复杂度为 stem:[O(log min(a, b))] 因为余数至少每两步减半, 效率极高.
+
+=== 注意事项
+
+. 输入应为**非负整数**, 负数的GCD可取其绝对值
+
+. stem:[gcd(0, 0)] 通常定义为0(有些定义未定义)
+
+. stem:[gcd(a, 0) = |a|](任何数与0的最大公约数是其绝对值)
+
+=== 总结
+
+欧几里得算法利用"余数替换"的递归性质, 将求解最大公约数问题简化为更小规模的相同问题, 是数论和计算数学的基础算法之一.

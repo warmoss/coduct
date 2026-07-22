@@ -1,0 +1,173 @@
+== MySQL排序规则讲解
+
+=== 什么是排序规则?
+排序规则(Collation)定义了字符串数据在比较和排序时的规则. 它决定了:
+
+* 字符的排序顺序
+
+* 字符比较时是否区分大小写
+
+* 字符比较时是否区分重音符号
+
+=== 字符集与排序规则的关系
+字符集(Character Set)定义可用的字符, 而排序规则定义这些字符的排序和比较方式.
+
+[source, sql, linenums]
+----
+-- 查看支持的字符集和排序规则
+SHOW CHARACTER SET;
+SHOW COLLATION;
+
+-- 查看特定字符集的排序规则
+SHOW COLLATION LIKE 'utf8mb4%';
+----
+
+=== 常见的排序规则类型
+
+==== 按语言区分
+
+* utf8mb4_general_ci: 通用规则, 性能较好
+
+* utf8mb4_unicode_ci: 基于Unicode标准, 更准确
+
+* utf8mb4_chinese_ci: 中文排序规则
+
+==== 按敏感性区分
+
+* _ci: 不区分大小写(Case Insensitive)
+
+* _cs: 区分大小写(Case Sensitive)
+
+* _bin: 二进制比较
+
+=== 排序规则的命名规则
+[source, text, linenums]
+----
+字符集_语言_敏感性
+----
+
+例如: utf8mb4_unicode_ci
+
+* utf8mb4: 字符集
+
+* unicode: 基于Unicode标准
+
+* ci: 不区分大小写
+
+=== 排序规则的影响示例
+
+==== 大小写敏感性
+
+[source, sql, linenums]
+----
+-- 使用不区分大小写的排序规则
+CREATE TABLE users_ci (
+    name VARCHAR(50)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+INSERT INTO users_ci VALUES ('John'), ('john'), ('JOHN');
+
+-- 所有记录都会被找到
+SELECT * FROM users_ci WHERE name = 'john';
+-- 返回: John, john, JOHN
+----
+
+[source, sql, linenums]
+----
+-- 使用区分大小写的排序规则
+CREATE TABLE users_cs (
+    name VARCHAR(50)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_cs;
+
+INSERT INTO users_cs VALUES ('John'), ('john'), ('JOHN');
+
+-- 只会找到完全匹配的记录
+SELECT * FROM users_cs WHERE name = 'john';
+-- 返回: john
+----
+
+==== 排序顺序差异
+
+[source, sql, linenums]
+----
+-- 创建测试数据
+CREATE TABLE test_sort (
+    word VARCHAR(20)
+) CHARACTER SET utf8mb4;
+
+-- 插入测试数据
+INSERT INTO test_sort VALUES 
+('apple'), ('Apple'), ('APPLE'),
+('banana'), ('Banana'),
+('cherry');
+
+-- 使用不同排序规则查询
+SELECT word FROM test_sort 
+ORDER BY word COLLATE utf8mb4_unicode_ci;
+-- 结果可能: apple, Apple, APPLE, banana, Banana, cherry
+
+SELECT word FROM test_sort 
+ORDER BY word COLLATE utf8mb4_bin;
+-- 结果可能: APPLE, Apple, apple, Banana, banana, cherry
+----
+
+=== 设置排序规则
+
+==== 服务器级别
+
+[source, sql, linenums]
+----
+-- 查看当前设置
+SHOW VARIABLES LIKE 'character_set_server';
+SHOW VARIABLES LIKE 'collation_server';
+
+-- 在配置文件中设置
+[mysqld]
+character-set-server=utf8mb4
+collation-server=utf8mb4_bin
+----
+
+==== 数据库级别
+
+[source, sql, linenums]
+----
+CREATE DATABASE mydb 
+CHARACTER SET utf8mb4 
+COLLATE utf8mb4_bin;
+
+-- 修改现有数据库
+ALTER DATABASE mydb 
+CHARACTER SET utf8mb4 
+COLLATE utf8mb4_bin;
+----
+
+=== 性能考虑
+
+* _general_ci: 性能较好, 但准确性稍差
+
+* _unicode_ci: 准确性更好, 但性能稍差
+
+* _bin: 性能最好, 但严格区分大小写和重音
+
+=== 最佳实践
+
+. **一致性:** 在整个应用中使用统一的排序规则
+
+. **根据需求选择:**
+
+** 需要大小写不敏感: 使用 _ci
+
+** 需要精确匹配: 使用 _cs 或 _bin
+
+** 多语言支持: 使用 utf8mb4_unicode_ci
+
+. **中文环境推荐:**
+
+[source, sql, linenums]
+----
+-- 对于中文应用推荐使用
+CHARACTER SET utf8mb4 COLLATE utf8mb4_bin
+----
+
+=== 总结
+掌握排序规则对于确保数据库查询的正确性和性能非常重要，特别是在多语言环境和复杂的字符串比较场景中

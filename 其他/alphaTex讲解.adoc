@@ -1,0 +1,377 @@
+== alphaTab 的 alphaTex 讲解
+
+alphaTab 是一个跨平台的乐谱渲染库, 支持将 MusicXML、Guitar Pro 和 alphaTex 格式渲染为可视化乐谱. 其中, alphaTex 是一种纯文本标记语言, 专为快速编写和分享乐谱而设计. 本文深入讲解 alphaTex 的语法体系、核心概念及其工作原理.
+
+=== 什么是 alphaTex
+
+alphaTex:: alphaTab 团队设计的**纯文本乐谱标记语言**, 灵感来源于 ASCII Tab 和 LilyPond, 旨在提供一种简洁、人类可读的文本来描述五线谱和六线谱(指板谱).
+MusicXML:: 标准的乐谱交换格式, 基于 XML, 描述能力强但冗长, 适合工具间互操作.
+Guitar Pro:: 商业吉他谱格式(GP3/GP4/GP5/GPX), 包含指法、拨弦方向等丰富信息.
+
+alphaTex 的核心定位是**开发者友好型乐谱描述语言** -- 它不需要图形编辑工具, 用任何文本编辑器即可编写, 适合嵌入到 Web 应用、生成式乐谱场景中.
+
+[NOTE]
+====
+alphaTab 是开源项目(MIT 许可证), 支持 JavaScript、C#、Java、Swift 等多平台. alphaTex 作为其原生格式, 是 alphaTab 生态中最轻量的乐谱输入方式.
+====
+
+=== 核心语法体系
+
+alphaTex 的语法围绕"轨道(Track)"、"小节(Bar)"、"音符(Note)"三层结构组织.
+
+==== 轨道与乐器
+
+一个乐谱文件包含一个或多个轨道, 每个轨道对应一种乐器. 使用 `track` 关键字定义新轨道:
+
+[source,alphaTex]
+----
+track "Guitar" tuning "E2 A3 D4 G4 B4 E4" // <1>
+track "Piano"                              // <2>
+----
+<1> 定义吉他轨道, 并指定调弦
+<2> 定义钢琴轨道, 使用默认调弦(钢琴为 C 大调)
+
+支持的乐器名称包括 `Piano`、`Guitar`、`Bass`、`Drums`、`Violin` 等, 对应 General MIDI 标准.
+
+==== 调弦与变调夹
+
+`tuning` 属性指定弦乐器的调弦, 使用空格分隔的音名:
+
+[source,alphaTex]
+----
+track "Guitar" tuning "E2 A3 D4 G4 B4 E4" // 标准调弦
+track "Drop D" tuning "D2 A3 D4 G4 B4 E4"  // Drop D 调弦
+----
+
+`capo` 属性指定变调夹位置:
+
+[source,alphaTex]
+----
+track "Capo 3" tuning "E2 A3 D4 G4 B4 E4" capo 3
+----
+
+==== 小节与拍号
+
+小节是乐谱的基本时间单位. 使用 `|` 分隔各个小节:
+
+[source,alphaTex]
+----
+track "Guitar"
+  tuning "E2 A3 D4 G4 B4 E4"
+  // 4/4 拍, 4个小节
+  | A B C D | E F G A | B C D E | F G A B |
+----
+
+拍号(Time Signature)使用 `time` 属性设置:
+
+[source,alphaTex]
+----
+track "Piano"
+  time 4 4  // 4/4 拍
+  | C D E F | G A B C |
+----
+
+默认拍号为 4/4. 支持 `time 3 4`(3/4 拍)、`time 6 8`(6/8 拍)等复合拍号.
+
+==== 音符表示
+
+音符通过**音名 + 八度 + 时值**组合描述.
+
+*音名映射:* `C` = Do, `D` = Re, `E` = Mi, `F` = Fa, `G` = Sol, `A` = La, `B` = Si
+*八度标注:* 数字后缀表示八度, 如 `C4` 为中央 C
+*升降号:* `#` 表示升号, `b` 表示降号, 如 `C#4`、`Bb3`
+
+[source,alphaTex]
+----
+| C4 D4 E4 F4 | G4 A4 B4 C5 | // 上行音阶, 四分音符
+----
+
+==== 时值与休止符
+
+时值通过数字后缀表示:
+
+[source,alphaTex]
+----
+| C4 D4 E4 F4 |   // 四分音符(默认时值)
+| C4/2 D4/2 |     // 二分音符
+| C4/4 D4/4 |     // 四分音符(显式指定)
+| C4/8 D4/8 |     // 八分音符
+| C4/16 D4/16 |   // 十六分音符
+----
+
+休止符使用 `_`(下划线)表示:
+
+[source,alphaTex]
+----
+| C4 _ D4 _ | // 四分音符、四分休止、四分音符、四分休止
+----
+
+[cols="2*"]
+|===
+| 语法 | 含义
+| `C4/2` | 二分音符, 持续 2 拍
+| `C4/4` | 四分音符, 持续 1 拍
+| `C4/8` | 八分音符, 持续 0.5 拍
+| `C4/16` | 十六分音符, 持续 0.25 拍
+| `_` | 休止符, 默认时值
+| `_/8` | 八分休止符
+|===
+
+==== 附点与三连音
+
+附点音符在时值后加 `.`:
+
+[source,alphaTex]
+----
+| C4/4. D4/8 | // 附点四分音符 + 八分音符
+----
+
+三连音使用 `t` 前缀:
+
+[source,alphaTex]
+----
+| t C4/8 D4/8 E4/8 | // C-D-E 三连音
+----
+
+==== 和弦
+
+和弦通过花括号 `{}` 包裹多个音:
+
+[source,alphaTex]
+----
+| {C4 E4 G4} /2 | // C 大三和弦, 二分音符
+| {F4 A4 C5} /4 | // F 大三和弦, 四分音符
+----
+
+和弦内的每个音可以单独指定八度、升降号和时值.
+
+==== 指法谱(六线谱)
+
+alphaTex 的特色之一是**同时支持五线谱和六线谱**. 六线谱上的数字表示品数(Fret), 字母表示弦号:
+
+[source,alphaTex]
+----
+| .3/6 .0/5 .2/4 .0/3 .1/2 .0/1 | // 标准 E 和弦指法
+----
+
+语法解析: `.` 表示指法谱音符, 数字前为品数, `/` 后为弦号. 上例表示: 6 弦 3 品、5 弦空弦、4 弦 2 品、3 弦空弦、2 弦 1 品、1 弦空弦.
+
+[source,alphaTex]
+----
+| .3/6 .3/5 .0/4 .0/3 .0/2 .3/1 | // G 和弦
+----
+
+==== 节奏与速度
+
+速度(BPM)使用 `tempo` 设置:
+
+[source,alphaTex]
+----
+track "Guitar"
+  tempo 120
+  | C4 D4 E4 F4 |
+----
+
+摇摆节奏使用 `swing`:
+
+[source,alphaTex]
+----
+track "Guitar"
+  swing 0.3           // 摇摆程度 0.0-1.0
+  | C4/8 D4/8 E4/8 F4/8 |
+----
+
+==== 演奏记号
+
+alphaTex 支持丰富的演奏记号, 通过前缀修饰符表示:
+
+[source,alphaTex]
+----
+| h C4/8 D4/8 |   // 锤弦(Hammer-on)
+| p D4/8 C4/8 |   // 勾弦(Pull-off)
+| s C4/8 D4/8 |   // 滑弦(Slide)
+| b C4/8 D4/8 |   // 推弦(Bend)
+| v C4/8 D4/8 |   // 揉弦(Vibrato)
+| t C4/8 D4/8 |   // 点弦(Tap)
+| m C4/8 D4/8 |   // 闷音(Mute)
+----
+
+[cols="3*"]
+|===
+| 修饰符 | 含义 | 说明
+| `h` | Hammer-on | 上行连音, 右手不弹
+| `p` | Pull-off | 下行连音, 左手勾弦
+| `s` | Slide | 在同一弦上滑动
+| `b` | Bend | 推弦, 改变音高
+| `v` | Vibrato | 揉弦, 音高波动
+| `t` | Tap | 点弦, 手指击弦
+| `m` | Mute | 闷音, 手掌制音
+|===
+
+==== 歌词
+
+歌词通过 `lyrics` 块附加到音符上:
+
+[source,alphaTex]
+----
+track "Voice"
+| C4 D4 E4 F4 |
+lyrics "你" "好" "世" "界" // 每词对应一个音符
+----
+
+==== 重复与跳跃记号
+
+alphaTex 支持常见乐谱重复记号:
+
+[source,alphaTex]
+----
+// 反复记号: || 表示反复开始, |] 表示反复结束
+| C4 D4 E4 F4 || G4 A4 B4 C5 |]
+
+// 跳房子(Volta): [1 表示第一遍, [2 表示第二遍
+| C4 D4 E4 F4 [1 G4 A4 B4 C5 [2 F4 E4 D4 C4 |]
+
+// D.C. 和 D.S.
+| C4 D4 E4 F4 | $ G4 A4 B4 C5 | dc // 从头反复至 Fine
+----
+
+=== 工作流程
+
+alphaTab 将 alphaTex 渲染为乐谱的过程分为三个阶段:
+
+[plantuml, "alphaTab 渲染 alphaTex 的工作流程", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+skinparam componentStyle rectangle
+
+rectangle "alphaTex 源码" as source
+rectangle "词法/语法解析" as parse
+rectangle "抽象语法树(AST)" as ast
+rectangle "乐谱模型" as model
+rectangle "渲染引擎" as render
+rectangle "Canvas/SVG 乐谱" as output
+
+source --> parse : 文本输入
+parse --> ast : 语法分析
+ast --> model : 语义转换
+model --> render : 布局计算
+render --> output : 绘制输出
+
+note right of parse
+  分词(Tokenize)
+  语法树构建
+  错误检测
+end note
+
+note right of render
+  页布局
+  符干方向
+  连音线绘制
+  指法标注
+end note
+@enduml
+----
+
+. 词法/语法解析阶段: alphaTex 解析器将文本拆分为 Token 序列, 按文法规则构建抽象语法树(AST). 此阶段检测语法错误, 如未闭合的花括号、未知修饰符等.
+. 语义转换阶段: AST 被转换为 alphaTab 内部乐谱模型(`Score`), 包含轨道、小节、音符、演奏记号等结构化数据. 此阶段应用默认值(如缺省时值、缺省八度).
+. 渲染阶段: 乐谱模型传递给渲染引擎, 引擎根据当前设置(页面宽度、字体、样式)计算布局并绘制到 Canvas 或 SVG 上.
+
+=== 综合示例
+
+以下是一个完整的 alphaTex 示例, 演示吉他独奏片段:
+
+[source,alphaTex]
+----
+track "Acoustic Guitar"
+  tuning "E2 A3 D4 G4 B4 E4"
+  tempo 100
+  time 4 4
+
+// 小节 1: Am 和弦分解
+| .0/5 .1/4 .0/3 .2/2 .3/1 _/8 |
+
+// 小节 2: 音阶上行
+| .3/6 .0/5 .2/4 .3/3 .0/2 .1/1 .3/6 .0/5 |
+
+// 小节 3: 推弦与滑弦
+| b .3/6/4 .0/5 s .2/4/5 .3/3 |
+
+// 小节 4: 和弦扫弦
+| {.0/5 .1/4 .0/3 .2/2 .3/1} /2 {.3/6 .2/5 .0/4 .0/3 .0/2 .3/1} /2 |
+----
+
+解析说明:
+
+. `track "Acoustic Guitar"` -- 定义原声吉他轨道
+. `tuning "E2 A3 D4 G4 B4 E4"` -- 标准吉他调弦(从 6 弦到 1 弦)
+. `.0/5` -- 5 弦空弦(A 音)
+. `b .3/6/4` -- 在 6 弦 3 品推弦, 推高 4 个半音(全音)
+. `{.0/5 .1/4 .0/3 .2/2 .3/1} /2` -- 5-1 弦组成 Am 和弦, 持续 2 拍
+
+=== 高级特性
+
+==== 自定义指法
+
+可通过括号标注左右手指法:
+
+[source,alphaTex]
+----
+| C4(p1) D4(p2) E4(p3) F4(p4) | // p1-p5 表示右手指法
+| C4(f1) D4(f2) E4(f3) F4(f4) | // f1-f5 表示左手指法
+----
+
+==== 力度标记
+
+通过 `!` 前缀标注力度:
+
+[source,alphaTex]
+----
+| !pp C4 !mf D4 !ff E4 | // pp=极弱, mf=中强, ff=最强
+----
+
+常用力度标记: `ppp`(极弱)、`pp`、`p`(弱)、`mp`、`mf`、`f`(强)、`ff`、`fff`(极强).
+
+==== 装饰音
+
+装饰音使用 `g`(Grace) 前缀:
+
+[source,alphaTex]
+----
+| g C4/8 D4/4 | // C4 为装饰音, D4 为主音
+----
+
+==== 多声部
+
+同一轨道内通过声部(S voice)编号实现多声部:
+
+[source,alphaTex]
+----
+track "Piano"
+  S1 | C4 E4 G4 C5 |  // 高声部(右手)
+  S2 | C3 G3 C4    |  // 低声部(左手)
+----
+
+=== 最佳实践与注意事项
+
+* 使用显式八度: 即使默认八度可用, 标注明确八度可减少歧义, 提高可读性
+* 分层编写: 先写出音符序列, 再添加演奏记号, 最后调整时值和细节
+* 合理使用和弦: 对于密集和弦, 优先使用 `{}` 语法而非逐个音符编写
+* 轨道命名清晰: 即使单轨道, 也建议明确命名乐器类型, 以便后期扩展
+* 注释先行: 对复杂段落使用 `//` 注释说明演奏意图
+
+[WARNING]
+====
+alphaTex 是 alphaTab 的原生格式, **不适用于其他乐谱引擎**. 如需最大兼容性, 可考虑同时维护 MusicXML 版本, 或使用 alphaTab 的导出功能将 alphaTex 转换为 MusicXML.
+====
+
+=== 总结
+
+alphaTex 提供了一种轻量、高效的方式来描述乐谱, 特别适合嵌入到 Web 应用和开发者工作流中. 其核心优势在于:
+
+* **纯文本可读** -- 无需专用编辑器, Git 友好
+* **双谱支持** -- 同时描述五线谱和六线谱, 适合吉他/贝斯等弦乐器
+* **丰富表现力** -- 支持和弦、演奏记号、力度、装饰音等专业音乐符号
+* **实时渲染** -- alphaTab 引擎提供毫秒级渲染, 适合交互式应用
+
+对于需要动态生成乐谱或嵌入式乐谱展示的场景, alphaTex 是目前最简洁高效的解决方案之一.

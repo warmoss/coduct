@@ -1,0 +1,239 @@
+== OAuth2.1原理讲解
+
+=== 什么是OAuth2.1
+
+定义:: OAuth2.1 是 OAuth 2.0 的**整合与精简版本**, 由 IETF 在 2020 年以草案形式发布(目前为 draft-05), **不是**一个全新的协议, 而是**废弃 OAuth 2.0 中的不安全模式**, 保留并强化安全最佳实践.
+
+目的:: 为第三方应用提供**安全的授权委托**机制, 允许用户授权第三方应用访问其存储在资源服务器上的数据, 而无需将用户名和密码直接交给第三方.
+
+与 OAuth 2.0 的关系::
+* OAuth 2.1 **向后不兼容** OAuth 2.0, 废弃了多种不安全流程
+* **不再支持** 隐式模式(Implicit Grant)和资源拥有者密码凭证模式(Password Grant)
+* **强制要求** PKCE(Proof Key for Code Exchange) 用于授权码模式
+* **强化** 了重定向 URI 的校验和刷新令牌的安全要求
+
+=== 核心角色
+
+OAuth2.1 定义了四个核心角色:
+
+资源拥有者(Resource Owner):: 通常是**用户**, 拥有受保护资源的访问权限, 可以授权第三方应用访问其资源.
+
+客户端(Client):: 需要访问用户资源的**第三方应用**, 可以是 Web 应用、单页应用、移动应用或服务端应用.
+
+授权服务器(Authorization Server):: 负责**认证用户身份**并**发放令牌**的服务器, 在用户同意后向客户端颁发访问令牌.
+
+资源服务器(Resource Server):: **托管受保护资源**的服务器, 需要验证访问令牌的有效性后才允许访问资源.
+
+=== 授权流程
+
+OAuth2.1 核心推荐的是**授权码流程(Authorization Code Flow)** + **PKCE**. 这是 OAuth2.1 中最重要的流程.
+
+==== 授权码流程(Authorization Code Flow)
+
+授权码流程专为**有安全后端**的客户端(如传统 Web 应用)设计, 经过优化后也能通过 PKCE 安全地用于**无后端的客户端**(如单页应用和移动应用).
+
+[source, plaintext, linenums]
+----
++--------+                               +---------------+
+|        |--(A) 授权请求 --------------->|               |
+|        |                               |               |
+|        |<-(B) 授权码 ------------------|               |
+|        |                               |   授权服务器  |
+| 客户端 |--(C) 授权码 + PKCE验证 ---->|               |
+|        |                               |               |
+|        |<-(D) 访问令牌 + 刷新令牌 -----|               |
+|        |                               +---------------+
+|        |                                     |
+|        |--(E) 使用访问令牌访问资源 ----->    |
+|        |                               +---------------+
+|        |<-(F) 返回受保护资源 ------------|  资源服务器   |
++--------+                               +---------------+
+----
+
+流程步骤详解:
+
+. **客户端发起授权请求:**
+* 客户端将用户重定向到授权服务器的授权端点
+* 请求包含: `client_id`, `redirect_uri`, `response_type=code`, `scope` 以及 `code_challenge`(PKCE)
+* 如果使用 PKCE, 客户端还需生成 `code_verifier` 并计算其 SHA-256 哈希值作为 `code_challenge`
+
+. **用户认证与授权:**
+* 授权服务器要求用户登录并确认授权
+* 用户同意授权后, 授权服务器将用户重定向回客户端指定的 `redirect_uri`
+* 重定向 URL 中附带一个一次性使用的**授权码(authorization code)**
+
+. **客户端换取令牌:**
+* 客户端使用授权码向授权服务器的令牌端点发起 POST 请求
+* 请求包含: `client_id`, `client_secret`(机密客户端), `code`, `redirect_uri`, `code_verifier`(PKCE)
+* 授权服务器验证 `code_verifier` 与之前收到的 `code_challenge` 匹配
+* 验证通过后, 返回 `access_token`(访问令牌)和可选的 `refresh_token`(刷新令牌)
+
+. **访问资源:**
+* 客户端在请求资源服务器的 API 时, 在 HTTP 头中携带访问令牌: `Authorization: Bearer <access_token>`
+* 资源服务器验证令牌的有效性和作用域后, 返回受保护资源
+
+==== PKCE 机制详解
+
+PKCE(读作 "pixie") 是 OAuth2.1 中**强制要求**的安全机制, 用于防止授权码拦截攻击.
+
+[source, plaintext, linenums]
+----
+客户端                             授权服务器
+  |                                     |
+  |-- 1. 生成 code_verifier ----------->|
+  |    (随机字符串, 43~128字符)          |
+  |                                     |
+  |-- 2. 计算 code_challenge ---------->|
+  |    = BASE64URL(SHA256(code_verifier))|
+  |                                     |
+  |-- 3. 发送包含 code_challenge 的 --->|
+  |    授权请求                         |
+  |                                     |
+  |<-- 4. 返回授权码 ------------------|
+  |                                     |
+  |-- 5. 发送 code + code_verifier ---->|
+  |    至令牌端点                       |
+  |                                     |
+  |    6. 验证 SHA256(code_verifier)    |
+  |    == code_challenge                |
+  |                                     |
+  |<-- 7. 返回访问令牌 ----------------|
+  |                                     |
+----
+
+关键点::
+* 即使授权码被恶意应用拦截, 由于攻击者不知道 `code_verifier`, 也无法完成令牌交换
+* `code_verifier` 是客户端生成的**高熵随机字符串**, 仅存储在客户端本地
+* OAuth2.1 **强制**所有类型的客户端使用 PKCE
+
+=== 令牌类型
+
+==== 访问令牌(Access Token)
+
+定义:: 用于访问受保护资源的**凭证**, 通常是 **JWT(JSON Web Token)** 格式或**不透明字符串**
+
+JWT 格式示例::
+
+[source, javascript, linenums]
+----
+// JWT 解码后的 payload 示例
+{
+  "iss": "https://auth.example.com",    // 令牌签发者(授权服务器)
+  "sub": "user123",                      // 主体(用户标识)
+  "aud": "https://api.example.com",      // 令牌受众(资源服务器)
+  "exp": 1893456000,                     // 过期时间(Unix时间戳)
+  "iat": 1893452400,                     // 签发时间
+  "scope": "openid profile email",       // 授权作用域
+  "client_id": "my-client"               // 客户端标识
+}
+----
+
+特性::
+* **短期有效:** 通常有效期为 15 分钟到 1 小时
+* **不可撤销(除非通过黑名单):** 由于无状态设计, 分发后的令牌在过期前通常难以直接撤销
+* **最小权限原则:** 令牌的 scope 应限制为所需的最小权限集
+
+==== 刷新令牌(Refresh Token)
+
+定义:: 用于在访问令牌过期后**获取新的访问令牌**的凭证, 生命周期较长
+
+特性::
+* **长期有效:** 有效期可以是数天、数月, 甚至永不过期(取决于策略)
+* **可撤销:** 授权服务器可以撤销刷新令牌(如用户主动撤销授权)
+* **轮换(Rotation):** 每次使用刷新令牌后, 授权服务器**应返回一个新的刷新令牌**并废弃旧令牌
+* **发送方受限(Sender-Constrained):** OAuth2.1 推荐将刷新令牌与客户端身份绑定, 防止泄露后被盗用
+
+刷新流程::
+
+[source, plaintext, linenums]
+----
+POST /token HTTP/1.1
+Host: auth.example.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=refresh_token
+&refresh_token=<refresh_token>
+&client_id=<client_id>
+&client_secret=<client_secret>
+----
+
+响应::
+
+[source, javascript, linenums]
+----
+{
+  "access_token": "新访问令牌",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "新刷新令牌",  // 令牌轮换
+  "scope": "openid profile"
+}
+----
+
+=== OAuth2.1 废弃的模式
+
+OAuth2.1 明确废弃了以下 OAuth 2.0 中定义的模式:
+
+隐式模式(Implicit Grant):: 访问令牌直接通过 URL 片段返回, 存在泄露风险; PKCE 使授权码流程在浏览器环境中也能安全使用
+密码模式(Password Grant):: 客户端直接获取用户密码, 违背了 OAuth 的授权委托初衷, 安全性极低
+客户端凭证模式(Client Credentials):: 未被废弃但仅适用于**无用户参与的服务器间通信**
+
+=== 安全最佳实践
+
+. **强制使用 PKCE:** 所有客户端(无论是否有机密)都必须使用 PKCE
+
+. **重定向 URI 严格校验:**
+* 授权服务器必须精确匹配注册的重定向 URI
+* 禁止使用通配符 URI
+* 应拒绝包含 fragment(#) 的 URI
+
+. **访问令牌防泄露:**
+* 使用 HTTPS 传输所有令牌
+* 访问令牌不应出现在 URL 查询参数中
+* 单页应用应将令牌存储在内存中, **禁止**存储在 localStorage 或 sessionStorage
+* 考虑使用 **DPoP(Demonstration of Proof of Possession)** 绑定令牌到特定客户端
+
+. **刷新令牌保护:**
+* 令牌轮换: 每次使用后发放新令牌, 废弃旧令牌
+* 令牌回收检测: 如果已废弃的刷新令牌被使用, 可能是令牌泄露信号, 应撤销该用户的所有令牌
+
+. **授权码重用检测:**
+* 授权码必须是**一次性**的
+* 授权服务器应检测并阻止授权码重用
+* 如果检测到授权码重用, 应撤销已发放的所有令牌
+
+. **客户端认证强化:**
+* 机密客户端应使用 `client_secret` 或**私钥 JWT 认证(private_key_jwt)**
+* `client_secret` 不应硬编码在可反编译的客户端中
+
+=== 常见应用场景
+
+Web 应用(服务端渲染)::
+* 使用标准授权码流程 + PKCE
+* `client_secret` 安全存储在服务端
+* 刷新令牌存储在服务端会话中
+
+单页应用(SPA)::
+* 使用授权码流程 + PKCE
+* 无 `client_secret`(公开客户端)
+* 令牌存储在 JavaScript 内存变量中
+* 可使用 iframe + `prompt=none` + `OAuth 2.0 for Browser-Based Apps` 规范进行静默刷新
+
+移动应用::
+* 使用授权码流程 + PKCE
+* 通过**系统浏览器(Chrome Custom Tabs/ASWebAuthenticationSession)** 发起授权, 而非 WebView
+* 利用 **AppAuth** 等成熟 SDK
+
+=== 与其他协议的关系
+
+OpenID Connect (OIDC):: OAuth2.1 之上的一层**身份认证**协议, 通过 `id_token`(JWT 格式) 提供用户身份信息. OIDC 在 OAuth2.1 的授权框架基础上增加了认证层.
+
+JWT (JSON Web Token):: OAuth2.1 中访问令牌的常见**格式载体**, 提供自包含的令牌信息, 资源服务器无需每次向授权服务器验证令牌.
+
+=== 总结
+
+* OAuth2.1 是 OAuth 2.0 的**安全强化版本**, 废弃了不安全的模式并强制使用 PKCE
+* 授权码流程 + PKCE 是 OAuth2.1 中**唯一推荐**的授权流程
+* 访问令牌**短期有效**, 刷新令牌**可轮换和可撤销**
+* 安全重定向 URI、令牌防泄露、严格的令牌校验是 OAuth2.1 的三大安全支柱
+* 对于需要身份认证的场景, 应结合 **OpenID Connect** 使用

@@ -1,0 +1,360 @@
+== Jumpserver原理讲解
+
+你有没有遇到过这样的场景: 公司有几十台服务器分散在不同环境, 开发、测试、运维人员都需要登录, 但**谁登录过哪台机器、执行过什么命令、有没有违规操作**, 全都无法追溯? 更危险的是, 如果某台服务器被攻破, 攻击者能否通过它"跳转"到内网其他机器?
+
+**堡垒机(Bastion Host)** 就是为这些问题而生的. 而 **Jumpserver** 是目前最流行的开源堡垒机实现之一, 它解决了 **"谁可以登录哪台机器, 登录后做了什么, 以及如何阻断危险操作"** 这一核心问题.
+
+[[what-is-jumpserver]]
+
+=== 什么是 Jumpserver?
+
+**Jumpserver** 是一个开源的 **堡垒机(跳板机)** 系统, 它充当了用户与目标服务器之间的 **中间层**, 所有 SSH/RDP 连接都必须经过 Jumpserver 进行 **认证、授权和审计**.
+
+* **开源** -- 基于 Apache 2.0 协议, 使用 Python/Django 开发, 完全开源可自建
+* **协议支持** -- 支持 SSH、RDP、Telnet、VNC、Kubernetes 等多种远程连接协议
+* **四大核心能力** -- 认证(Authentication)、授权(Authorization)、控制(Control)、审计(Audit), 即 **4A** 能力
+
+[NOTE]
+====
+Jumpserver 的核心设计理念是: **用户不直接接触目标服务器, 所有操作都必须通过堡垒机中转**. 这样, 堡垒机就成为唯一的安全管控节点.
+====
+
+[[bastion-vs-jumpbox]]
+
+=== 堡垒机 vs 跳板机
+
+这两个概念常被混用, 但侧重点不同:
+
+|===
+| 维度 | 跳板机(Jump Box) | 堡垒机(Bastion Host)
+
+| **核心功能** | 网络跳转, 连接中转 | 认证 + 授权 + 审计
+
+| **用户管理** | 依赖 OS 账号 | 集中化管理, 与应用账户解耦
+
+| **操作审计** | 无(或需额外配置) | 录像回放、命令记录、告警
+
+| **权限控制** | 粗粒度(操作系统级) | 细粒度(命令级、时间级)
+
+| **高可用** | 通常单点 | 支持集群部署
+
+| **典型产品** | 自建 SSH 跳板机 | Jumpserver、JumpServer 商业版
+
+|===
+
+简单来说: **跳板机让你"能过去", 堡垒机让你"知道谁过去做了什么"**.
+
+[[architecture]]
+
+=== 架构设计
+
+Jumpserver 采用 **微服务架构**, 各组件职责清晰、可水平扩展:
+
+[plantuml, "Jumpserver 架构图", format=png]
+----
+@startuml
+!define RECTANGLE class
+
+skinparam rectangle {
+  BackgroundColor #E8F0FE
+  BorderColor #1A73E8
+  FontColor #1A73E8
+}
+
+rectangle "用户端" as User {
+  rectangle "SSH 客户端" as SSH
+  rectangle "Web Terminal" as Web
+  rectangle "RDP 客户端" as RDP
+}
+
+rectangle "Jumpserver 核心" as Core {
+  rectangle "Lion" as Lion
+  rectangle "KoKo" as Koko
+  rectangle "Magnus" as Magnus
+  rectangle "Chen" as Chen
+  rectangle "Kael" as Kael
+}
+
+rectangle "管理服务" as Mgmt {
+  rectangle "Core (Django API)" as CoreAPI
+  rectangle "Celery Worker" as Celery
+}
+
+rectangle "数据存储" as Storage {
+  rectangle "MySQL/PostgreSQL" as DB
+  rectangle "Redis" as Redis
+  rectangle "对象存储" as OSS
+}
+
+rectangle "目标资产" as Target {
+  rectangle "Linux 服务器" as Linux
+  rectangle "Windows 服务器" as Win
+  rectangle "数据库" as DBs
+  rectangle "网络设备" as Net
+  rectangle "K8s 集群" as K8s
+}
+
+User --> Lion : RDP/VNC
+User --> Koko : SSH/Telnet
+User --> Magnus : 数据库代理
+User --> Chen : 应用发布
+User --> Kael : K8s 代理
+
+Koko --> CoreAPI : 认证授权查询
+Lion --> CoreAPI : 认证授权查询
+Magnus --> CoreAPI : 认证授权查询
+
+CoreAPI --> DB : 持久化
+CoreAPI --> Redis : 缓存/会话
+
+Koko --> Target : 代理连接
+Lion --> Target : 代理连接
+Magnus --> Target : 数据库连接
+
+Koko --> OSS : 上传录像
+Lion --> OSS : 上传录像
+@enduml
+----
+
+各组件功能如下:
+
+* **Core** -- Django 应用, 提供 REST API, 管理用户、资产、权限、会话等核心数据
+* **KoKo** -- SSH/Telnet 连接代理, 处理用户 SSH 登录请求, 执行命令记录和录像
+* **Lion** -- RDP/VNC 连接代理, 处理 Windows 远程桌面连接, 支持屏幕录像
+* **Magnus** -- 数据库代理, 支持 MySQL、PostgreSQL、SQL Server、Oracle 等数据库的代理连接
+* **Chen** -- 应用发布器, 将 Web 应用等非标准协议通过 Jumpserver 发布
+* **Kael** -- Kubernetes 代理, 允许用户通过 Jumpserver 连接到 K8s 集群 Pod
+* **Celery Worker** -- 异步任务执行器, 处理资产连通性测试、自动化任务等
+
+[[core-principles]]
+
+=== 核心原理
+
+==== 连接代理原理
+
+Jumpserver 的核心机制是 **SSH 代理转发**. 当用户试图连接目标服务器时, 整个链路分为两段:
+
+. 用户连接 Jumpserver(KoKo), 经过认证后获得授权访问列表
+. KoKo 代表用户向目标服务器发起 SSH 连接, 建立中转通道
+
+[source,text]
+----
+用户 ----SSH----> KoKo(代理) ----SSH----> 目标服务器
+                    |
+                    ├── 记录输入命令
+                    ├── 录制会话屏幕
+                    └── 匹配命令规则
+----
+
+关键点是: **目标服务器上不需要安装任何 Jumpserver 组件**, KoKo 使用标准的 SSH 协议与目标通信. Jumpserver 只作为"中间人"存在.
+
+==== 双因子认证
+
+Jumpserver 支持多种认证方式组合:
+
+* **本地密码** -- Jumpserver 自身维护的账户密码
+* **LDAP/AD 认证** -- 与企业目录服务集成, 参见 <<LDAP原理讲解.adoc, LDAP 原理>>
+* **MFA 二次认证** -- 支持 TOTP(Google Authenticator)、RADIUS、SMS 验证码
+* **OAuth2 / OpenID Connect** -- 对接企业 SSO 系统, 如 Keycloak、Azure AD
+
+[[authorization-model]]
+
+==== 授权模型
+
+Jumpserver 的授权模型基于 **用户-资产-权限** 三层关系, 通过 **授权规则** 绑定:
+
+[plantuml,"Jumpserver 授权模型", format=png]
+----
+@startuml
+skinparam rectangle {
+  BackgroundColor #FFF3E0
+  BorderColor #E65100
+}
+
+rectangle "用户组" as Group
+rectangle "用户" as User
+rectangle "授权规则" as Rule
+rectangle "资产" as Asset
+rectangle "账号" as Account
+rectangle "系统用户" as SysUser
+
+User --> Group : 属于
+Group --> Rule : 绑定权限
+User --> Rule : 绑定权限
+Rule --> Asset : 指定可访问资产
+Rule --> SysUser : 指定使用哪个系统用户连接
+
+SysUser --> Account : 映射到资产上的账号
+Asset --> Account : 拥有
+
+note right of Rule
+  授权规则包含:
+  - 有效时间段
+  - 允许执行的命令(黑白名单)
+  - 文件上传/下载限制
+  - 连接最大时长
+end note
+@enduml
+----
+
+这里有一个重要的概念: **系统用户(System User)**. 系统用户是 Jumpserver 用来登录目标服务器的"凭证", 可以选择两种模式:
+
+* **手动输入** -- 每次连接时由用户输入目标服务器的账号密码, Jumpserver 透传
+* **自动推送** -- Jumpserver 自动在目标服务器上创建账号并推送 SSH 密钥, 用户无需知道密码
+
+TIP: 推荐使用 **自动推送** 模式, 这样用户连目标服务器的密码都不知道, 即使 Jumpserver 被攻破, 也无法直接登录目标机器.
+
+[[command-filter]]
+
+==== 命令过滤
+
+Jumpserver 可以对用户在目标服务器上执行的每条命令进行 **实时过滤**:
+
+[source,text]
+----
+用户输入:  rm -rf /data
+                │
+                ▼
+        KoKo 截获命令
+                │
+        ┌───────┴───────┐
+        ▼               ▼
+    匹配黑名单       匹配高危规则
+        │               │
+        ▼               ▼
+    禁止执行         触发告警+记录
+        │               │
+        ▼               ▼
+    Connection      通知管理员
+    已断开
+----
+
+命令过滤规则支持:
+
+* **正则匹配** -- 如 `^rm\s+-rf` 匹配危险删除命令
+* **高危险命令告警** -- 执行 `reboot`, `shutdown`, `passwd` 等命令时通知管理员
+* **白名单模式** -- 只允许执行特定命令列表, 其他一律禁止
+
+[[workflow]]
+
+=== 工作流程
+
+用户通过 Jumpserver 连接到目标服务器的完整流程:
+
+. **用户登录** -- 用户通过 Web 界面或 SSH 客户端连接到 Jumpserver, 完成身份认证(密码 + MFA)
+. **获取授权列表** -- Jumpserver Core 根据用户身份查询授权规则, 返回该用户可访问的资产列表
+. **选择目标资产** -- 用户从列表中选择要连接的服务器
+. **创建代理会话** -- KoKo 接收请求, 在 Jumpserver 上创建一个代理会话, 记录会话 ID
+. **连接目标服务器** -- KoKo 使用授权规则中指定的系统用户, 向目标服务器发起 SSH 连接
+. **实时监控** -- 连接建立后, KoKo:
+   * 录制所有输入和输出(TyR 格式, 可回放)
+   * 实时检测执行的命令, 匹配过滤规则
+   * 记录文件传输操作
+. **会话结束** -- 用户断开连接或超时, KoKo 将会话录像上传到对象存储, 更新会话状态
+
+[plantuml,"用户连接目标服务器时序图", format=png]
+----
+@startuml
+actor 用户
+participant "SSH 客户端" as SSH
+participant "KoKo" as Koko
+participant "Core" as Core
+participant "目标服务器" as Target
+
+用户 -> SSH: ssh user@jumpserver
+SSH -> Koko: 建立 SSH 连接
+Koko -> Core: 验证用户身份
+Core --> Koko: 认证通过 + 授权资产列表
+Koko --> SSH: 显示可访问资产
+用户 -> SSH: 选择目标服务器(10.0.0.1)
+SSH -> Koko: 请求连接 10.0.0.1
+Koko -> Core: 查询授权规则
+Core --> Koko: 规则确认(系统用户: admin)
+Koko -> Target: 发起 SSH 连接(使用系统用户)
+Target --> Koko: 连接建立
+Koko --> SSH: 代理通道就绪
+用户 -> SSH: 执行命令
+SSH -> Koko: 转发命令
+Koko -> Koko: 检查命令过滤规则
+Koko -> Target: 转发(允许的命令)
+Target --> Koko: 返回结果
+Koko --> SSH: 转发结果
+用户 -> SSH: 断开连接
+SSH -> Koko: 关闭连接
+Koko -> Target: 关闭连接
+Koko -> Core: 上传会话录像, 结束会话
+@enduml
+----
+
+[[high-availability]]
+
+=== 高可用部署
+
+生产环境中, Jumpserver 支持 **集群部署** 以实现高可用:
+
+[plantuml,"Jumpserver 高可用部署", format=png]
+----
+@startuml
+skinparam rectangle {
+  BackgroundColor #E8F5E9
+  BorderColor #2E7D32
+}
+
+rectangle "负载均衡(LB)" as LB
+
+rectangle "Jumpserver 节点1" as Node1 {
+  rectangle "Core" as C1
+  rectangle "KoKo" as K1
+  rectangle "Lion" as L1
+  rectangle "Celery" as W1
+}
+
+rectangle "Jumpserver 节点2" as Node2 {
+  rectangle "Core" as C2
+  rectangle "KoKo" as K2
+  rectangle "Lion" as L2
+  rectangle "Celery" as W2
+}
+
+rectangle "存储层" as Store {
+  rectangle "MySQL/PostgreSQL (主从)" as DB
+  rectangle "Redis (哨兵/集群)" as Redis
+  rectangle "对象存储 (MinIO/S3)" as OSS
+}
+
+rectangle "目标资产" as Assets
+
+LB --> Node1
+LB --> Node2
+Node1 --> Store
+Node2 --> Store
+Node1 --> Assets
+Node2 --> Assets
+@enduml
+----
+
+关键要点:
+
+* **无状态节点** -- Core 和 KoKo 是无状态的, 可以水平扩展
+* **共享存储** -- 数据库、Redis、录像存储必须使用共享外部服务
+* **会话亲和性** -- 建议配置 LB 的会话保持, 避免用户在操作过程中切换到不同节点
+
+[[summary]]
+
+=== 总结
+
+Jumpserver 作为开源堡垒机, 核心价值在于将 **"谁能访问什么资源"** 和 **"访问后做了什么"** 这两个问题集中化、可控化、可审计化.
+
+**最佳实践:**
+
+* **绝不绕过堡垒机** -- 关闭目标服务器的公网 SSH 端口, 强制所有流量经过 Jumpserver
+* **使用自动推送账号** -- 避免用户直接知道目标服务器密码
+* **开启命令过滤** -- 即使是内网, 也要配置高危命令告警
+* **定期审计录像** -- 设置录像保留周期, 定期抽检回放
+* **多节点部署** -- 生产环境至少两个 Jumpserver 节点避免单点故障
+
+**常见误区:**
+
+* 误区: Jumpserver 只能管理 SSH -- 实际上它还支持 RDP、VNC、数据库、K8s 等多种协议
+* 误区: 堡垒机会大幅增加延迟 -- 实际只增加一次 TCP 握手和认证的开销(通常 < 50ms)
+* 误区: Jumpserver 需要在目标服务器装 Agent -- 不需要, 它通过标准 SSH 协议通信

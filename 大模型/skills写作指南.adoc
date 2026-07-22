@@ -1,0 +1,220 @@
+== skills写作指南
+
+Skill(技能) 是 GitHub Copilot 等 AI 编码助手中用于封装**领域专业知识**的文件. 一个精心编写的 Skill 能让 AI agent 在面对特定任务时, 自动加载相关知识和指令, 从而做出更精准的判断和操作; 而一个模糊的 Skill 则可能被 agent 忽略或误用. 本文系统讲解 Skill 的设计原则、文件结构和编写方法.
+
+参考: <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>>, <<大模型/prompt写作指南.adoc#, prompt写作指南>>
+
+=== 什么是 Skill
+
+Skill:: 一个以 `SKILL.md` 命名的**可复用知识包**, 包含 YAML frontmatter(元数据)和 Markdown 内容体, 放置在约定目录下供 AI agent 按需加载. 它将特定领域的知识、工作流和最佳实践打包为 agent 可直接执行的指令集.
+
+Skill 与 Prompt 的核心区别在于:
+
+* **Prompt** 是用户主动输入的指令, 按需触发; Skill 是 agent **自动匹配**的上下文知识, 根据任务描述由 agent 自行决定是否加载
+* **Prompt** 面向**一次性的对话任务**; Skill 面向**可复用的领域场景**, 可包含资产文件(脚本、模板等)
+* **Prompt** 通常无结构; Skill 有严格的 YAML frontmatter + Markdown 内容体结构
+
+Skill 与 Agent instructions 的核心区别在于:
+
+* **Agent instructions**(如 `copilot-instructions.md`) 始终生效, 适用于项目中**大多数**工作; Skill 仅在执行**特定任务**时按需加载
+* Agent instructions 是在 agent 启动时自动注入的全局上下文; Skill 是 agent 在推理过程中根据 `description` 字段**主动匹配**的局部知识
+
+=== Skill 的核心构成要素
+
+一个完整的 Skill 由以下要素组成:
+
+YAML frontmatter:: 文件开头的 YAML 元数据块, 用 `---` 包裹. 其中最关键的是 `name` 和 `description` 字段, 前者标识 Skill 名称, 后者是 agent 匹配 Skill 的依据.
+
+Content body:: frontmatter 之后的主体内容, 使用 Markdown 编写. 包含领域知识、操作步骤、决策表、代码示例等.
+
+Assets:: Skill 可附带脚本文件、模板文件等资产, 与 `SKILL.md` 放在同级或子目录中. 这些资产由 agent 在需要时调用.
+
+[source,yaml]
+----
+---
+name: database-migration
+description: '将数据库从 MySQL 迁移到 PostgreSQL 的最佳实践和操作步骤. 当用户要求迁移数据库时使用. 包含 schema 转换、数据类型映射、性能调优指南.'
+---
+----
+
+=== Skill 编写核心原则
+
+==== 描述即发现入口
+
+`description` 字段是 agent 决定是否加载 Skill 的唯一依据. 如果触发词不在 description 中, agent 就找不到它.
+
+* **不推荐:** `description: '数据库相关技能'`
+* **推荐:** `description: 'MySQL 到 PostgreSQL 迁移的最佳实践. 当用户要求: 迁移数据库、数据迁移、数据库切换、更换数据库引擎时使用. 包含: schema 转换、数据类型映射、性能对比、停机方案.'`
+
+使用 **"当...时使用"** 句式, 配合具体关键词枚举, 覆盖 agent 可能遇到的各种触发场景.
+
+==== 单一职责, 聚焦特定任务
+
+一个 Skill 应只覆盖**一个特定的领域场景**. 职责过广的 Skill 会被 agent 误加载, 导致上下文污染.
+
+* **不推荐:** 一个 Skill 同时覆盖数据库迁移、性能优化和安全审计
+* **推荐:** 拆分为 `database-migration`, `database-performance`, `security-audit` 三个独立 Skill
+
+==== 指令与说明分离
+
+Skill 的内容体应包含两部分:
+
+* **知识说明(What):** 领域概念、原理、约束条件, 帮助 agent 理解上下文
+* **操作指令(How):** 具体步骤、执行规则、代码模板, 指导 agent 如何操作
+
+[source,markdown]
+----
+# 知识说明
+PostgreSQL 与 MySQL 的核心差异:
+- 事务隔离级别默认行为不同
+- 索引实现方式不同(B-tree vs 自适应哈希)
+- 字符串比较是否区分大小写
+
+# 操作指令
+执行迁移的步骤:
+1. 使用 `pgloader` 工具导出 MySQL schema
+2. 检查并修正不兼容的数据类型
+3. 在 PostgreSQL 中重建索引和约束
+----
+
+==== 提供决策表和代码模板
+
+当任务涉及多种分支情况时, 使用**决策表**帮助 agent 判断. 同时提供可直接使用的**代码模板**减少 agent 自由发挥的空间.
+
+[source,markdown]
+----
+| 源数据类型 | PostgreSQL 目标类型 | 注意事项 |
+|------------|-------------------|----------|
+| TINYINT    | SMALLINT          | 无直接对应 |
+| DATETIME   | TIMESTAMP         | 无影响     |
+| ENUM       | VARCHAR + CHECK   | 需转换为自定义约束 |
+----
+
+==== 合理设置 user-invocable
+
+`user-invocable` 字段决定 Skill 是否作为**斜杠命令**(在聊天框中输入 `/`) 对用户可见.
+
+* 设置为 `false`: Skill 完全由 agent 自动匹配, 用户无感知. 适用于后台知识类 Skill
+* 设置为 `true`: 用户可通过 `/skill-name` 手动调用. 适用于需要用户主动触发的工作流类 Skill
+
+=== Skill 文件结构
+
+Skill 的目录结构遵循以下约定:
+
+[source]
+----
+.github/skills/<skill-name>/     # 项目级 Skill (团队共享)
+  SKILL.md                       # Skill 定义文件
+  templates/                     # (可选) 模板资产
+  scripts/                       # (可选) 辅助脚本
+
+.agents/skills/<skill-name>/     # 替代目录 (部分平台)
+  SKILL.md
+
+.claude/skills/<skill-name>/     # Claude 兼容格式
+  SKILL.md
+----
+
+用户级别的 Skill 放置在:
+
+[source]
+----
+{{VSCODE_USER_PROMPTS_FOLDER}}/  # 跨工作空间的个人 Skill
+  *.prompt.md                    # 注: 用户级不支持 SKILL.md, 使用 prompt.md 替代
+----
+
+YAML frontmatter 的完整结构:
+
+[source,yaml]
+----
+---
+name: <skill-name>
+description: '<触发场景描述>'
+user-invocable: false   # 可选, 是否作为斜杠命令
+---
+----
+
+=== Skill 的工作方式
+
+AI agent 在推理过程中按照以下流程与 Skill 交互:
+
+. **任务分析:** agent 接收到用户请求后, 分析其意图和涉及的领域
+
+. **Skill 匹配:** agent 扫描各 Skill 目录下的 `SKILL.md` 文件, 将任务意图与每个 Skill 的 `description` 字段进行匹配. 匹配度高的 Skill 被标记为**候选**
+
+. **Skill 加载:** agent 读取候选 Skill 的 `SKILL.md` 内容体, 将其注入当前推理上下文
+
+. **知识应用:** agent 根据 Skill 中的指令和知识执行任务, 必要时访问 Skills 目录下的资产文件
+
+. **完成输出:** agent 完成任务后生成最终输出, Skill 上下文不再保留
+
+[plantuml, "Skill 加载与执行流程", format=png]
+----
+@startuml
+actor User as U
+participant "AI Agent" as A
+database "Skills 目录" as S
+
+U -> A: 提出任务请求
+A -> A: 分析任务领域和意图
+A -> S: 扫描 SKILL.md 文件
+S --> A: 返回 description 列表
+A -> A: 匹配候选 Skill
+A -> S: 读取匹配 Skill 的内容体
+S --> A: 返回指令和知识
+A -> A: 执行任务(使用 Skill 知识)
+A --> U: 返回完成结果
+@enduml
+----
+
+=== Skill vs Prompt vs Agent Instructions 选择指南
+
+|===
+| 特性 | Skill | Prompt | Agent Instructions
+
+| 触发方式
+| agent 自动匹配
+| 用户手动调用
+| 始终加载
+
+| 适用范围
+| 特定领域任务
+| 一次性对话
+| 项目全局
+
+| 附带资产
+| 支持(脚本/模板)
+| 不支持
+| 不支持
+
+| 用户可见性
+| 可选斜杠命令
+| 斜杠命令
+| 不可见
+
+| 存放位置
+| `.github/skills/`
+| `.github/prompts/`
+| 项目根目录或 `.github/`
+|===
+
+=== 常见误区与注意事项
+
+* **description 过于简短:** 这是最常见的问题. description 必须包含足够的关键词和触发场景, 否则 agent 无法匹配
+* **职责范围过大:** 一个 Skill 试图覆盖多个不相关的主题, 导致 agent 在无关任务中误加载, 浪费上下文窗口
+* **忽略 assets 路径:** 如果 Skill 引用了外部脚本或模板, 需确认路径相对于 Skill 目录是正确的
+* **与 Instructions 冲突:** 如果某个知识在 Instructions 和 Skill 中都存在, agent 可能收到冗余或矛盾的指令. 优先将全局知识放入 Instructions, 领域特定知识放入 Skill
+* **遗忘 YAML 边界:** frontmatter 必须使用 `---` 严格包裹, 且 YAML 语法必须正确. 格式错误的 frontmatter 会导致整个 Skill 被忽略
+* **user-invocable 误配:** 本应由 agent 自动匹配的知识类 Skill 设置了 `user-invocable: true`, 增加了用户认知负担
+
+=== 总结
+
+Skill 写作是 **Agent 定制化配置**的核心技能之一. 高质量的 Skill 需要:
+
+* 精准的 `description` 描述, 确保 agent 能正确匹配
+* 清晰的职责边界, 一个 Skill 只覆盖一个领域场景
+* 结构化的知识说明和操作指令, 兼顾 What 和 How
+* 充分的决策表和代码模板, 减少 agent 的自由发挥
+* 正确的目录位置和 frontmatter 格式, 确保 Skill 可被加载
+
+优秀的 Skill 设计, 能将领域专家知识转化为 agent 可复用的智能单元, 显著提升 AI 编码助手在特定任务上的表现.

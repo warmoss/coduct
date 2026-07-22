@@ -1,0 +1,319 @@
+== 异步请求源码分析
+
+下面我们深入分析 Spring MVC 中异步请求处理的源码实现, 重点关注 *Callable*、*DeferredResult* 和超时处理的机制.
+
+=== 整体架构与核心组件
+Spring MVC 的异步处理建立在 Servlet 3.0+ 的异步特性之上, 主要通过以下几个核心组件实现:
+
+. *WebAsyncManager:* 异步处理的核心管理器
+
+. *AsyncWebRequest:* 对原生 *AsyncContext* 的封装
+
+. *CallableProcessingInterceptor:* 处理 *Callable* 的拦截器
+
+. *DeferredResultProcessingInterceptor:* 处理 *DeferredResult* 的拦截器
+
+=== 请求处理流程源码分析
+==== DispatcherServlet 中的异步处理入口
+在 *DispatcherServlet.doDispatch()* 方法中, 处理控制器方法返回值的核心逻辑:
+
+[source, java, linenums]
+----
+// DispatcherServlet.java
+protected void doDispatch(HttpServletRequest request, HttpServletResponse response) throws Exception {
+    // ...
+    mv = ha.handle(processedRequest, response, mappedHandler.getHandler());
+    // ...
+    if (asyncManager.isConcurrentHandlingStarted()) {
+        return; // 如果开始了异步处理, 直接返回, 释放容器线程
+    }
+    // ...
+}
+----
+
+==== RequestMappingHandlerAdapter 处理返回值
+*RequestMappingHandlerAdapter.invokeHandlerMethod()* 方法负责调用控制器方法并处理返回值:
+
+[source, java, linenums]
+----
+// RequestMappingHandlerAdapter.java
+protected ModelAndView invokeHandlerMethod(HttpServletRequest request,
+        HttpServletResponse response, HandlerMethod handlerMethod) throws Exception {
+    
+    // 设置WebAsyncManager
+    WebAsyncManager asyncManager = WebAsyncUtils.getAsyncManager(request);
+    asyncManager.setTaskExecutor(this.taskExecutor);
+    asyncManager.setAsyncWebRequest(asyncWebRequest);
+    
+    // 执行处理器方法
+    invocableMethod.invokeAndHandle(webRequest, mavContainer);
+    
+    // 如果开始了异步处理, 返回null
+    if (asyncManager.isConcurrentHandlingStarted()) {
+        return null;
+    }
+    
+    return getModelAndView(mavContainer, modelFactory, webRequest);
+}
+----
+
+==== 处理 Callable 返回值
+当控制器方法返回 *Callable* 时, *CallableMethodReturnValueHandler* 会处理它:
+
+[source, java, linenums]
+----
+// CallableMethodReturnValueHandler.java
+public void handleReturnValue(@Nullable Object returnValue, MethodParameter returnType,
+        ModelAndViewContainer mavContainer, NativeWebRequest webRequest) throws Exception {
+    
+    if (returnValue == null) {
+        mavContainer.setRequestHandled(true);
+        return;
+    }
+    
+    Callable<?> callable = (Callable<?>) returnValue;
+    
+    // 通过WebAsyncManager开始处理Callable
+    WebAsyncUtils.getAsyncManager(webRequest).startCallableProcessing(
+            new WebAsyncTask<>(callable), mavContainer);
+}
+----
+
+==== 处理 DeferredResult 返回值
+当控制器方法返回 *DeferredResult* 时, *DeferredResultMethodReturnValueHandler* 会处理它:
+
+[source, java, linenums]
+----
+// DeferredResultMethodReturnValueHandler.java
+public void handleReturnValue(@Nullable Object returnValue, MethodParameter returnType,
+        ModelAndViewContainer mavContainer, NativeWebRequest webRequest) throws Exception {
+    
+    if (returnValue == null) {
+        mavContainer.setRequestHandled(true);
+        return;
+    }
+    
+    DeferredResult<?> result = (DeferredResult<?>) returnValue;
+    
+    // 通过WebAsyncManager开始处理DeferredResult
+    WebAsyncUtils.getAsyncManager(webRequest).startDeferredResultProcessing(result, mavContainer);
+}
+----
+
+=== WebAsyncManager 核心源码分析
+
+==== startCallableProcessing 方法
+
+[source, java, linenums]
+----
+// WebAsyncManager.java
+public void startCallableProcessing(WebAsyncTask<?> webAsyncTask, Object... processingContext) throws Exception {
+    // 断言检查
+    Assert.state(this.asyncWebRequest != null, "AsyncWebRequest must not be null");
+    
+    // 设置超时时间
+    Long timeout = webAsyncTask.getTimeout();
+    if (timeout != null) {
+        this.asyncWebRequest.setTimeout(timeout);
+    }
+    
+    // 添加拦截器
+    for (CallableProcessingInterceptor interceptor : this.callableInterceptors) {
+        interceptor.beforeConcurrentHandling(this.asyncWebRequest, webAsyncTask.getCallable());
+    }
+    
+    // 开始异步处理
+    this.asyncWebRequest.startAsync();
+    
+    // 提交Callable到任务执行器
+    Future<?> future = getTaskExecutor().submit(() -> {
+        Object result = null;
+        try {
+            // 执行前拦截
+            for (CallableProcessingInterceptor interceptor : this.callableInterceptors) {
+                try {
+                    interceptor.preProcess(this.asyncWebRequest, webAsyncTask.getCallable());
+                } catch (Exception ex) {
+                    // 异常处理
+                }
+            }
+            
+            // 执行Callable
+            result = webAsyncTask.getCallable().call();
+            
+            // 执行后拦截
+            for (CallableProcessingInterceptor interceptor : this.callableInterceptors) {
+                interceptor.postProcess(this.asyncWebRequest, webAsyncTask.getCallable(), result);
+            }
+        } catch (Exception ex) {
+            // 异常处理
+        } finally {
+            // 设置结果
+            setConcurrentResultAndDispatch(result);
+        }
+        return null;
+    });
+    
+    // 保存Future用于可能的取消操作
+    this.concurrentResult = future;
+}
+----
+
+==== startDeferredResultProcessing 方法
+
+[source, java, linenums]
+----
+// WebAsyncManager.java
+public void startDeferredResultProcessing(final DeferredResult<?> deferredResult, Object... processingContext) throws Exception {
+    // 断言检查
+    Assert.state(this.asyncWebRequest != null, "AsyncWebRequest must not be null");
+    
+    // 设置超时时间
+    Long timeout = deferredResult.getTimeoutValue();
+    if (timeout != null) {
+        this.asyncWebRequest.setTimeout(timeout);
+    }
+    
+    // 添加结果处理器
+    deferredResult.setResultHandler(result -> {
+        setConcurrentResultAndDispatch(result);
+    });
+    
+    // 添加超时处理器
+    deferredResult.setTimeoutHandler(() -> {
+        Object timeoutResult = deferredResult.getTimeoutResult();
+        if (timeoutResult != null) {
+            setConcurrentResultAndDispatch(timeoutResult);
+        } else {
+            // 没有设置超时结果, 发送超时错误
+            asyncWebRequest.sendTimeout();
+        }
+    });
+    
+    // 添加拦截器
+    for (DeferredResultProcessingInterceptor interceptor : this.deferredResultInterceptors) {
+        interceptor.beforeConcurrentHandling(this.asyncWebRequest, deferredResult);
+    }
+    
+    // 开始异步处理
+    this.asyncWebRequest.startAsync();
+    
+    // 保存DeferredResult引用
+    this.concurrentResult = deferredResult;
+}
+----
+
+==== setConcurrentResultAndDispatch 方法
+这个方法负责设置异步处理结果并重新派发请求:
+
+[source, java, linenums]
+----
+// WebAsyncManager.java
+private void setConcurrentResultAndDispatch(Object result) {
+    // 保存结果
+    this.concurrentResult = result;
+    this.concurrentResultContext = null;
+    
+    // 如果异步请求已经完成, 直接返回
+    if (this.asyncWebRequest.isAsyncComplete()) {
+        return;
+    }
+    
+    // 重新派发请求
+    this.asyncWebRequest.dispatch();
+}
+----
+
+=== 超时处理源码分析
+==== AsyncWebRequest 的超时处理
+*StandardServletAsyncWebRequest* 是 *AsyncWebRequest* 的主要实现, 它封装了 Servlet 的 *AsyncContext*:
+
+[source, java, linenums]
+----
+// StandardServletAsyncWebRequest.java
+public void setTimeout(long timeout) {
+    this.timeout = timeout;
+    // 设置原生AsyncContext的超时时间
+    if (this.asyncContext != null) {
+        this.asyncContext.setTimeout(timeout);
+    }
+}
+
+// 添加超时监听器
+public void addTimeoutHandler(Runnable timeoutHandler) {
+    this.timeoutHandlers.add(timeoutHandler);
+}
+
+// 当Servlet容器触发超时时调用
+public void onTimeout(AsyncEvent event) throws IOException {
+    try {
+        // 执行所有注册的超时处理器
+        for (Runnable handler : this.timeoutHandlers) {
+            handler.run();
+        }
+    } finally {
+        // 如果响应还未提交, 发送超时错误
+        if (!isAsyncComplete() && !getNativeResponse().isCommitted()) {
+            getNativeResponse().sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+        }
+    }
+}
+----
+
+==== DeferredResult 的超时处理
+在 *WebAsyncManager.startDeferredResultProcessing()* 中, 我们看到了如何为 *DeferredResult* 设置超时处理器:
+
+[source, java, linenums]
+----
+// 设置超时处理器
+deferredResult.setTimeoutHandler(() -> {
+    Object timeoutResult = deferredResult.getTimeoutResult();
+    if (timeoutResult != null) {
+        setConcurrentResultAndDispatch(timeoutResult);
+    } else {
+        // 没有设置超时结果, 发送超时错误
+        asyncWebRequest.sendTimeout();
+    }
+});
+----
+
+==== 超时后的重新派发
+当超时发生时, 会调用 *setConcurrentResultAndDispatch()* 方法, 该方法最终会调用:
+
+[source, java, linenums]
+----
+// StandardServletAsyncWebRequest.java
+public void dispatch() {
+    // 获取当前请求的路径
+    String dispatchPath = getDispatchPath();
+    
+    // 使用AsyncContext派发请求
+    this.asyncContext.dispatch(dispatchPath);
+}
+----
+
+这个派发操作会让请求重新回到 *DispatcherServlet*, 但这次会使用异步处理的结果而不是再次执行控制器方法.
+
+=== 关键设计模式与实现技巧
+. *模板方法模式:* *WebAsyncManager* 中的处理流程定义了算法骨架, 具体步骤由拦截器实现.
+
+. *观察者模式:* *DeferredResult* 使用观察者模式, 当结果可用时通知注册的处理器.
+
+. *拦截器链:* 通过 *CallableProcessingInterceptor* 和 *DeferredResultProcessingInterceptor* 实现横切关注点的分离.
+
+. *资源清理:* 通过 *onCompletion* 和 *onTimeout* 回调确保资源正确释放, 防止内存泄漏.
+
+=== 总结
+Spring MVC 的异步请求处理是一个复杂但设计精良的机制:
+
+. *抽象层次:* Spring 在 Servlet 3.0 异步 API 之上构建了更高层次的抽象, 使开发者无需直接操作底层的 *AsyncContext*.
+
+. *灵活性:* 通过 *WebAsyncTask* 和 *DeferredResult* 提供了两种不同风格的异步处理方式, 满足不同场景需求.
+
+. *可扩展性:* 拦截器机制允许开发者介入异步处理的各个阶段, 添加自定义逻辑.
+
+. *健壮性:* 完善的超时和错误处理机制确保了系统的稳定性.
+
+. *资源管理:* 通过回调机制确保异步处理过程中分配的资源能够被正确释放.
+
+理解这些底层实现机制, 有助于我们更好地使用 Spring MVC 的异步特性, 编写出高效、稳定的异步 Web 应用程序.

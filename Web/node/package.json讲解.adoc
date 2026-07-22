@@ -1,0 +1,273 @@
+== package.json讲解
+
+package.json 是 Node.js 项目的核心配置文件, 用于管理项目的依赖、脚本、元数据等信息. 它是 npm/yarn/pnpm 等包管理器的入口文件.
+
+=== 核心字段详解
+
+==== 基本信息字段
+
+[source, json]
+----
+{
+  "name": "项目名称",
+  "version": "1.0.0",
+  "description": "项目描述",
+  "keywords": ["keyword1", "keyword2"],
+  "author": "Your Name <email@example.com>",
+  "license": "证书",
+  "private": true, // 设为 true 可防止意外发布到 npm
+  "homepage": "https://example.com",
+  "license": "MIT",
+  "author": "author <author@example.com> (https://example.com)",
+}
+----
+
+==== 依赖管理字段
+
+[source, json]
+----
+{
+  "dependencies": {},
+  "devDependencies": {},
+  "peerDependencies": {}, // 用于声明当前包需要依赖的宿主环境提供的包
+  "optionalDependencies": {},
+  "bundledDependencies": ["package1", "package2"] // 指定哪些依赖会被打包到最终发布的包中
+}
+----
+
+==== 脚本字段
+[source, json]
+----
+{
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "build": "webpack --mode production",
+    "test": "jest",
+    "lint": "eslint src/",
+    "prebuild": "npm run clean",
+    "postbuild": "npm run compress"
+  }
+}
+----
+
+**钩子脚本:**
+
+* **pre前缀:** 在主脚本前执行
+
+* **post前缀:** 在主脚本后执行
+
+* 例如: preinstall、postinstall、prebuild、postbuild
+
+==== 入口和模块字段
+
+[source, json]
+----
+{
+  "main": "index.js",
+  "module": "dist/index.esm.js",
+  "browser": "browser-specific.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.esm.js",
+      "require": "./dist/index.cjs.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./utils": {
+      "import": "./dist/utils.esm.js",
+      "require": "./dist/utils.cjs.js"
+    }
+  }
+}
+----
+
+* **main:** CommonJS 入口文件
+
+* **module:** ESM 入口文件
+
+* **browser:** 浏览器 入口文件
+
+* **types:** TypeScript 类型定义文件
+
+* **exports:** 更精细的导出控制(Node.js 12+)
+
+==== 可执行命令
+
+[source, json]
+----
+{
+  "name": "@mycompany/toolkit",
+  "bin": {
+    "my-build": "./bin/build.js",
+    "my-start": "./bin/start.js",
+    "my-test": "./bin/test.js"
+  }
+}
+----
+
+**示例:**
+
+[source, javascript]
+----
+#!/usr/bin/env node
+
+const { program } = require('commander');
+const packageJson = require('../package.json');
+
+// 定义 CLI
+program
+  .version(packageJson.version)
+  .description('My awesome CLI tool')
+  .option('-d, --debug', 'debug mode')
+  .argument('<input>', 'input file')
+  .action((input, options) => {
+    if (options.debug) {
+      console.log('Debug mode enabled');
+    }
+    console.log(`Processing: ${input}`);
+  });
+
+program.parse(process.argv);
+----
+
+==== 模块系统
+
+[source, json]
+----
+{
+  "type": "module"
+}
+----
+
+**作用:** 源码内使用import/export关键字进行导入导出而不是require/module.exports
+
+==== 配置字段
+
+[source, json]
+----
+{
+  "config": {
+    "port": 3000,
+    "env": "development"
+  },
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["x64", "arm64"]
+}
+----
+
+* **config:** 可通过 npm 包读取的配置变量
+
+* **engines:** 要求的 Node.js 版本
+
+* **os/cpu:** 支持的系统和架构
+
+=== 最佳实践
+
+==== 使用 workspace(Monorepo)
+
+[source, json]
+----
+{
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "private": true
+}
+----
+
+==== 发布配置
+
+[source, json]
+----
+{
+  "files": [
+    "dist",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}
+----
+
+==== 环境变量管理
+
+[source, json]
+----
+{
+  "scripts": {
+    "start:prod": "NODE_ENV=production node index.js",
+    "start:dev": "NODE_ENV=development nodemon index.js"
+  }
+}
+----
+
+==== Git Hooks
+
+[source, json]
+----
+{
+  "husky": {
+    "hooks": {
+      "pre-commit": "lint-staged",
+      "commit-msg": "commitlint -E HUSKY_GIT_PARAMS"
+    }
+  }
+}
+----
+
+=== 常见问题解决
+
+==== 依赖冲突
+
+[source, json]
+----
+{
+  "overrides": {
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  },
+  "resolutions": {
+    "lodash": "4.17.21"
+  }
+}
+----
+
+==== 兼容性处理
+
+[source, json]
+----
+{
+  "browserslist": [
+    ">0.2%",
+    "not dead",
+    "not op_mini all"
+  ]
+}
+----
+
+==== 安全配置
+
+[source, json]
+----
+{
+  "funding": "https://github.com/sponsors/username",
+  "bugs": {
+    "url": "https://github.com/username/project/issues"
+  },
+  "homepage": "https://github.com/username/project#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/username/project.git"
+  }
+}
+----

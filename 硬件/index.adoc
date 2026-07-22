@@ -1,0 +1,13 @@
+= 硬件
+
+include::esp32原理讲解.adoc[]
+
+include::麦克风原理讲解.adoc[]
+
+include::GPU讲解.adoc[]
+
+include::UWB讲解.adoc[]
+
+include::NFC讲解.adoc[]
+
+include::IEEE 754 原理讲解.adoc[]

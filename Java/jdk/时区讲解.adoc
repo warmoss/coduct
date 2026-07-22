@@ -1,0 +1,253 @@
+== 时区讲解
+
+=== 时区基本概念
+
+什么是时区::
+时区是地球上的区域使用同一个时间定义. 由于地球自转, 不同地区看到太阳的时间不同, 因此需要划分时区来协调时间.
+
+关键术语::
+
+* **UTC(协调世界时):** 主要的世界时间标准
+
+* **GMT(格林威治标准时间):** 与UTC基本等价
+
+* **时区偏移:** 相对于UTC的时间差, 如+08:00表示东八区
+
+* **夏令时(DST):** 夏季将时钟拨快一小时以节约能源
+
+=== Java中的时区核心类
+
+==== TimeZone类
+
+[source, java, linenums]
+----
+// 获取默认时区
+TimeZone defaultTimeZone = TimeZone.getDefault();
+System.out.println("默认时区: " + defaultTimeZone.getID()); // 如 Asia/Shanghai
+
+// 获取特定时区
+TimeZone newYorkTimeZone = TimeZone.getTimeZone("America/New_York");
+
+// 获取所有可用时区
+String[] availableIDs = TimeZone.getAvailableIDs();
+----
+
+==== ZoneId (Java 8+)
+
+[source, java, linenums]
+----
+// Java 8推荐使用ZoneId
+ZoneId systemZone = ZoneId.systemDefault();
+ZoneId shanghaiZone = ZoneId.of("Asia/Shanghai");
+ZoneId newYorkZone = ZoneId.of("America/New_York");
+
+// 所有可用时区
+Set<String> zoneIds = ZoneId.getAvailableZoneIds();
+----
+
+=== 时区在日期时间中的应用
+
+==== 传统Date类(时区不敏感)
+
+[source, java, linenums]
+----
+Date now = new Date(); // 总是存储UTC时间戳
+System.out.println(now); // 显示取决于默认时区
+
+// 设置显示时区
+SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+sdf.setTimeZone(TimeZone.getTimeZone("America/New_York"));
+System.out.println("纽约时间: " + sdf.format(now));
+----
+
+==== Java 8时间API(时区敏感)
+
+[source, java, linenums]
+----
+// 不同时区的当前时间
+ZonedDateTime shanghaiTime = ZonedDateTime.now(ZoneId.of("Asia/Shanghai"));
+ZonedDateTime newYorkTime = ZonedDateTime.now(ZoneId.of("America/New_York"));
+
+System.out.println("上海: " + shanghaiTime);
+System.out.println("纽约: " + newYorkTime);
+
+// 时区转换
+ZonedDateTime convertedTime = shanghaiTime.withZoneSameInstant(ZoneId.of("UTC"));
+System.out.println("UTC时间: " + convertedTime);
+----
+
+=== 时区偏移和规则
+
+==== 获取时区信息
+
+[source, java, linenums]
+----
+ZoneId zone = ZoneId.of("America/New_York");
+ZoneRules rules = zone.getRules();
+
+// 当前偏移量
+ZoneOffset currentOffset = rules.getOffset(Instant.now());
+System.out.println("当前偏移: " + currentOffset);
+
+// 是否使用夏令时
+boolean isDst = rules.isDaylightSavings(Instant.now());
+System.out.println("是否夏令时: " + isDst);
+
+// 标准偏移
+ZoneOffset standardOffset = rules.getStandardOffset(Instant.now());
+System.out.println("标准偏移: " + standardOffset);
+----
+
+==== 处理夏令时转换
+
+[source, java, linenums]
+----
+// 模拟夏令时转换
+LocalDateTime beforeDst = LocalDateTime.of(2024, 3, 10, 1, 30); // 夏令时开始前
+ZonedDateTime zonedBefore = ZonedDateTime.of(beforeDst, ZoneId.of("America/New_York"));
+
+LocalDateTime afterDst = LocalDateTime.of(2024, 3, 10, 3, 30); // 夏令时开始后
+ZonedDateTime zonedAfter = ZonedDateTime.of(afterDst, ZoneId.of("America/New_York"));
+
+System.out.println("夏令时前: " + zonedBefore);
+System.out.println("夏令时后: " + zonedAfter);
+----
+
+=== 时区最佳实践
+
+==== 存储和传输时间
+
+[source, java, linenums]
+----
+// 最佳实践: 使用UTC存储和传输
+Instant utcInstant = Instant.now();
+System.out.println("UTC时间戳: " + utcInstant);
+
+// 转换为本地时间显示
+ZonedDateTime localTime = utcInstant.atZone(ZoneId.of("Asia/Shanghai"));
+System.out.println("本地时间: " + localTime);
+----
+
+==== 处理用户时区
+
+[source, java, linenums]
+----
+public class TimeZoneService {
+    
+    // 获取用户时区(可从用户配置、浏览器等获取)
+    public ZoneId getUserTimeZone() {
+        return ZoneId.of("Asia/Shanghai"); // 示例
+    }
+    
+    // 将UTC时间转换为用户本地时间
+    public ZonedDateTime toUserLocalTime(Instant utcTime, ZoneId userZone) {
+        return utcTime.atZone(userZone);
+    }
+    
+    // 将用户本地时间转换为UTC
+    public Instant toUtcTime(ZonedDateTime userLocalTime) {
+        return userLocalTime.toInstant();
+    }
+}
+----
+
+==== 时区敏感的调度
+
+[source, java, linenums]
+----
+public class TimeZoneScheduler {
+    
+    public static ZonedDateTime scheduleAtUserTime(LocalDateTime userLocalTime, 
+                                                  ZoneId userZone, 
+                                                  ZoneId systemZone) {
+        // 将用户指定的本地时间转换为系统时区时间
+        ZonedDateTime userZoned = ZonedDateTime.of(userLocalTime, userZone);
+        return userZoned.withZoneSameInstant(systemZone);
+    }
+    
+    // 示例: 用户在北京时间上午9点执行, 系统在UTC时区
+    public static void example() {
+        LocalDateTime userTime = LocalDateTime.of(2024, 1, 15, 9, 0);
+        ZonedDateTime systemTime = scheduleAtUserTime(
+            userTime, 
+            ZoneId.of("Asia/Shanghai"), 
+            ZoneId.of("UTC")
+        );
+        System.out.println("系统执行时间: " + systemTime);
+    }
+}
+----
+
+=== 常见时区问题及解决方案
+
+==== 时区转换错误
+
+[source, java, linenums]
+----
+// 错误做法: 直接转换LocalDateTime
+LocalDateTime localTime = LocalDateTime.now();
+// ZonedDateTime wrong = ZonedDateTime.of(localTime, ZoneId.of("UTC")); // 错误!
+
+// 正确做法: 明确时区信息
+ZonedDateTime correct = localTime.atZone(ZoneId.systemDefault())
+                                .withZoneSameInstant(ZoneId.of("UTC"));
+----
+
+==== 数据库时区处理
+
+[source, java, linenums]
+----
+// JDBC URL中指定时区
+String url = "jdbc:mysql://localhost:3306/test?serverTimezone=Asia/Shanghai";
+
+// 从数据库读取时间时指定时区
+@Configuration
+public class JpaConfig {
+    
+    @Bean
+    public HibernatePropertiesCustomizer hibernatePropertiesCustomizer() {
+        return properties -> {
+            properties.put("hibernate.jdbc.time_zone", "Asia/Shanghai");
+        };
+    }
+}
+----
+
+==== 序列化时区处理
+
+[source, java, linenums]
+----
+// Jackson配置时区
+@Configuration
+public class JacksonConfig {
+    
+    @Bean
+    public ObjectMapper objectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.setTimeZone(TimeZone.getTimeZone("Asia/Shanghai"));
+        return mapper;
+    }
+}
+----
+
+=== 总结
+
+核心要点::
+
+* **理解时区本质:** 时区是相对于UTC的偏移规则集合
+
+* **统一存储:** 在系统中始终使用UTC时间存储和计算
+
+* **本地化显示:** 在显示时根据用户时区进行转换
+
+* **明确时区信息:** 避免使用没有时区信息的时间对象进行跨时区操作
+
+推荐实践::
+
+* 使用Java 8的java.time包代替传统的Date/Calendar
+
+* 在系统边界(API、数据库)明确时区信息
+
+* 为不同地区的用户提供正确的时区支持
+
+* 定期更新时区数据, 以应对政策变化

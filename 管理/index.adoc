@@ -1,0 +1,9 @@
+= 管理
+
+include::OKR讲解.adoc[]
+
+include::开发人员培养计划.adoc[]
+
+include::人员职责.adoc[]
+
+include::Java代码规范.adoc[]

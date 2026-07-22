@@ -1,0 +1,270 @@
+== rolldown原理讲解
+
+Rolldown 是一个使用 **Rust** 编写的 JavaScript 打包工具, 由 Vite 团队开发, 目标是成为 Vite 的**生产构建底层**, 替代目前 Vite 在 `rollup build` 命令中使用的 Rollup. Rolldown 的核心设计理念是: **提供与 Rollup API 高度兼容的接口**, 同时通过 Rust 的高性能和并行计算能力, 大幅提升构建速度.
+
+Rolldown 不是从零发明的新轮子, 而是对 Rollup 生态的"性能升级": 同样的配置, 同样的插件机制, 但快数倍到数十倍.
+
+=== 为什么需要 Rolldown
+
+Vite 在开发环境使用 esbuild(Go 语言)进行模块转换和预构建, 在生产环境使用 Rollup(JavaScript)进行打包. 这种双引擎架构带来了一个根本性问题: **开发与生产构建行为不一致**.
+
+**Rolldown 解决的问题:**
+
+**一致性**:: 开发(esbuild)和生产(Rollup)使用不同的打包器, 可能导致构建结果与开发预览不一致
+**性能**:: Rollup 的纯 JavaScript 实现在大型项目中构建耗时显著, 尤其在 monorepo 或巨量模块场景下
+**插件生态**:: Vite 插件需同时兼容 esbuild 和 Rollup, 增加了插件维护成本
+
+Rolldown 的目标是用**一个引擎统一开发与生产构建**, 同时保持对 Rollup 插件生态的兼容.
+
+=== 核心概念
+
+**Rolldown::** 一个 Rust 实现的 JavaScript/TypeScript 打包工具, 提供与 Rollup 高度兼容的配置 API 和插件接口.
+
+**napi-rs::** 一个允许用 Rust 编写 Node.js 原生插件的框架. Rolldown 通过 napi-rs 暴露 JavaScript API, 让用户可以像使用 Rollup 一样调用它.
+
+**oxc(Oxidation Compiler)::** 一个用 Rust 编写的 JavaScript 工具链, Rolldown 依赖 oxc 的解析器(parser)和 AST 操作能力.
+
+**Magic String::** Rolldown 内部使用的字符串操作抽象, 用于高效地拼接、替换和映射代码片段, 同时保留 source map 信息.
+
+=== 架构设计
+
+Rolldown 的架构分为两层: **Rust 核心层**和 **Node.js 桥接层**.
+
+==== Rust 核心层
+
+Rust 核心负责所有计算密集型任务, 包括:
+
+. **模块解析(Module Resolution)**:: 使用 Rust 实现的增强版 Node.js 模块解析算法, 支持 `node_modules` 查找、`exports` 映射、`tsconfig paths` 等
+. **语法分析**:: 基于 oxc 解析器, 将 JavaScript/TypeScript 源码解析为 AST, 速度远超 `babel` 或 `swc`
+. **依赖图构建**:: 从入口开始递归解析 `import`/`export`, 构建模块依赖图(Module Graph)
+. **Tree Shaking**:: 在 Rust 层完成死代码标记和消除, 无需经过 JavaScript 虚拟机
+. **代码生成(Code Generation)**:: 将优化后的 AST 生成目标代码, 支持 ESM、CJS、IIFE 等多种输出格式
+
+==== Node.js 桥接层
+
+Node.js 层通过 **napi-rs** 调用 Rust 核心, 提供:
+
+. **Rollup 兼容的配置 API**:: `input`, `output`, `plugins`, `external` 等配置项与 Rollup 保持一致
+. **插件系统**:: 兼容 Rollup 的插件 Hook 机制, 同时允许 Rust 原生插件
+. **文件监听(Watch Mode)**:: 基于 `chokidar` 的文件变化监听, 触发增量构建
+
+[plantuml, "Rolldown 架构分层", format=png]
+----
+@startuml
+!theme plain
+skinparam componentStyle rectangle
+
+package "Node.js 层" {
+  [CLI / API] as cli
+  [Rollup 兼容插件] as plugin
+  [Watch Mode] as watch
+}
+
+package "napi-rs 桥接" {
+  [napi bindings] as napi
+}
+
+package "Rust 核心层" {
+  [oxc Parser] as parser
+  [Module Resolver] as resolver
+  [Dependency Graph] as graph
+  [Tree Shaker] as shaker
+  [Code Generator] as generator
+}
+
+cli --> napi
+plugin --> napi
+watch --> cli
+napi --> parser
+napi --> resolver
+napi --> graph
+graph --> shaker
+shaker --> generator
+
+@enduml
+----
+
+=== 与 Rollup 的兼容性
+
+Rolldown 的核心设计目标之一是 **Rollup API 兼容**. 这意味着:
+
+. **配置兼容**:: 大多数 Rollup 配置项可直接在 Rolldown 中使用
+. **插件兼容**:: Rollup 插件通过适配层可在 Rolldown 中运行(但部分依赖 Rollup 内部机制的插件可能受限)
+. **输出兼容**:: 输出格式、chunk 命名、hash 策略等与 Rollup 一致
+
+[source, javascript]
+----
+// Rollup 配置
+import { defineConfig } from 'rollup';
+
+export default defineConfig({
+  input: 'src/main.js',
+  output: {
+    format: 'esm',
+    dir: 'dist',
+  },
+});
+----
+
+[source, javascript]
+----
+// Rolldown 配置 - 几乎完全相同
+import { defineConfig } from 'rolldown';
+
+export default defineConfig({
+  input: 'src/main.js',
+  output: {
+    format: 'esm',
+    dir: 'dist',
+  },
+});
+----
+
+这种兼容性设计使得现有 Rollup 项目可以**低成本迁移**到 Rolldown, 仅需更换包名即可获得性能提升.
+
+=== 构建流程
+
+Rolldown 的构建流程与 Rollup 高度相似, 但内部实现全部在 Rust 中完成:
+
+. **解析配置**:: 读取用户配置和命令行参数, 合并为最终配置对象
+. **加载入口模块**:: 从 `input` 指定的入口开始, 加载源码并解析为 AST
+. **构建模块依赖图**:: 递归解析所有 `import` 语句, 建立模块依赖关系图; 在此过程中应用插件(如 `resolveId`, `load`, `transform`)
+. **Tree Shaking**:: 从入口出发, 标记所有可达的导出和声明, 剪除死代码
+. **代码分割(Code Splitting)**:: 根据动态 `import()` 和 `output.manualChunks` 配置, 将模块图拆分为多个 chunk
+. **代码生成**:: 将每个 chunk 的 AST 生成最终代码, 并生成对应的 source map
+. **输出文件**:: 将生成的代码写入磁盘
+
+[plantuml, "Rolldown 构建流程", format=png]
+----
+@startuml
+!theme plain
+skinparam backgroundColor #FEFEFE
+
+start
+:解析用户配置;
+:加载入口模块;
+:构建模块依赖图;
+note right: 递归解析 import\n应用插件 hooks
+:Tree Shaking;
+note right: 标记死代码并剪除
+:代码分割;
+note right: 动态导入 → 独立 chunk
+:代码生成;
+note right: 生成最终代码 + source map
+:输出文件到磁盘;
+stop
+
+@enduml
+----
+
+=== 性能优势
+
+Rolldown 的性能优势主要来自以下几个方面:
+
+==== Rust 语言优势
+
+与 Rollup 的 JavaScript 实现相比, Rust 在以下方面具有本质优势:
+
+* **零开销抽象**:: Rust 的零成本抽象保证了高性能运行时, 没有 GC 暂停
+* **并行计算**:: Rust 的 `rayon` 等库可以轻松实现模块解析和代码生成的并行处理
+* **内存效率**:: Rust 的所有权系统避免了不必要的内存拷贝和 GC 压力
+
+==== 增量构建
+
+Rolldown 支持增量构建(Incremental Build), 即仅重新处理发生变更的模块, 而非全量重建:
+
+[source, javascript]
+----
+import { rolldown } from 'rolldown';
+
+const bundle = await rolldown({
+  input: 'src/main.js',
+  incremental: true, // 启用增量构建
+});
+
+// 首次构建
+const result = await bundle.generate({ format: 'esm' });
+
+// 修改文件后, 仅重新处理变更模块
+const result2 = await bundle.generate({ format: 'esm' }); // 增量构建
+----
+
+==== 与 esbuild 的对比
+
+.Rolldown vs esbuild vs Rollup
+|===
+| 特性 | Rolldown | esbuild | Rollup
+
+| 实现语言
+| Rust
+| Go
+| JavaScript
+
+| Rollup API 兼容
+| ✅ 高度兼容
+| ❌ 不兼容
+| ✅ 原生
+
+| 插件生态
+| Rollup 插件兼容 + Rust 插件
+| 自定义插件
+| Rollup 插件
+
+| Tree Shaking
+| ✅ 完整
+| 有限
+| ✅ 完整
+
+| 代码分割
+| ✅ 完整
+| 有限
+| ✅ 完整
+
+| 增量构建
+| ✅ 支持
+| 有限
+| ❌ 不支持
+
+| 构建速度
+| 极快(Rust)
+| 极快(Go)
+| 中等(JS)
+|===
+
+=== 插件系统
+
+Rolldown 的插件系统兼容 Rollup 的 Hook 模型, 同时引入了 Rust 原生插件的能力.
+
+==== Rollup 兼容插件
+
+Rollup 插件可以直接在 Rolldown 中使用, 但有以下限制:
+
+* **不依赖 Rollup 内部 API 的插件**通常可直接使用(如 `@rollup/plugin-json`, `@rollup/plugin-node-resolve`)
+* **依赖 Rollup 内部 API 的插件**(如访问 `this.parse`, `this.resolve` 等)需要适配
+* 部分使用 `moduleParsed` Hook 的插件行为可能与 Rollup 略有不同
+
+[source, javascript]
+----
+import { rolldown } from 'rolldown';
+import json from '@rollup/plugin-json';
+
+const bundle = await rolldown({
+  input: 'src/main.js',
+  plugins: [json()], // 直接使用 Rollup 插件
+});
+----
+
+==== Rust 原生插件
+
+Rolldown 允许用 Rust 编写插件, 获得更高的执行性能. Rust 插件可以直接操作 AST, 避免了序列化/反序列化的开销.
+
+=== 总结
+
+Rolldown 是 JavaScript 打包工具领域的重要革新:
+
+* **Rust 核心**带来了数量级的性能提升, 解决了 Rollup 在大型项目中的性能瓶颈
+* **Rollup API 兼容**降低了迁移成本, 现有 Rollup 生态可以平滑过渡
+* **统一构建引擎**解决了 Vite 开发/生产构建不一致的问题
+* **增量构建**支持进一步提升了开发体验, 尤其是在大型 monorepo 中
+
+Rolldown 目前仍处于积极开发阶段, 但已展现出成为下一代 JavaScript 打包标准的有力潜力. 当 Rolldown 成熟后, Vite 将用它替换 esbuild(开发)和 Rollup(生产), 实现单一构建引擎的完整闭环.

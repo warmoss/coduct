@@ -1,0 +1,134 @@
+== CSS clear 原理讲解
+
+**clear** 属性用于控制元素在浮动元素旁边的行为, 是 CSS 布局中处理浮动影响的重要工具. 本文将详细讲解 clear 的作用、语法、取值以及实际应用.
+
+=== 什么是 clear?
+
+clear 属性指定一个元素是否可以在它之前的浮动元素旁边显示, 还是必须移动到它们下方. 它通常与浮动(float)一起使用, 以解决父容器高度塌陷或元素重叠等问题.
+
+=== 语法与取值
+
+[source, css]
+----
+clear: none | left | right | both | inherit;
+----
+
+* **none(默认值):** 允许元素两侧都可以有浮动元素, 不强制换行.
+
+* **left:** 元素的左侧不允许有浮动元素. 如果左侧有浮动元素, 则元素会向下移动, 直到左侧没有浮动元素.
+
+* **right:** 元素的右侧不允许有浮动元素.
+
+* **both:** 元素两侧都不允许有浮动元素. 如果两侧有浮动元素, 则元素会向下移动, 直到两侧都没有浮动元素.
+
+* **inherit:** 从父元素继承 clear 属性的值.
+
+=== clear 如何工作?
+
+clear 属性通过增加元素的上外边距(margin-top), 使元素向下移动, 直到它满足指定的方向没有浮动元素. 注意: clear 只对**块级元素**有效, 并且只影响元素本身的位置, 不会改变浮动元素的布局.
+
+**示例**
+
+HTML:
+
+[source, html]
+----
+<div class="float-left">浮动元素1</div>
+<div class="float-left">浮动元素2</div>
+<div class="clear-left">我要清除左侧浮动</div>
+----
+
+CSS:
+
+[source, css]
+----
+.float-left {
+  float: left;
+  width: 100px;
+  height: 50px;
+  background: lightblue;
+  margin-right: 10px;
+}
+.clear-left {
+  clear: left; /* 确保该元素左侧没有浮动元素 */
+  background: lightcoral;
+  padding: 10px;
+}
+----
+
+效果: 前两个元素浮动向左排列成一行, 第三个元素因为 clear: left, 会移动到它们下方(即新的一行开始), 且左侧不再紧贴任何浮动元素.
+
+=== 常见应用场景
+
+==== 阻止文字环绕
+
+当图片浮动后, 文字会环绕在图片周围. 如果你希望某段文字另起一行(即不环绕), 可以使用 clear.
+
+[source, css]
+----
+img {
+  float: left;
+}
+p.clear {
+  clear: left;
+}
+----
+
+==== 解决父容器高度塌陷(清除浮动)
+
+当子元素全部浮动时, 父容器会失去高度(高度塌陷). 常见的清除浮动方法之一就是在父容器末尾添加一个空元素并设置 clear: both.
+
+[source, css]
+----
+.clearfix::after {
+  content: "";
+  display: table;
+  clear: both;
+}
+----
+
+或者用经典的空div:
+
+[source, html]
+----
+<div style="clear: both;"></div>
+----
+
+==== 多列布局
+
+在简单的多列浮动布局中, 可以通过在每一行末尾添加一个清除浮动的元素来换行.
+
+[source, css]
+----
+.row::after {
+  content: "";
+  display: table;
+  clear: both;
+}
+.column {
+  float: left;
+  width: 33.33%;
+}
+----
+
+=== 现代布局与 clear
+
+随着 Flexbox 和 Grid 的出现, 许多需要 float 和 clear 的场景已经被取代. 但 clear 仍然在特定情况下有用, 例如:
+
+* 维护旧项目或兼容旧浏览器.
+
+* 处理图文混排中的简单换行需求.
+
+* 作为清除浮动的备用方案.
+
+=== 注意事项
+
+* clear 只影响元素自身的位置, 不会修改浮动元素的属性.
+
+* 如果元素同时有 float 和 clear, 则 clear 可能会影响浮动元素的位置, 但通常不推荐同时使用.
+
+* 当一个元素同时设置了 clear 和 margin-top, 其实际的上边距由浏览器根据清除后的位置计算, 有时会忽略部分 margin-top, 需留意.
+
+=== 总结
+
+clear 是 CSS 中用于控制元素与浮动元素关系的简单而有效的属性. 理解它的工作原理可以帮助你更好地掌握传统浮动布局, 并在必要时灵活运用. 虽然现代布局方式已经逐渐替代浮动, 但 clear 依然是每个前端开发者必须掌握的基础知识.

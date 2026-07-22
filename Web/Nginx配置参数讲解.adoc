@@ -1,0 +1,283 @@
+== Nginx配置参数讲解
+
+=== 全局块(Main Context)
+
+==== 核心参数
+
+[source, nginx, linenums]
+----
+user nginx nginx;                    # 运行Nginx的用户和用户组
+worker_processes auto;               # worker进程数, auto表示自动设置为CPU核心数
+error_log /var/log/nginx/error.log;  # 错误日志路径和级别
+pid /run/nginx.pid;                  # PID文件位置
+worker_rlimit_nofile 65535;          # 每个worker进程能打开的最大文件数
+----
+
+=== Events 块
+
+[source, nginx, linenums]
+----
+events {
+    worker_connections 1024;         # 每个worker进程的最大连接数
+    use epoll;                       # 使用的事件驱动模型(Linux推荐epoll)
+    multi_accept on;                 # 是否一次性接受所有新连接
+    accept_mutex on;                 # 是否启用连接互斥锁
+}
+----
+
+=== HTTP 块
+
+==== 基础配置
+
+[source, nginx, linenums]
+----
+http {
+    include /etc/nginx/mime.types;    # 包含MIME类型定义文件
+    default_type application/octet-stream;  # 默认MIME类型
+    
+    # 日志格式
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+    
+    access_log /var/log/nginx/access.log main;  # 访问日志
+}
+----
+
+==== 性能优化参数
+
+[source, nginx, linenums]
+----
+http {
+    sendfile on;                      # 启用sendfile系统调用
+    tcp_nopush on;                    # 在sendfile模式下, 启用TCP_CORK
+    tcp_nodelay on;                   # 禁用Nagle算法
+    keepalive_timeout 65;             # 保持连接超时时间
+    keepalive_requests 100;           # 一个连接上的最大请求数
+    
+    # 缓冲区设置
+    client_body_buffer_size 128k;     # 客户端请求体缓冲区大小
+    client_max_body_size 10m;         # 客户端上传文件最大大小
+    
+    # Gzip压缩
+    gzip on;
+    gzip_min_length 1k;
+    gzip_comp_level 2;
+    gzip_types text/plain text/css application/json application/javascript;
+}
+----
+
+=== Server 块(虚拟主机)
+
+[source, nginx, linenums]
+----
+server {
+    listen 80;                        # 监听端口
+    server_name example.com www.example.com;  # 域名
+    
+    root /var/www/html;               # 网站根目录
+    index index.html index.htm;       # 默认索引文件
+    
+    # 位置块
+    location / {
+        try_files $uri $uri/ =404;    # 文件查找规则
+    }
+    
+    # 静态文件处理
+    location ~* \.(jpg|jpeg|png|gif|ico|css|js)$ {
+        expires 30d;                  # 缓存过期时间
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # API代理
+    location /api/ {
+        proxy_pass http://backend_server;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+    
+    # 错误页面
+    error_page 404 /404.html;
+    error_page 500 502 503 504 /50x.html;
+}
+----
+
+=== Location 块详解
+
+==== 匹配规则
+
+[source, nginx, linenums]
+----
+location = /uri        # 精确匹配
+location ^~ /uri       # 前缀匹配, 停止正则检查
+location ~ pattern     # 区分大小写的正则匹配
+location ~* pattern    # 不区分大小写的正则匹配
+location /uri          # 普通前缀匹配
+----
+
+==== 常用配置示例
+
+[source, nginx, linenums]
+----
+# 静态资源
+location /static/ {
+    alias /var/www/static/;
+    expires max;
+    access_log off;
+}
+
+# PHP处理
+location ~ \.php$ {
+    fastcgi_pass 127.0.0.1:9000;
+    fastcgi_index index.php;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    include fastcgi_params;
+}
+
+# 反向代理
+location /app/ {
+    proxy_pass http://127.0.0.1:8080/;
+    proxy_redirect off;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+----
+
+=== 反向代理配置
+
+[source, nginx, linenums]
+----
+upstream backend {
+    server 192.168.1.10:8080 weight=3;    # 权重
+    server 192.168.1.11:8080;
+    server 192.168.1.12:8080 backup;      # 备份服务器
+    
+    # 负载均衡算法
+    # least_conn;    # 最少连接
+    # ip_hash;       # IP哈希
+}
+
+server {
+    location / {
+        proxy_pass http://backend;
+        
+        # 代理头信息
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # 超时设置
+        proxy_connect_timeout 30s;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        
+        # 缓冲区
+        proxy_buffering on;
+        proxy_buffer_size 4k;
+        proxy_buffers 8 4k;
+    }
+}
+----
+
+=== SSL/TLS 配置
+
+[source, nginx, linenums]
+----
+server {
+    listen 443 ssl http2;
+    server_name example.com;
+    
+    ssl_certificate /etc/nginx/ssl/example.com.crt;
+    ssl_certificate_key /etc/nginx/ssl/example.com.key;
+    
+    # SSL优化
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    
+    # HSTS
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+}
+----
+
+=== 安全配置
+
+[source, nginx, linenums]
+----
+# 隐藏Nginx版本号
+server_tokens off;
+
+# 安全头
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-XSS-Protection "1; mode=block" always;
+add_header Referrer-Policy "no-referrer-when-downgrade" always;
+
+# 限制请求方法
+if ($request_method !~ ^(GET|POST|HEAD)$) {
+    return 444;
+}
+
+# 限制访问频率
+limit_req_zone $binary_remote_addr zone=one:10m rate=1r/s;
+
+location /login {
+    limit_req zone=one burst=5 nodelay;
+}
+----
+
+=== 完整的配置示例
+
+[source, nginx, linenums]
+----
+# 全局配置
+user www-data;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 2048;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+    
+    access_log /var/log/nginx/access.log main;
+    
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    
+    # 虚拟主机
+    server {
+        listen 80;
+        server_name example.com;
+        root /var/www/example;
+        index index.html;
+        
+        location / {
+            try_files $uri $uri/ =404;
+        }
+        
+        location ~ \.php$ {
+            include fastcgi_params;
+            fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
+            fastcgi_index index.php;
+            fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        }
+    }
+}
+----
+
+这些是 Nginx 配置的核心参数, 实际使用时需要根据具体需求进行调整. 建议在修改配置后使用 nginx -t 测试配置文件的正确性.

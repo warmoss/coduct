@@ -1,0 +1,331 @@
+[[aho-corasick]]
+== Aho-Corasick算法讲解
+
+Aho-Corasick 算法(简称 AC 自动机)是一种经典的多模式串匹配算法, 由 Alfred V. Aho 和 Margaret J. Corasick 于 1975 年提出. 它解决了在**一个主串**中同时查找**多个模式串**所有出现位置的问题, 将 KMP 算法的单模式串线性匹配思想推广到多模式串场景.
+
+=== 问题定义
+
+多模式串匹配问题:: 给定一个**主串** stem:[T](长度 stem:[n])和一组**模式串集合** stem:[P = {P_1, P_2, ldots, P_k}](总长度 stem:[m]), 找出 stem:[P] 中任意模式串在 stem:[T] 中的所有出现位置.
+
+朴素做法是对每个模式串分别运行 KMP 算法, 时间复杂度为 stem:[O(k * (n + m_i))] 即 stem:[O(kn + m)], 当模式串数量 k 很大时效率低下. AC 自动机通过一次扫描主串即可找出所有匹配, 将时间复杂度降至 stem:[O(n + m)].
+
+=== 核心思想
+
+AC 自动机的核心是**在预处理阶段构建一个带有失败指针的 Trie 树**, 在匹配阶段利用失败指针实现主串指针不回退的多模式匹配.
+
+AC 自动机的三要素::
+
+* **goto 函数(构建 Trie 树):** 将所有模式串构建成一棵 Trie 树, 每个节点代表一个字符, 路径代表一个前缀.
+* **failure 函数(失败指针):** 为每个节点计算一个失败指针, 指向当前节点失配时应跳转的位置. 这是 AC 自动机与普通 Trie 树的本质区别.
+* **output 函数(输出):** 每个节点关联一个输出集合, 记录从根到该节点的路径上包含的所有完整模式串.
+
+=== 数据结构: Trie 树 + 失败指针
+
+AC 自动机建立在 Trie 树之上, 每个节点除了存储子节点信息外, 还额外存储两个关键字段:
+
+[source, python]
+----
+class AhoCorasickNode:
+    def __init__(self):
+        self.children = {}      # goto 表: 字符 -> 子节点
+        self.fail = None        # failure 指针
+        self.output = []        # 当前节点匹配到的模式串列表
+----
+
+失败指针的定义:: 对于节点 `v`, 其失败指针 `fail[v]` 指向**Trie 树中另一个节点 w**, 使得从根到 w 的路径是"从根到 v 的路径的最长真后缀". 这个定义与 KMP 的前缀函数 stem:[\pi] 一脉相承.
+
+[plantuml, "AC自动机节点结构示意图", format=png]
+----
+@startuml
+skinparam rectangle {
+    BackgroundColor LightBlue
+    BorderColor DarkBlue
+}
+
+rectangle "root" as root
+rectangle "a" as a
+rectangle "ab" as ab
+rectangle "bc" as bc
+rectangle "c" as c
+
+root --> a : a
+a --> ab : b
+root --> bc : b
+bc --> c : c
+
+a --> root : fail
+ab --> bc : fail
+bc --> root : fail
+c --> root : fail
+
+note right of ab : output: {"ab"}
+note right of c : output: {"bc"}
+
+@enduml
+----
+
+NOTE: 失败指针的概念与 KMP 算法中的前缀函数高度相似. 如果你已理解 KMP 的 <<KMP算法讲解, 前缀函数>>, 可以将其看作从前缀函数的"链式结构"推广到了"树状结构".
+
+=== 构建失败指针
+
+失败指针的构建采用**广度优先搜索(BFS)** 方式, 逐层计算每个节点的失败指针:
+
+. **根节点**的直接子节点的失败指针指向根节点.
+
+. 对于队列中的节点 `u`, 遍历其每个子节点 `v`(对应字符 `c`):
+   * 从 `fail[u]` 开始, 沿着失败指针向上追溯, 直到找到一个节点 `w`, 使得 `w` 有字符 `c` 的子节点.
+   * 如果找到, 则 `fail[v] = w.children[c]`.
+   * 如果追溯到根节点仍未找到, 则 `fail[v] = root`.
+   * 合并输出: `v.output += fail[v].output`.
+
+[source, python]
+----
+from collections import deque
+
+def build_failure_pointers(root):
+    queue = deque()
+    
+    # 第一层节点: 失败指针指向根
+    for char, child in root.children.items():
+        child.fail = root
+        queue.append(child)
+    
+    # BFS 逐层构建
+    while queue:
+        u = queue.popleft()
+        for char, v in u.children.items():
+            # 沿着失败指针追溯
+            w = u.fail
+            while w and char not in w.children:
+                w = w.fail
+            if w:
+                v.fail = w.children[char]
+            else:
+                v.fail = root
+            # 合并输出
+            v.output = v.output + v.fail.output
+            queue.append(v)
+----
+
+[plantuml, "失败指针构建示例 - 模式串 {he, she, his, hers}", format=png]
+----
+@startuml
+skinparam ranksep 30
+
+rectangle "root" as root
+rectangle "h" as h
+rectangle "he" as he
+rectangle "her" as her
+rectangle "hers" as hers
+rectangle "s" as s
+rectangle "sh" as sh
+rectangle "she" as she
+rectangle "i" as i
+rectangle "is" as is
+rectangle "his" as his
+
+root --> h : h
+h --> he : e
+he --> her : r
+her --> hers : s
+h --> hi : i
+hi --> his : s
+root --> s : s
+s --> sh : h
+sh --> she : e
+
+h --> root : fail (虚线)
+s --> root : fail (虚线)
+he --> s : fail (虚线)
+hi --> s... : fail
+
+note right of he : output: {"he"}
+note right of hers : output: {"hers"}
+note right of she : output: {"she", "he"}
+note right of his : output: {"his"}
+note right of is : output: {"is"}
+
+@enduml
+----
+
+上例展示了模式串集合 {he, she, his, hers} 的 AC 自动机结构. 注意节点 `she` 的失败指针指向 `he`, 因此 `she` 的输出同时包含 "she" 和 "he".
+
+=== 匹配过程
+
+构建好失败指针后, 匹配过程非常简洁:
+
+. 从根节点开始, 主串指针 `i` 遍历主串 T.
+. 对每个字符 `T[i]`:
+   * 如果当前节点有 `T[i]` 的子节点, 则移动到该子节点.
+   * 否则沿失败指针回退, 直到找到一个有 `T[i]` 子节点的节点或回到根节点.
+   * 到达目标节点后, 检查其 `output` 列表, 输出所有匹配的模式串及其起始位置.
+. 重复直至主串结束.
+
+[source, python]
+----
+def ac_search(root, text):
+    result = []  # (起始位置, 模式串) 列表
+    node = root
+    
+    for i, ch in enumerate(text):
+        # 沿失败指针查找可继续的节点
+        while node != root and ch not in node.children:
+            node = node.fail
+        if ch in node.children:
+            node = node.children[ch]
+        else:
+            node = root
+        
+        # 输出当前节点的所有匹配
+        for pattern in node.output:
+            result.append((i - len(pattern) + 1, pattern))
+    
+    return result
+----
+
+==== 匹配示例
+
+以主串 T = "shers", 模式串集合 {he, she, his, hers} 为例:
+
+[cols="4*"]
+|===
+| 步骤 | 主串位置 | 当前节点 | 输出
+
+| 1 | s(0) | s | -
+| 2 | h(1) | sh | -
+| 3 | e(2) | she | (0, she), (1, he)
+| 4 | r(3) | her | -
+| 5 | s(4) | hers | (1, hers)
+|===
+
+注意: 节点 she 的输出包含自身与失败指针指向的 he.
+
+=== 时间复杂度分析
+
+* **构建阶段:** 为所有模式串建 Trie 树 O(m)(m 为所有模式串总长度), 加上 BFS 构建失败指针 O(m). 总构建时间为 **O(m)**.
+
+* **匹配阶段:** 主串指针 i 遍历 n 个字符, 每次字符处理中 while 循环回退的总次数不超过 n(因为每次回退减少节点深度, 而深度增加次数不超过 n). 匹配阶段为 **O(n)**.
+
+* **总体复杂度: O(n + m)**, 其中 n 为主串长度, m 为所有模式串总长度.
+
+WARNING: 这里的时间复杂度是**严格线性**的, 与模式串数量无关. 无论要匹配 10 个还是 10 万个模式串, 只要总长度 m 不变, 构建和匹配的复杂度量级不变.
+
+=== 完整代码实现
+
+下面给出一个完整的 Python 实现, 包含构建和匹配两个阶段:
+
+[source, python]
+----
+from collections import deque
+
+class ACNode:
+    """AC 自动机节点"""
+    def __init__(self):
+        self.children = {}
+        self.fail = None
+        self.output = []
+
+class AhoCorasick:
+    """Aho-Corasick 自动机"""
+    def __init__(self, patterns: list[str]):
+        self.root = ACNode()
+        self._build_trie(patterns)
+        self._build_failure()
+    
+    def _build_trie(self, patterns: list[str]):
+        """构建 Trie 树"""
+        for pattern in patterns:
+            node = self.root
+            for ch in pattern:
+                if ch not in node.children:
+                    node.children[ch] = ACNode()
+                node = node.children[ch]
+            node.output.append(pattern)
+    
+    def _build_failure(self):
+        """BFS 构建失败指针"""
+        queue = deque()
+        for child in self.root.children.values():
+            child.fail = self.root
+            queue.append(child)
+        
+        while queue:
+            u = queue.popleft()
+            for ch, v in u.children.items():
+                w = u.fail
+                while w and ch not in w.children:
+                    w = w.fail
+                v.fail = w.children[ch] if w else self.root
+                v.output += v.fail.output  # 合并输出
+                queue.append(v)
+    
+    def search(self, text: str) -> list[tuple[int, str]]:
+        """在主串中搜索所有模式串"""
+        result = []
+        node = self.root
+        
+        for i, ch in enumerate(text):
+            while node != self.root and ch not in node.children:
+                node = node.fail
+            if ch in node.children:
+                node = node.children[ch]
+            else:
+                node = self.root
+            
+            for pattern in node.output:
+                result.append((i - len(pattern) + 1, pattern))
+        
+        return result
+
+# 使用示例
+patterns = ["he", "she", "his", "hers"]
+ac = AhoCorasick(patterns)
+
+text = "shers"
+matches = ac.search(text)
+for pos, pattern in matches:
+    print(f"位置 {pos}: '{pattern}'")
+# 输出:
+# 位置 0: 'she'
+# 位置 1: 'he'
+# 位置 1: 'hers'
+----
+
+=== 算法对比
+
+[cols="4*"]
+|===
+| 算法 | 时间复杂度 | 适用场景 | 匹配模式数
+
+| 朴素 Trie 匹配 | O(n * 模式串平均长度) | 少量模式串 | 单次或少量
+| 多次 KMP | O(kn + m) | 少量模式串 | k 个
+| AC 自动机 | O(n + m) | 大量模式串 | 任意数量
+|===
+
+=== 应用场景
+
+* **敏感词过滤:** 在文本中同时检测多个敏感词, 广泛应用于内容审核系统.
+* **病毒特征码匹配:** 杀毒软件用 AC 自动机在文件中同时搜索已知病毒的特征码.
+* **生物信息学:** 在 DNA 序列中同时搜索多个基因片段或引物序列.
+* **入侵检测系统(IDS):** 如 Snort 等系统使用 AC 自动机在网络流量中匹配攻击特征.
+* **中文分词:** 在词典模式的分词算法中, 用 AC 自动机快速匹配所有词典词.
+
+=== 优缺点分析
+
+优点::
+
+. **线性时间复杂度:** O(n + m), 模式串数量不影响匹配速度.
+. **一次扫描:** 主串只需遍历一次, 适合处理流式数据和大文件.
+. **可扩展:** 支持动态添加模式串(需重新构建失败指针).
+
+缺点::
+
+. **内存占用大:** 每个 Trie 节点都需要存储子节点指针和失败指针, 当模式串数量巨大时内存消耗可观.
+. **构建开销:** 模式串集合变化时需要重新构建自动机.
+. **缓存不友好:** 失败指针的跳转可能导致大量内存随机访问, 影响实际性能.
+
+TIP: 对于超大模式串集合(如百万级别), 可以考虑使用 **Double-Array Trie** 来压缩存储, 或使用 **有限状态机** 的变种来优化缓存局部性.
+
+=== 总结
+
+Aho-Corasick 算法是多模式串匹配领域的经典之作. 它巧妙地结合了 Trie 树的结构优势和 KMP 的前缀函数思想, 实现了**线性时间的一次扫描多匹配**能力. 虽然在实际工程中可能因内存和缓存问题需要优化, 但其核心设计理念至今仍广泛应用于文本处理、网络安全和生物信息学等领域.

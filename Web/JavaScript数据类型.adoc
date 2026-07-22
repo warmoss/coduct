@@ -1,0 +1,12 @@
+== JavaScript数据类型
+
+* Null
+* Symbol(ES6新增)
+* BigInt(ES2020新增)
+* Date
+* RegExp
+* Map、Set(ES6)
+* WeakMap、WeakSet
+* Promise(ES6)
+* Error(及其子类型如 TypeError、ReferenceError等)
+* **Decimal(第三方库 decimal.js 用于金融计算)**

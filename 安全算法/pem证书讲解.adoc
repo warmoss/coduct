@@ -1,0 +1,304 @@
+== PEM证书讲解
+
+PEM(Privacy-Enhanced Mail)本是早期互联网安全电子邮件协议的标准格式, 虽然后来电子邮件加密转向了 PGP/GPG, 但 PEM 格式因其简洁和通用性, 意外成为了**现代密码学中最广泛使用的密钥和证书编码格式**.
+
+几乎所有 TLS/SSL 相关的工具、服务器和库都支持 PEM 格式: OpenSSL, nginx, Apache, Java, Python 的 `cryptography` 库, Go 的 `crypto/tls` 包等.
+
+=== 什么是 PEM
+
+PEM 本质上是一种**基于 Base64 编码的文本封装格式**, 用于表示各类密码学对象: 证书、私钥、公钥、证书请求等.
+
+[source,plaintext]
+----
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+...
+-----END CERTIFICATE-----
+----
+
+PEM 格式的核心特征:
+
+* **文本可读:** 纯文本形式, 可直接用文本编辑器打开查看, 方便复制和传输
+* **自描述:** 通过 `BEGIN`/`END` 头尾标记清晰说明内容类型
+* **平台无关:** 不依赖平台编码, 在 Unix, Windows, macOS 间可无缝传递
+* **易于拼接:** 支持将多个 PEM 对象依次串联在同一个文件中(如证书链)
+
+NOTE: PEM 格式虽然名字里有"Enhanced Mail", 但实际与电子邮件已无关系, 它是当前网络安全领域的通用格式.
+
+=== PEM 文件结构
+
+一个完整的 PEM 块包含三个部分:
+
+. **头标记:** `-----BEGIN <类型>-----` 标识内容类型
+. **主体:** Base64 编码的 DER 二进制数据(每行通常 64 个字符)
+. **尾标记:** `-----END <类型>-----` 标识内容结束
+
+[source,plaintext]
+----
+-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIE5hdGlvbmFsIEFlcm9uYXV0aWNzIGFu
+...                                                          <1>
+-----END CERTIFICATE-----
+----
+<1> Base64 编码的 DER 数据, 每行 64 字节
+
+=== 常见 PEM 类型
+
+PEM 的 `BEGIN`/`END` 标记指明了内部数据的类型. 以下是日常开发中最常见的类型:
+
+[cols="2,3,2"]
+|====
+| PEM 标记 | 含义 | 常见扩展名
+
+| `BEGIN CERTIFICATE`
+| X.509 证书
+| .pem, .crt, .cert
+
+| `BEGIN PRIVATE KEY`
+| PKCS#8 私钥(无加密)
+| .key, .pem
+
+| `BEGIN ENCRYPTED PRIVATE KEY`
+| PKCS#8 加密私钥(带密码)
+| .key, .pem
+
+| `BEGIN RSA PRIVATE KEY`
+| RSA 私钥(PKCS#1 格式, 传统)
+| .key, .pem
+
+| `BEGIN PUBLIC KEY`
+| PKCS#8 公钥
+| .pub, .pem
+
+| `BEGIN RSA PUBLIC KEY`
+| RSA 公钥(PKCS#1 格式, 传统)
+| .pub, .pem
+
+| `BEGIN CERTIFICATE REQUEST`
+| PKCS#10 证书签名请求(CSR)
+| .csr
+
+| `BEGIN X509 CRL`
+| 证书吊销列表(CRL)
+| .crl
+
+| `BEGIN DH PARAMETERS`
+| Diffie-Hellman 参数
+| .pem
+
+| `BEGIN EC PRIVATE KEY`
+| 椭圆曲线(EC)私钥(SEC 1 格式)
+| .key, .pem
+
+|====
+
+WARNING: `BEGIN RSA PRIVATE KEY`(PKCS#1)和 `BEGIN PRIVATE KEY`(PKCS#8)不是同一种格式. PKCS#8 是更现代、更通用的标准, 支持多种算法(RSA, EC, Ed25519 等), 而 PKCS#1 仅支持 RSA. 新系统应优先使用 PKCS#8.
+
+=== PEM vs DER
+
+PEM 和 DER 是 OpenSSL 中最基本的两种编码格式:
+
+|====
+| 对比维度 | PEM | DER
+
+| 编码方式
+| Base64 + 头尾标记
+| 二进制 ASN.1 BER
+
+| 可读性
+| 纯文本, 可读
+| 二进制, 不可读
+
+| 文件大小
+| 比 DER 大约多 30%
+| 紧凑
+
+| 多对象支持
+| 可串联多个 PEM 块
+| 需额外封装
+
+| 解析性能
+| 需解码 Base64
+| 直接解析, 更快
+
+| 典型应用
+| 分发、展示、手动管理
+| 程序内部处理、内存表示
+
+|====
+
+转换命令(使用 OpenSSL):
+
+[source,shell]
+----
+# PEM -> DER
+openssl x509 -in cert.pem -outform DER -out cert.der
+
+# DER -> PEM
+openssl x509 -in cert.der -inform DER -out cert.pem
+----
+
+=== 单个文件包含多个 PEM 块
+
+PEM 的一个强大特性是支持将多个对象串联在同一个文件中. 最常见的场景是**证书链(certificate chain)**:
+
+[source,plaintext]
+----
+-----BEGIN CERTIFICATE-----
+(服务器证书 - 叶证书)
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+(中间 CA 证书)
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+(根 CA 证书)
+-----END CERTIFICATE-----
+----
+
+服务器配置(如 nginx)中通常需要指定证书链文件:
+
+[source,nginx]
+----
+server {
+    listen 443 ssl;
+    ssl_certificate     /etc/ssl/certs/chain.pem;   # 串联的证书链
+    ssl_certificate_key /etc/ssl/private/server.key; # 私钥
+}
+----
+
+NOTE: 正确的证书链顺序是: 叶证书 -> 中间 CA -> 根 CA. 根 CA 证书通常可省略(客户端信任存储中已有).
+
+=== OpenSSL 实用命令
+
+以下是最常用的 PEM 操作命令:
+
+.查看 PEM 证书的文本化信息
+[source,shell]
+----
+openssl x509 -in cert.pem -text -noout
+----
+
+.查看 PEM 私钥的信息(不暴露私钥本身)
+[source,shell]
+----
+openssl pkey -in private.pem -text -noout
+openssl rsa -in rsa_private.pem -text -noout  # RSA PKCS#1 格式
+----
+
+.验证证书链
+[source,shell]
+----
+openssl verify -CAfile ca-chain.pem server-cert.pem
+----
+
+.提取证书中的公钥
+[source,shell]
+----
+openssl x509 -in cert.pem -pubkey -noout > public.pem
+----
+
+.生成自签名证书(一步完成)
+[source,shell]
+----
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+    -days 365 -nodes -subj "/CN=example.com"
+----
+
+WARNING: `-nodes` 参数表示不加密私钥(no DES). 生产环境中应根据需要使用加密私钥(`BEGIN ENCRYPTED PRIVATE KEY`).
+
+=== 程序中的 PEM 操作
+
+.Java 读取 PEM 证书
+
+[source,java]
+----
+// 使用 Java 内置的 CertificateFactory
+CertificateFactory cf = CertificateFactory.getInstance("X.509");
+
+// 从 PEM 文件读取(支持 PEM 和 DER 自动检测)
+try (FileInputStream fis = new FileInputStream("cert.pem")) {
+    X509Certificate cert = (X509Certificate) cf.generateCertificate(fis);
+    System.out.println("颁发者: " + cert.getIssuerX500Principal());
+    System.out.println("有效期至: " + cert.getNotAfter());
+}
+----
+
+.Go 解析 PEM 块
+
+[source,go]
+----
+import (
+    "crypto/x509"
+    "encoding/pem"
+    "os"
+)
+
+// 解码 PEM 块
+data, _ := os.ReadFile("cert.pem")
+block, _ := pem.Decode(data)     // <1>
+if block == nil || block.Type != "CERTIFICATE" {
+    panic("无效的 PEM 数据")
+}
+
+// 解析为 X.509 证书对象
+cert, _ := x509.ParseCertificate(block.Bytes)
+----
+<1> `pem.Decode` 自动寻找第一个 PEM 块并返回解码后的字节和块类型
+
+.Python 使用 cryptography 库
+
+[source,python]
+----
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+
+# 加载证书
+with open("cert.pem", "rb") as f:
+    cert = x509.load_pem_x509_certificate(f.read())
+
+print(cert.subject)
+
+# 加载私钥
+with open("private.pem", "rb") as f:
+    key = serialization.load_pem_private_key(
+        f.read(),
+        password=None  # 或 b"password"
+    )
+----
+
+.Nginx 配置中使用 PEM
+
+[source,nginx]
+----
+server {
+    listen 443 ssl http2;
+    server_name example.com;
+
+    ssl_certificate     /etc/nginx/certs/example.com.pem;
+    ssl_certificate_key /etc/nginx/certs/example.com.key;
+    ssl_trusted_certificate /etc/nginx/certs/ca-chain.pem;  # <1>
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+}
+----
+<1> `ssl_trusted_certificate` 用于 OCSP Stapling 验证, 与 `ssl_certificate` 文件内容相同即可
+
+=== 常见误区与最佳实践
+
+[WARNING]
+====
+* **不要混淆格式:** PEM 是 Base64 文本, DER 是二进制. OpenSSL 默认使用 PEM, 但 Java 的 `keytool` 默认使用 DER(JKS 内部).
+* **私钥保护:** PEM 私钥文件(`.key`)应设置严格权限(`chmod 600`), 必要时使用加密 PEM(`BEGIN ENCRYPTED PRIVATE KEY`).
+* **正确扩展名不保证格式:** `.pem` 扩展名不保证内部一定是证书--可能是私钥、公钥或 CSR, 应检查 `BEGIN` 标记.
+* **证书链顺序:** nginx/Apache 配置中, 证书链文件必须顺序正确(叶 -> 中间 -> 根), 否则部分客户端(TLS 握手)会报错.
+====
+
+=== 总结
+
+* PEM 是 TLS/SSL 生态中最通用的密钥和证书编码格式, 基于 Base64 + 头尾标记的文本封装
+* 常见类型包括 `CERTIFICATE`, `PRIVATE KEY`, `PUBLIC KEY`, `CERTIFICATE REQUEST` 等, 不同类型有不同的 `BEGIN`/`END` 标记
+* PEM 与 DER 互转使用 OpenSSL 的 `-outform` / `-inform` 参数
+* 支持在同一个文件中串联多个 PEM 块, 常用于证书链配置
+* 主流编程语言(Java, Go, Python, Node.js)均有成熟的 PEM 解析库, 操作便捷

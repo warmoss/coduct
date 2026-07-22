@@ -1,0 +1,269 @@
+== AtomicInteger原理讲解
+
+AtomicInteger 是 Java 并发包(`java.util.concurrent.atomic`)中用于对 `int` 类型执行原子操作的类. 它解决了多线程环境下对整数变量的递增、递减等操作非原子性的问题, 无需使用 `synchronized` 或 `Lock`.
+
+=== 核心特性
+
+**原子性**
+
+* 保证对整数的读写和算术操作(如自增、自减)是原子的
+* 避免 `i++` 这类非原子操作在并发场景下的数据竞争问题
+
+**可见性**
+
+* 内部使用 `volatile` 修饰的 `value` 字段, 保证一个线程的修改对其他线程立即可见
+* 详见 <<Java/jdk/volatile关键字讲解.adoc#, volatile关键字讲解>>
+
+**无锁编程**
+
+* 基于 CAS(Compare-And-Swap) 算法实现, 避免锁的开销和死锁风险
+* 在低竞争场景下性能显著优于 `synchronized`
+
+=== 实现原理
+
+==== 内部结构
+
+[source,java]
+----
+public class AtomicInteger extends Number implements java.io.Serializable {
+    // 使用 volatile 保证可见性
+    private volatile int value;
+
+    // Unsafe 实例, 用于执行底层 CAS 操作
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    private static final long valueOffset; // value 字段的内存偏移量
+
+    static {
+        try {
+            valueOffset = unsafe.objectFieldOffset
+                (AtomicInteger.class.getDeclaredField("value"));
+        } catch (Exception ex) { throw new Error(ex); }
+    }
+}
+----
+
+关键点:
+
+* `value` 被 `volatile` 修饰, 确保多线程间的**内存可见性**
+* `valueOffset` 是 `value` 字段在对象内存布局中的偏移量, 在类加载时通过 `unsafe.objectFieldOffset()` 计算并缓存
+* `Unsafe` 类提供**硬件级别的原子操作**, 是 CAS 的底层支撑
+
+核心机制 CAS(Compare-And-Swap) 的详细原理可参阅 <<Java/jdk/AtomicReference原理讲解.adoc#, AtomicReference原理讲解>>.
+
+==== 与普通 int 的对比
+
+|===
+|特性|int|AtomicInteger|volatile int
+
+|**原子性**|不保证|保证|不保证
+|**可见性**|不保证|保证|保证
+|**自增操作**|非原子|原子|非原子
+|**性能**|最高|中等(无锁)|高
+|**适用场景**|线程私有变量|计数器、序列生成|状态标志位
+|===
+
+==== CAS 在 AtomicInteger 中的实现
+
+[source,java]
+----
+// CAS 操作的入口
+public final boolean compareAndSet(int expect, int update) {
+    return unsafe.compareAndSwapInt(this, valueOffset, expect, update);
+}
+----
+
+`unsafe.compareAndSwapInt` 是一个 **native 方法**, 底层调用 CPU 的 `CMPXCHG` 指令实现原子比较和交换.
+
+=== 关键方法解析
+
+==== 构造方法
+
+[source,java]
+----
+// 初始值为 0
+AtomicInteger counter = new AtomicInteger();
+
+// 指定初始值
+AtomicInteger counter = new AtomicInteger(100);
+----
+
+==== 核心操作方法
+
+[source,java]
+----
+// 获取当前值
+int value = counter.get();
+
+// 原子地设置新值
+counter.set(200);
+
+// 获取当前值并自增(等价于 i++)
+int oldValue = counter.getAndIncrement();
+
+// 获取当前值并自减(等价于 i--)
+int oldValue = counter.getAndDecrement();
+
+// 自增并获取新值(等价于 ++i)
+int newValue = counter.incrementAndGet();
+
+// 原子地增加指定值, 返回旧值
+int oldValue = counter.getAndAdd(10);
+
+// 原子地增加指定值, 返回新值
+int newValue = counter.addAndGet(10);
+
+// CAS 操作: 只有当前值等于期望值时才更新
+boolean success = counter.compareAndSet(expect, update);
+
+// Java 8+ 提供的函数式更新方法
+int newValue = counter.updateAndGet(x -> x * 2);
+int oldValue = counter.getAndUpdate(x -> x * 2);
+int result = counter.accumulateAndGet(5, (prev, x) -> prev + x);
+----
+
+==== getAndIncrement 自旋实现
+
+以 `getAndIncrement` 为例, 其内部是一个典型的 **CAS 自旋**模式:
+
+[source,java]
+----
+public final int getAndIncrement() {
+    // 传入 this 对象和 valueOffset, 由 JVM 内部完成自旋
+    return unsafe.getAndAddInt(this, valueOffset, 1);
+}
+----
+
+对应的 `unsafe.getAndAddInt` 底层逻辑大致如下:
+
+[source,java]
+----
+// Unsafe 中的实现(伪代码)
+public final int getAndAddInt(Object o, long offset, int delta) {
+    int v;
+    do {
+        // 步骤1: 获取当前值
+        v = getIntVolatile(o, offset);
+        // 步骤2: 尝试 CAS 更新, 失败则重试
+    } while (!compareAndSwapInt(o, offset, v, v + delta));
+    return v;
+}
+----
+
+流程说明:
+
+. 读取当前值 `v` (通过 `getIntVolatile` 保证获取到最新值)
+
+. 尝试 CAS 将值从 `v` 更新为 `v + delta`
+
+. 如果 CAS 失败(说明其他线程已修改), 回到步骤1重新读取最新值并重试
+
+. 重复以上步骤直到成功
+
+这种"**自旋 + CAS**"的模式是无锁编程的经典范式.
+
+=== 使用示例
+
+==== 线程安全的计数器
+
+[source,java]
+----
+public class Counter {
+    private final AtomicInteger count = new AtomicInteger(0);
+
+    public int increment() {
+        return count.incrementAndGet();
+    }
+
+    public int decrement() {
+        return count.decrementAndGet();
+    }
+
+    public int getCount() {
+        return count.get();
+    }
+}
+----
+
+==== 唯一序列号生成器
+
+[source,java]
+----
+public class SequenceGenerator {
+    private final AtomicInteger sequence = new AtomicInteger(0);
+
+    public long nextId() {
+        // 基于时间和序号生成唯一 ID
+        long timestamp = System.currentTimeMillis();
+        return (timestamp << 20) | sequence.getAndIncrement();
+    }
+}
+----
+
+==== 限流器实现
+
+[source,java]
+----
+public class RateLimiter {
+    private final AtomicInteger counter = new AtomicInteger(0);
+    private final int maxPermits;
+
+    public RateLimiter(int maxPermits) {
+        this.maxPermits = maxPermits;
+    }
+
+    public boolean tryAcquire() {
+        int current;
+        do {
+            current = counter.get();
+            if (current >= maxPermits) {
+                return false; // 超过限流阈值
+            }
+        } while (!counter.compareAndSet(current, current + 1));
+        return true;
+    }
+
+    public void release() {
+        counter.decrementAndGet();
+    }
+}
+----
+
+=== 性能分析
+
+AtomicInteger 采用**无锁 CAS** 实现, 在不同竞争程度下表现不同:
+
+* **低竞争场景:** CAS 自旋通常一次成功, 性能远高于 `synchronized`
+* **高竞争场景:** CAS 反复失败导致频繁自旋, 性能可能劣于 `synchronized` (JDK 对 `synchronized` 有偏向锁、轻量级锁等优化)
+* **Java 8+ LongAdder:** 在极高竞争场景下, `LongAdder` 采用分段计数策略, 性能优于 `AtomicInteger`
+
+=== 注意事项
+
+==== ABA 问题
+
+CAS 操作无法感知值从 A 变为 B 再变回 A 的过程. 对于整数类型, 在大多数计数场景下 ABA 问题不产生实质性影响. 若需要检测中间变化, 可使用 `AtomicStampedReference` 或 `AtomicMarkableReference`.
+
+ABA 问题的详细说明可参阅 <<Java/jdk/AtomicReference原理讲解.adoc#, AtomicReference原理讲解>>.
+
+==== 性能陷阱
+
+* `AtomicInteger` 适用于**热点计数器**、**序列号生成**等高频更新场景
+* 不适用于**复杂业务逻辑**的同步——应使用 `Lock` 或 `synchronized` 保护临界区
+* 多个 `AtomicInteger` 之间无法保证**复合操作的原子性**, 需要组合原子操作时应使用 `AtomicReference` 封装状态对象
+
+==== 与 volatile 的配合
+
+虽然 `AtomicInteger` 内部使用 `volatile` 保证可见性, 但它的核心价值在于**原子性** —— 这是 `volatile` 无法提供的. 选择依据:
+
+* 仅需可见性: `volatile int`
+* 需要原子读-改-写: `AtomicInteger`
+* 需要原子自增/自减: `AtomicInteger`
+
+=== 总结
+
+AtomicInteger 通过 **volatile + CAS + 自旋** 的组合方式, 实现了线程安全的整数原子操作:
+
+* **volatile** 保证了变量的**内存可见性**
+* **CAS(Compare-And-Swap)** 保证了读-改-写操作的**原子性**
+* **自旋(Spin Loop)** 确保了在并发冲突时的最终成功
+
+在低竞争场景下, AtomicInteger 提供了比锁更高性能的并发控制手段, 是编写高效并发程序的基石工具之一.

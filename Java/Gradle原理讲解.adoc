@@ -1,0 +1,358 @@
+== Gradle原理讲解
+
+Gradle 是一个基于 Apache Ant 和 Maven 理念构建的自动化构建工具, 采用 Groovy 或 Kotlin 作为领域特定语言(DSL)编写构建脚本. 相比前辈, Gradle 在构建性能, 灵活性和依赖管理方面做出了根本性改进, 现已成为 Android 官方构建工具和许多大型 Java 项目的首选.
+
+=== 核心概念
+
+Gradle 的构建模型围绕几个核心抽象展开:
+
+Gradle构建::
+  整个自动化构建过程的执行单元, 由 Gradle 运行时驱动, 解析构建脚本并执行任务图.
+
+项目(Project):: 
+  一个 `build.gradle`(或 `build.gradle.kts`)文件所描述的逻辑单元. 在单体项目中通常只有一个 Project; 在多模块项目中, 根 Project 管理若干子 Project(Subproject).
+
+任务(Task)::
+  构建过程中的最小工作单元, 如编译源码, 打包 JAR, 运行测试等. 任务之间可以声明依赖关系, Gradle 根据依赖图确定执行顺序.
+
+构建脚本(Build Script)::
+  使用 Groovy(`.gradle`)或 Kotlin(`.gradle.kts`)编写的声明式配置文件, 定义 Project 的行为, 包括插件, 依赖, 任务等.
+
+Gradle Wrapper::
+  一种将特定 Gradle 版本绑定到项目的机制, 通过 `gradlew`(Unix) 和 `gradlew.bat`(Windows) 脚本实现, 确保团队和 CI 环境使用统一版本.
+
+依赖配置(Dependency Configuration)::
+  定义依赖的作用域和可见性, 如 `implementation`(编译和运行时可见, 但对外部隐蔽), `api`(对外暴露), `testImplementation`(仅测试阶段)等.
+
+=== 核心特性与原理
+
+==== 基于有向无环图的任务执行
+
+Gradle 将构建过程建模为一个有向无环图(DAG), 节点是 Task, 边是 Task 之间的依赖关系. Gradle 在配置阶段完成后即可确定完整的任务 DAG, 并按拓扑序执行.
+
+[plantuml, "Task DAG 示例", format=png]
+----
+@startuml
+skinparam ranksep 20
+skinparam nodeFontSize 12
+
+rectangle compileJava
+rectangle processResources
+rectangle classes
+rectangle jar
+rectangle test
+rectangle check
+rectangle build
+
+compileJava --> classes
+processResources --> classes
+classes --> jar
+classes --> test
+jar --> build
+test --> check
+check --> build
+@enduml
+----
+
+Task 通过 `dependsOn` 声明依赖:
+
+[source,groovy]
+----
+task A {
+    doLast { println "Task A" }
+}
+task B(dependsOn: A) {
+    doLast { println "Task B" }
+}
+task C(dependsOn: B) {
+    doLast { println "Task C" }
+}
+----
+
+执行 `gradle C` 时会按 A -> B -> C 的顺序执行. Gradle 确保每个 Task 仅执行一次, 即使被多个 Task 依赖.
+
+==== 增量构建
+
+Gradle 通过 输入(inputs) 和 输出(outputs) 的声明来判断 Task 是否需要重新执行. 如果某 Task 的输入和输出自上次构建后均未发生变化, Gradle 会将该 Task 标记为 `UP-TO-DATE` 并跳过执行.
+
+[source,groovy]
+----
+task compileJava(type: JavaCompile) {
+    source = fileTree('src/main/java')
+    destinationDir = file('build/classes')
+}
+----
+
+当 `src/main/java` 下的文件未变且 `build/classes` 中的 class 文件仍然存在时, 该 Task 会被跳过. 这大幅缩短了增量构建时间.
+
+底层实现上, Gradle 对每个 Task 的 inputs 和 outputs 计算哈希值并存入本地缓存, 构建前比对哈希值决定是否跳过.
+
+==== 构建缓存(Build Cache)
+
+构建缓存是增量构建的扩展: 不仅本地可用, 还可以通过远程缓存(Remote Cache)在团队和 CI 之间共享构建产物.
+
+[source,groovy]
+----
+// settings.gradle
+buildCache {
+    local {
+        enabled = true
+    }
+    remote(HttpBuildCache) {
+        url = 'https://cache.example.com/cache/'
+        push = true
+    }
+}
+----
+
+当一台 CI 机器编译了某个 Task, 其他机器可以直接从远程缓存下载其输出, 无需重新编译. 这对大型 monorepo 项目尤其有效.
+
+==== Gradle Daemon
+
+Gradle 在后台运行一个常驻 JVM 进程(Gradle Daemon)来避免每次构建都重新加载 JVM, 加载 Gradle 运行时和解析构建脚本的开销.
+
+Daemon 的工作流程:
+
+. 首次运行 `gradle build` 时, Gradle 启动 Daemon 进程
+. 该 Daemon 保持运行(默认 3 小时空闲超时), 缓存已解析的构建脚本, 插件类和项目对象
+. 后续构建直接复用 Daemon, 跳过 JVM 启动和脚本解析时间
+
+实际测试中, 有 Daemon 的构建比无 Daemon 的构建快 2~5 倍(尤其在小项目上差距显著).
+
+==== 依赖管理机制
+
+Gradle 的依赖管理通过 **配置(Configuration)** 来划分依赖的作用域:
+
+[cols="3*"]
+|===
+| 配置 | 作用 | 示例依赖
+
+| `implementation`
+| 编译和运行时可用, 但对外隐藏传递依赖
+| `com.google.guava:guava:32.1.3`
+
+| `api`
+| 编译和运行时可用, 且对外暴露传递依赖
+| `org.springframework:spring-core:6.0.0`
+
+| `compileOnly`
+| 仅编译时可用, 不参与运行时
+| `lombok:lombok:1.18.30`
+
+| `runtimeOnly`
+| 仅运行时可用, 不参与编译
+| `mysql:mysql-connector-java:8.0.33`
+
+| `testImplementation`
+| 仅测试阶段可用
+| `org.junit.jupiter:junit-jupiter:5.10.0`
+
+|===
+
+依赖解析采用 **语义化版本控制(Semantic Versioning)** 的策略:
+
+* 对于 `1.2.3` 这样的精确版本, 直接使用
+* 对于 `1.2.+` 的动态版本, 使用匹配该范围的最新版本
+* 对于 `1.+` 的版本范围, 使用该主版本下的最新版本
+* 当出现依赖冲突时, Gradle 默认选择最高版本, 也可通过 `force` 或 `resolutionStrategy` 覆盖:
+
+[source,groovy]
+----
+configurations.all {
+    resolutionStrategy {
+        force 'com.google.guava:guava:32.1.3-jre'
+        eachDependency { DependencyResolveDetails details ->
+            if (details.requested.group == 'com.fasterxml.jackson') {
+                details.useVersion '2.16.0'
+            }
+        }
+    }
+}
+----
+
+==== 插件体系
+
+Gradle 的插件机制是其可扩展性的核心. 插件可以封装 Task, 扩展 DSL, 配置约定等.
+
+插件来源:
+
+* **核心插件** - Gradle 内置, 如 `java`, `application`, `war`, `maven-publish`
+* **社区插件** - 发布在 Gradle Plugin Portal 或 Maven Central, 如 `spring-boot`, `shadow`
+* **自定义插件** - 可在 `buildSrc`, `included build` 或独立项目中编写
+
+[source,groovy]
+----
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.2.0'
+    id 'io.spring.dependency-management' version '1.1.4'
+}
+----
+
+`java` 插件自动注册了 `compileJava`, `processResources`, `test`, `jar`, `build` 等核心 Task, 并按约定优于配置(Convention over Configuration)原则设定了默认目录结构:
+
+[source,plain]
+----
+project/
+├── src/main/java/          # 生产代码
+├── src/main/resources/     # 生产资源文件
+├── src/test/java/          # 测试代码
+└── src/test/resources/     # 测试资源文件
+----
+
+=== 构建生命周期
+
+Gradle 的每次构建分为三个阶段:
+
+. **初始化(Initialization)** - Gradle 确定本次构建涉及哪些 Project. 对于单体项目, 只有一个 Project; 对于多模块项目, Gradle 解析 `settings.gradle` 确定所有子 Project
+. **配置(Configuration)** - 所有参与构建的 Project 的构建脚本被执行, 注册 Task 并建立依赖关系, 形成 Task DAG. 无论最终执行哪个 Task, 所有 Project 的配置阶段都会执行
+. **执行(Execution)** - Gradle 根据用户指定的 Task 名称, 从 Task DAG 中选出需要执行的 Task, 按拓扑序依次执行
+
+[plantuml, "Gradle 构建生命周期", format=png]
+----
+@startuml
+start
+:初始化阶段;
+note right: 解析 settings.gradle\n确定参与构建的 Project
+:配置阶段;
+note right: 执行所有 Project 的 build.gradle\n注册 Task, 构建 DAG
+:执行阶段;
+note right: 按拓扑序执行 Task
+stop
+@enduml
+----
+
+不同阶段的典型耗时对比:
+
+[cols="3*"]
+|===
+| 阶段 | 占比(首次) | 占比(增量)
+
+| 初始化
+| ~5%
+| ~10%
+
+| 配置
+| ~25%
+| ~40%
+
+| 执行
+| ~70%
+| ~50%
+
+|===
+
+通过 Gradle Daemon 和配置缓存(Configuration Cache)可以大幅降低配置阶段的耗时, 使增量构建的配置阶段缩短至毫秒级.
+
+=== 配置缓存(Configuration Cache)
+
+配置缓存是 Gradle 7.0+ 引入的里程碑特性, 它将配置阶段的输出(即 Project 和 Task 对象的状态)序列化到本地缓存. 当构建脚本未变化时, 后续构建直接跳过配置阶段, 从缓存恢复状态.
+
+启用方式:
+
+[source,gradle]
+----
+// gradle.properties
+org.gradle.configuration-cache=true
+----
+
+配置缓存带来的收益:
+
+* 小型项目: 构建速度提升 2~3 倍
+* 大型多模块项目: 构建速度提升 5~10 倍
+* 特别适合 CI 环境中的增量构建
+
+[WARNING]
+====
+配置缓存要求构建脚本中不包含 `TaskExecutionListener`, `buildFinished` 等非序列化回调. 如需兼容, 可使用 `configuration-cache-problems=warn` 在迁移阶段提前发现兼容性问题.
+====
+
+=== 多模块构建(Multi-project Build)
+
+大型项目通常采用多模块结构, 根 Project 通过 `settings.gradle` 声明子 Project:
+
+[source,gradle]
+----
+// settings.gradle
+rootProject.name = 'my-app'
+include 'core', 'web', 'api', 'common'
+----
+
+子 Project 可以共享父 Project 的公共配置:
+
+[source,groovy]
+----
+// root build.gradle
+subprojects {
+    apply plugin: 'java'
+    
+    repositories {
+        mavenCentral()
+    }
+    
+    dependencies {
+        testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
+    }
+}
+----
+
+子 Project 之间通过 **跨项目依赖(Cross-project Dependency)** 关联:
+
+[source,groovy]
+----
+// web/build.gradle
+dependencies {
+    implementation project(':core')
+    implementation project(':common')
+}
+----
+
+Gradle 会自动解析跨项目依赖的顺序, 确保被依赖的 Project 先构建.
+
+=== 对比其他构建工具
+
+[cols="4*"]
+|===
+| 特性 | Gradle | Maven | Ant+Ivy
+
+| 构建脚本语言
+| Groovy/Kotlin DSL
+| XML
+| XML
+
+| 约定优于配置
+| 是(可通过插件扩展)
+| 是(固定结构)
+| 否(需手动配置)
+
+| 增量构建
+| 原生支持(输入输出哈希)
+| 部分支持(编译器增量)
+| 手动实现
+
+| 构建缓存
+| 本地 + 远程
+| 无
+| 无
+
+| 并行执行
+| 支持(按 DAG 并行)
+| 支持(多模块并行)
+| 支持(需手动配置)
+
+| 学习曲线
+| 中等(需学习 DSL)
+| 低(XML 声明式)
+| 低
+
+|===
+
+=== 总结与最佳实践
+
+* 优先使用 **Gradle Wrapper** 确保构建环境一致性, 将 `gradlew` 和 `gradlew.bat` 纳入版本控制
+* 合理使用依赖配置范围, 能用 `implementation` 就不用 `api`, 减少对外暴露的传递依赖
+* 利用 **构建缓存** 加速 CI 构建, 特别是多模块项目或 monorepo
+* 启用 **配置缓存**(`org.gradle.configuration-cache=true`) 进一步加速增量构建
+* 避免在配置阶段执行耗时操作(如网络请求, 文件读写), 这些应放入 Task 的 `doLast` 或 `doFirst` 块中
+* 多模块项目中通过 `subprojects` 和 `allprojects` 统一管理公共配置, 减少重复
+* 使用 `gradle build --scan` 生成构建扫描报告, 分析构建瓶颈

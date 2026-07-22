@@ -1,0 +1,395 @@
+== OpenID原理讲解
+
+=== 引言
+
+在 OAuth2.1 授权框架中, 第三方应用仅能获得**访问令牌**来操作资源, 但无法获知**用户是谁**. 例如, 一个第三方应用通过 OAuth2.1 获取了用户的 Google Drive 访问权限, 但它仍然不知道用户的姓名、邮箱或头像.
+
+OpenID Connect (OIDC) 正是为解决此问题而设计. 它在 OAuth2.1 的授权框架之上增加了**身份认证层**, 使客户端能够**验证用户的身份**并获取**基本的用户信息(Profile)**.
+
+OIDC 是 OAuth2.1 的**超集**, 是目前业界**最广泛使用**的身份认证协议标准, 被 Google、Microsoft、GitHub 等主流平台采用.
+
+=== 核心概念
+
+==== 什么是 OpenID Connect
+
+定义:: OpenID Connect (OIDC) 是 OAuth2.1 之上的**身份认证层协议**, 通过引入 `id_token` 来提供**可验证的用户身份信息**
+
+本质:: OAuth2.1 解决"我能访问什么"(授权), OIDC 解决"我是谁"(认证)
+
+OIDC 与 OAuth2.1 的核心区别:
+
+* OAuth2.1 只关注**授权**, 返回 `access_token`, 客户端无法确认当前登录的用户是谁
+* OIDC 在授权基础上增加**认证**, 额外返回 `id_token`(JWT 格式), 客户端可直接从中解析出用户身份信息
+* OIDC 还定义了标准化的 **UserInfo 端点**, 用于获取更详细的用户资料
+
+==== 核心角色
+
+OIDC 在 OAuth2.1 的四个角色基础上, 新增了一些概念:
+
+OpenID Provider (OP):: 实现了 OIDC 协议的**授权服务器**, 负责认证用户身份并发放 `id_token` 和 `access_token`; 相当于 OAuth2.1 中的授权服务器 + 身份认证功能
+
+Relying Party (RP):: 依赖 OIDC 进行用户身份认证的**客户端**, 即第三方应用; 相当于 OAuth2.1 中的客户端
+
+End User:: 最终**用户**, 即资源拥有者, 需要向 RP 证明自己的身份
+
+身份令牌 (ID Token):: OIDC 的核心凭证, 使用 **JWT 格式**, 包含用户身份信息(如用户 ID、姓名、邮箱等), 由 OP 使用私钥签名, RP 可验证其真实性
+
+UserInfo 端点:: OP 提供的 REST API, RP 使用 `access_token` 访问以获取更详细的用户信息
+
+==== 标准作用域 (Standard Scopes)
+
+OIDC 定义了三个标准请求作用域, 用于控制 RP 能获取的用户信息范围:
+
+`openid`:: **必须包含**的作用域, 表示这是一个 OIDC 请求而非纯 OAuth2 请求; 不包含此作用域则不会返回 `id_token`
+
+`profile`:: 允许获取用户的**基本资料**, 包括姓名(`name`)、头像(`picture`)、用户名(`preferred_username`)等
+
+`email`:: 允许获取用户的**邮箱地址**(`email`)和邮箱验证状态(`email_verified`)
+
+`address`:: 允许获取用户的**邮寄地址**(`address`)
+
+`phone`:: 允许获取用户的**电话号码**(`phone_number`)和号码验证状态(`phone_number_verified`)
+
+[source, plaintext, linenums]
+----
+// 示例: OIDC 认证请求中的 scope 参数
+GET /authorize?
+  response_type=code
+  &client_id=my-client
+  &redirect_uri=https://myapp.com/callback
+  &scope=openid%20profile%20email  // 请求 OIDC + 用户资料 + 邮箱
+  &state=xyz123
+  &nonce=n-0S6_WzA2Mj
+----
+
+=== OIDC 授权码流程
+
+OIDC 最常用的流程是基于 OAuth2.1 授权码流程的 **Authorization Code Flow**. 以下时序图展示了完整交互:
+
+[plantuml, "OIDC Authorization Code 流程", format=png]
+----
+@startuml
+actor "End User" as User
+participant "Relying Party (RP)" as RP
+participant "OpenID Provider (OP)" as OP
+participant "UserInfo Endpoint" as UI
+
+== 认证与授权 ==
+
+User -> RP: 点击"使用 Google 登录"
+RP -> OP: 发起授权请求\n(包含 openid scope + nonce)
+
+User <-> OP: 用户登录并同意授权
+OP -> User: 重定向回 redirect_uri\n(附带 authorization code)
+
+User -> RP: 浏览器携带 authorization code 到达 RP
+RP -> OP: 发送 authorization code\n至令牌端点换取令牌
+OP -> RP: 返回 id_token + access_token + refresh_token
+
+== 认证完成 ==
+
+RP -> RP: 验证 id_token 签名、issuer、audience、nonce
+RP -> UI: (可选)使用 access_token\n请求 UserInfo 端点
+UI -> RP: 返回用户详细信息
+
+RP -> User: 用户已登录, 显示用户信息
+@enduml
+----
+
+流程步骤详解:
+
+. **RP 发起 OIDC 授权请求:**
+* 用户点击"使用 Google 登录"等按钮
+* RP 将用户重定向到 OP 的授权端点
+* 请求必须包含 `scope=openid`, 可选 `profile`, `email` 等
+* **必须包含** `nonce` 参数(一次性随机字符串), 用于防止重放攻击
+
+. **用户认证与授权:**
+* OP 要求用户登录(如果未登录), 并向用户展示授权页面
+* 用户确认授权后, OP 生成授权码并将用户重定向回 RP 的 `redirect_uri`
+
+. **RP 换取令牌:**
+* RP 使用授权码向 OP 的令牌端点发起 POST 请求
+* OP 验证授权码和 `code_verifier`(PKCE) 后, 返回三个关键元素:
+** `id_token`: JWT 格式, 包含用户身份信息, 由 OP 签名
+** `access_token`: 用于访问 UserInfo 端点
+** `refresh_token`: (可选)用于获取新令牌
+
+. **RP 验证 id_token:**
+* RP **必须**严格验证 `id_token` 的有效性(详见下文)
+* 验证通过后, RP 即可从 `id_token` 中提取用户身份
+
+. **(可选)获取用户详细信息:**
+* RP 使用 `access_token` 调用 OP 的 UserInfo 端点
+* UserInfo 端点返回标准化的用户信息 JSON
+
+=== ID Token 详解
+
+==== Token 结构与格式
+
+`id_token` 是一个 **JWT (JSON Web Token)**, 由三部分组成:
+
+* **Header:** 包含签名算法(`alg`)和令牌类型(`typ`)
+* **Payload:** 包含用户身份声明(Claims)
+* **Signature:** 使用 OP 的私钥对 Header + Payload 签名
+
+[source, javascript, linenums]
+----
+// id_token 解码后的 Header
+{
+  "alg": "RS256",               // 签名算法: RSA + SHA-256
+  "kid": "abc123",              // 密钥标识, 用于选择 OP 的哪个公钥验证
+  "typ": "JWT"
+}
+
+// id_token 解码后的 Payload (Claims)
+{
+  "iss": "https://accounts.google.com",  // 令牌签发者(OP 的标识符)
+  "sub": "1234567890",                   // 主体标识(用户在 OP 中的唯一 ID)
+  "aud": "my-client-id",                 // 令牌受众(RP 的 client_id)
+  "exp": 1893456000,                     // 过期时间
+  "iat": 1893452400,                     // 签发时间
+  "auth_time": 1893452200,               // 用户认证时间
+  "nonce": "n-0S6_WzA2Mj",              // 用于防止重放攻击的随机数
+  "azp": "my-client-id",                 // 授权的客户端 ID
+  "at_hash": "MTIzNDU2Nzg5MDEyMzQ1Ng", // access_token 的哈希值(用于绑定 id_token 和 access_token)
+  "c_hash": "Nzg5MDEyMzQ1Njc4OTAxMjM", // 授权码的哈希值(用于绑定 id_token 和 authorization code)
+  "name": "张三",                        // 用户姓名
+  "given_name": "三",                    // 名
+  "family_name": "张",                   // 姓
+  "picture": "https://.../photo.jpg",   // 用户头像 URL
+  "email": "zhangsan@example.com",      // 用户邮箱
+  "email_verified": true                // 邮箱是否已验证
+}
+----
+
+==== 标准 Claims
+
+OIDC 定义了一组标准 Claims, 按类别分为:
+
+注册 Claims (Registered Claims)::
+
+* `sub`:: **必须**提供, 用户在 OP 中的**唯一标识符**, 用于区分用户; 同一用户在同一个 OP 下的 `sub` 永不改变
+* `name`:: 用户的**显示名称**
+* `given_name`:: 用户的名(First Name)
+* `family_name`:: 用户的姓(Last Name)
+* `middle_name`:: 用户的中间名
+* `nickname`:: 用户的**昵称**
+* `preferred_username`:: 用户**首选用户名**, 可用于显示
+* `profile`:: 用户个人主页的 URL
+* `picture`:: 用户头像的 URL
+* `website`:: 用户个人网站的 URL
+* `email`:: 用户的**邮箱地址**
+* `email_verified`:: 邮箱是否经过验证的**布尔值**; 未经过验证的邮箱不可信
+* `gender`:: 用户性别
+* `birthdate`:: 用户生日
+* `zoneinfo`:: 用户所在时区
+* `locale`:: 用户的区域设置(如 `zh-CN`)
+* `phone_number`:: 用户手机号码
+* `phone_number_verified`:: 手机号码是否经过验证
+* `address`:: 用户的邮寄地址(JSON 对象)
+* `updated_at`:: 用户信息最后更新时间(Unix 时间戳)
+
+协议 Claims (Protocol Claims)::
+
+* `iss`:: **必须**提供, **令牌签发者**, 值应为 OP 的 issuer 标识符(如 `https://accounts.google.com`)
+* `sub`:: **必须**提供, **主体标识**, 用户在 OP 中的唯一标识
+* `aud`:: **必须**提供, **令牌受众**, 应为 RP 的 `client_id`; 可包含多个受众
+* `exp`:: **必须**提供, **过期时间**, Unix 时间戳, RP 必须在当前时间晚于此值时拒绝令牌
+* `iat`:: **必须**提供, **签发时间**, Unix 时间戳
+* `auth_time`:: **可选**, 用户完成认证的时间
+* `nonce`:: **必须**验证, RP 在认证请求中发送的随机字符串, 用于防止重放攻击
+* `acr`:: **可选**, 认证上下文参考值, 表示用户认证的强度级别
+* `amr`:: **可选**, 认证方法引用值, 数组形式列出用户使用的认证方式(如 `["pwd", "otp"]` 表示密码+一次性验证码)
+* `azp`:: **可选**, 授权方, 当 `aud` 中有多个值时, `azp` 标识实际授权的客户端
+
+==== ID Token 验证流程
+
+RP 收到 `id_token` 后, **必须**按以下步骤验证其有效性:
+
+. **验证 JWT 签名:**
+* 从 OP 的 JWKS (JSON Web Key Set) 端点获取 OP 的公钥
+* 使用 `kid`(Key ID) 头部找到对应公钥
+* 验证 `id_token` 的签名是否匹配
+
+. **验证 `iss` (签发者):**
+* 确保 `iss` 值与 RP 预期的 OP 标识符完全匹配
+* 防止恶意 OP 签发的令牌被误用
+
+. **验证 `aud` (受众):**
+* 确保 `aud` 中包含 RP 自身的 `client_id`
+* 防止令牌被其他客户端使用
+
+. **验证 `exp` (过期时间):**
+* 确保当前时间早于 `exp` 中的时间戳
+* 允许一定的时钟偏差(通常不超过 5 分钟)
+
+. **验证 `nonce` (防重放):**
+* 将 `id_token` 中的 `nonce` 值与 RP 在授权请求中发送的 `nonce` 值进行比较
+* 两者必须一致, 且 `nonce` 值在验证后应标记为已使用, 防止重复使用
+
+. **(可选)验证 `at_hash`:**
+* 如果 OIDC 流程中同时返回了 `access_token`, 应验证 `at_hash` 是否与 `access_token` 的哈希值一致
+* 这确保 `id_token` 和 `access_token` 是绑定的, 防止令牌替换攻击
+
+==== JWKS 与公钥获取
+
+OP 通过 **JWKS (JSON Web Key Set)** 端点暴露公钥, RP 使用这些公钥验证 `id_token` 的签名.
+
+[source, javascript, linenums]
+----
+// JWKS 端点返回的公钥集合示例
+GET https://accounts.example.com/.well-known/jwks.json
+
+{
+  "keys": [
+    {
+      "kty": "RSA",                     // 密钥类型
+      "kid": "abc123",                  // 密钥 ID, 对应 id_token header 中的 kid
+      "use": "sig",                     // 密钥用途: sig(签名) 或 enc(加密)
+      "alg": "RS256",                   // 签名算法
+      "n": "0vx7agoebG...QeZ",         // RSA 公钥模数 (Base64URL 编码)
+      "e": "AQAB"                       // RSA 公钥指数 (Base64URL 编码)
+    }
+  ]
+}
+----
+
+OIDC 支持多种签名算法:
+
+[options="header", cols="2,3,3"]
+|===
+| 算法值      | 签名算法                     | 密钥类型
+| `RS256`     | RSA + SHA-256 (推荐)          | RSA 公私钥对
+| `RS384`     | RSA + SHA-384                 | RSA 公私钥对
+| `RS512`     | RSA + SHA-512                 | RSA 公私钥对
+| `ES256`     | ECDSA + P-256 + SHA-256       | 椭圆曲线密钥对
+| `ES384`     | ECDSA + P-384 + SHA-384       | 椭圆曲线密钥对
+| `HS256`     | HMAC + SHA-256 (对称)         | 共享密钥(不推荐)
+|===
+
+NOTE: **RS256** (RSA + SHA-256) 是最广泛使用的签名算法. **HS256** 作为对称算法, 要求 RP 和 OP 共享密钥, 通常不推荐用于多客户端场景.
+
+=== UserInfo 端点
+
+UserInfo 端点是 OP 提供的一个 **OAuth2 受保护资源**, RP 使用 `access_token` 访问它来获取用户的详细信息.
+
+[source, bash, linenums]
+----
+GET https://accounts.example.com/userinfo
+Authorization: Bearer <access_token>
+----
+
+成功响应:
+
+[source, javascript, linenums]
+----
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "sub": "1234567890",
+  "name": "张三",
+  "given_name": "三",
+  "family_name": "张",
+  "picture": "https://example.com/photos/zhangsan.jpg",
+  "email": "zhangsan@example.com",
+  "email_verified": true
+}
+----
+
+UserInfo 端点返回的 Claims 与 `id_token` 中的 Claims **应保持一致**, 但返回格式统一为 JSON. `access_token` 的作用域决定了 UserInfo 端点能返回哪些 Claims.
+
+重要限制::
+* UserInfo 端点**不能**返回 `iss`, `aud`, `exp`, `iat`, `nonce` 等协议 Claims, 这些仅存在于 `id_token` 中
+* RP **不应**单独信任 UserInfo 端点返回的数据而不验证 `id_token`; `id_token` 才是经 OP 签名的可信身份凭证
+
+=== OpenID Discovery
+
+OIDC 定义了 **Discovery 机制**, 使 RP 能够通过 OP 的一个已知端点自动获取所有配置信息.
+
+Discovery 端点:: `https://{OP的域名}/.well-known/openid-configuration`
+
+[source, javascript, linenums]
+----
+// Google 的 OIDC Discovery 文档(示例)
+GET https://accounts.google.com/.well-known/openid-configuration
+
+{
+  "issuer": "https://accounts.google.com",
+  "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+  "token_endpoint": "https://oauth2.googleapis.com/token",
+  "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
+  "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+  "scopes_supported": [
+    "openid", "email", "profile"
+  ],
+  "response_types_supported": [
+    "code", "token", "id_token", "code token", "code id_token"
+  ],
+  "subject_types_supported": ["public"],
+  "id_token_signing_alg_values_supported": ["RS256"],
+  "claims_supported": [
+    "aud", "email", "email_verified", "exp", "family_name",
+    "given_name", "iat", "iss", "name", "picture", "sub"
+  ]
+}
+----
+
+Discovery 文档的核心字段:
+
+`issuer`:: OP 的**唯一标识符**, 所有 URL 路径均以此为基础
+`authorization_endpoint`:: 授权端点 URL
+`token_endpoint`:: 令牌端点 URL
+`userinfo_endpoint`:: UserInfo 端点 URL
+`jwks_uri`:: 公钥集合端点 URL
+`scopes_supported`:: 支持的 OIDC 作用域列表
+`response_types_supported`:: 支持的响应类型(如 `code`, `id_token`)
+`subject_types_supported`:: 主题标识类型(`public` 或 `pairwise`)
+`id_token_signing_alg_values_supported`:: 支持的 ID Token 签名算法
+`claims_supported`:: 支持的 Claims 列表
+
+通过 Discovery, RP 可以在运行时**自动配置**, 无需硬编码 OP 的各个端点地址, 大大提升了灵活性和互操作性.
+
+=== 与 OAuth2.1 的关系
+
+OIDC 与 OAuth2.1 的关系可以用一句话概括: **OIDC 是 OAuth2.1 的认证层扩展**.
+
+OAuth2.1 仅提供**授权能力**, 其 `access_token` 仅表示"某用户授权了某客户端访问某些资源". 但 OAuth2.1 本身**不关心用户是谁**. OIDC 在此基础上增加:
+
+* **标准化的身份凭证:** `id_token` 以 JWT 格式封装用户身份信息, 由 OP 签名保证可信
+* **标准化的用户信息接口:** UserInfo 端点提供统一的用户资料获取方式
+* **标准化的认证流程:** 包括 nonce 防重放、`at_hash` 和 `c_hash` 绑定机制
+* **标准化发现机制:** Discovery 和 JWKS 实现了配置自动化和公钥分发
+
+技术关系:
+* OIDC **完全建立在** OAuth2.1 的授权码流程之上, 继承了 PKCE、令牌轮换等安全机制
+* OIDC 的 `access_token` 本质就是 OAuth2.1 的访问令牌, 用于访问 UserInfo 端点
+* OAuth2.1 的安全最佳实践(<<业务/OAuth2.1原理讲解.adoc#安全最佳实践, HTTPS 传输、重定向 URI 校验、令牌防泄露>>) 对 OIDC 同样适用
+
+=== 安全注意事项
+
+. **始终验证 id_token 签名:** 使用 JWKS 端点获取 OP 公钥, 验证 `id_token` 签名是否有效; 切勿跳过此步骤
+
+. **验证 nonce 防重放:** `nonce` 是防止令牌重放攻击的关键机制, RP **必须**验证 `nonce` 值与授权请求时发送的一致, 且标记为已使用
+
+. **验证 iss 和 aud:** 确保令牌由预期的 OP 签发, 且仅用于当前 RP; 否则可能被恶意 OP 或第三方客户端利用
+
+. **不要信任未经验证的信息:** UserInfo 端点返回的数据必须以 `id_token` 验证为前提; `id_token` 是经签名验证的可信数据, UserInfo 端点的响应应作为补充而非替代
+
+. **HTTPS 是强制要求:** 所有 OIDC 通信(授权请求、令牌交换、UserInfo 访问)必须使用 HTTPS
+
+. **令牌存储安全:**
+* `access_token` 不应存储在浏览器 localStorage 或 sessionStorage 中
+* 单页应用应将令牌存储在内存变量中
+* 刷新令牌应安全存储在服务端(对于机密客户端)
+
+=== 总结
+
+* **OpenID Connect** 是在 OAuth2.1 之上构建的**身份认证协议**, 解决了"用户是谁"的问题
+* 核心产物是 **id_token**(JWT 格式), 由 OpenID Provider 签名, 包含用户身份 Claims
+* OIDC 标准定义了 `openid`, `profile`, `email` 等作用域, 控制客户端可获取的用户信息范围
+* **Authorization Code Flow** + PKCE 是 OIDC 最常用的流程, 结合 `nonce` 实现防重放保护
+* **UserInfo 端点** 提供标准化的用户资料获取接口
+* **Discovery 机制** 和 **JWKS** 实现了 OP 配置和公钥的自动发现
+* 安全方面, 验证 `id_token` 签名、`nonce`、`iss`、`aud` 是 RP **必须**执行的操作

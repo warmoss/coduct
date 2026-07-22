@@ -1,0 +1,43 @@
+= 数学
+
+include::基础概念讲解.adoc[]
+
+include::欧拉函数讲解.adoc[]
+
+include::欧拉定理讲解.adoc[]
+
+include::中国剩余定理讲解.adoc[]
+
+include::证明行列式与它的转置行列式相等.adoc[]
+
+include::欧几里得算法讲解.adoc[]
+
+include::贝祖等式讲解.adoc[]
+
+include::三角函数原理讲解.adoc[]
+
+include::极坐标原理讲解.adoc[]
+
+include::波的原理讲解.adoc[]
+
+include::向量原理讲解.adoc[]
+
+include::柯西不等式讲解.adoc[]
+
+include::排列组合原理讲解.adoc[]
+
+include::模反元素讲解.adoc[]
+
+include::阿贝尔群讲解.adoc[]
+
+include::拉格朗日定理讲解.adoc[]
+
+include::贝塞尔曲线原理讲解.adoc[]
+
+include::B样条曲线原理讲解.adoc[]
+
+== 积分
+
+== 概率论
+
+== 抛物线

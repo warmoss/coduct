@@ -1,0 +1,312 @@
+== wait原理讲解
+
+=== 基本概念
+wait() 是 Java 中 Object 类的一个方法, 用于线程间的协作和通信. 它使当前线程进入等待状态, 直到其他线程调用该对象的 notify() 或 notifyAll() 方法.
+
+=== 核心原理
+
+==== 监视器锁(Monitor Lock)
+
+[source, java, linenums]
+----
+public class WaitExample {
+    private final Object lock = new Object();
+    
+    public void waitMethod() throws InterruptedException {
+        synchronized (lock) {
+            System.out.println("线程进入等待状态");
+            lock.wait();  // 释放锁并等待
+            System.out.println("线程被唤醒");
+        }
+    }
+    
+    public void notifyMethod() {
+        synchronized (lock) {
+            lock.notify();  // 唤醒等待的线程
+        }
+    }
+}
+----
+
+==== wait() 的内部工作机制
+
+[source, java, linenums]
+----
+// wait() 方法的伪代码实现
+public final void wait() throws InterruptedException {
+    // 1. 检查当前线程是否持有锁
+    if (!currentThread.holdsLock(this)) {
+        throw new IllegalMonitorStateException();
+    }
+    
+    // 2. 将当前线程加入等待队列
+    addToWaitSet(Thread.currentThread());
+    
+    // 3. 释放锁
+    releaseLock(this);
+    
+    // 4. 将线程状态设置为 WAITING
+    Thread.currentThread().state = WAITING;
+    
+    // 5. 等待被唤醒
+    while (!isNotified) {
+        park();  // 线程挂起
+    }
+    
+    // 6. 被唤醒后重新竞争锁
+    acquireLock(this);
+    
+    // 7. 从等待队列中移除
+    removeFromWaitSet(Thread.currentThread());
+}
+----
+
+=== 详细执行流程
+
+==== 等待过程
+
+[source, java, linenums]
+----
+public class WaitProcess {
+    public void waitingProcess() throws InterruptedException {
+        synchronized (obj) {
+            // 步骤1: 检查中断状态
+            if (Thread.interrupted()) {
+                throw new InterruptedException();
+            }
+            
+            // 步骤2: 将线程加入等待集
+            // JVM 内部操作
+            
+            // 步骤3: 释放锁
+            // 其他线程可以获取该锁
+            
+            // 步骤4: 线程进入等待状态
+            // 直到以下情况发生:
+            // - notify()/notifyAll() 被调用
+            // - 线程被中断
+            // - 超时(如果使用 wait(timeout))
+            
+            obj.wait();
+            
+            // 步骤5: 被唤醒后重新获取锁
+            // 继续执行后续代码
+        }
+    }
+}
+----
+
+==== 唤醒过程
+
+[source, java, linenums]
+----
+public class NotifyProcess {
+    public void notifyingProcess() {
+        synchronized (obj) {
+            // 步骤1: 从等待集中移除一个线程
+            // JVM 内部操作
+            
+            // 步骤2: 将线程移到入口集(Entry Set)
+            // 线程将竞争锁
+            
+            // 步骤3: notify() 不会立即释放锁
+            // 需要等到同步块结束
+            
+            obj.notify();
+            
+            // 步骤4: 同步块结束后释放锁
+            // 被唤醒的线程可以竞争锁
+        }
+    }
+}
+----
+
+==== wait() 的三种形式
+
+[source, java, linenums]
+----
+public class WaitVariants {
+    private final Object lock = new Object();
+    
+    public void differentWaits() throws InterruptedException {
+        synchronized (lock) {
+            // 1. 无限等待, 直到被通知
+            lock.wait();
+            
+            // 2. 带超时的等待(毫秒)
+            lock.wait(1000);
+            
+            // 3. 更精确的超时等待(毫秒 + 纳秒)
+            lock.wait(1000, 500000);
+        }
+    }
+}
+----
+
+==== 完整的生产者-消费者示例
+
+[source, java, linenums]
+----
+public class ProducerConsumerExample {
+    private final Object lock = new Object();
+    private Queue<Integer> queue = new LinkedList<>();
+    private final int CAPACITY = 5;
+    
+    public void produce() throws InterruptedException {
+        int value = 0;
+        while (true) {
+            synchronized (lock) {
+                // 等待队列非满
+                while (queue.size() == CAPACITY) {
+                    System.out.println("队列已满, 生产者等待");
+                    lock.wait();
+                }
+                
+                System.out.println("生产: " + value);
+                queue.offer(value++);
+                
+                // 通知消费者
+                lock.notifyAll();
+                
+                Thread.sleep(1000);
+            }
+        }
+    }
+    
+    public void consume() throws InterruptedException {
+        while (true) {
+            synchronized (lock) {
+                // 等待队列非空
+                while (queue.isEmpty()) {
+                    System.out.println("队列为空, 消费者等待");
+                    lock.wait();
+                }
+                
+                int value = queue.poll();
+                System.out.println("消费: " + value);
+                
+                // 通知生产者
+                lock.notifyAll();
+                
+                Thread.sleep(1000);
+            }
+        }
+    }
+}
+----
+
+=== 重要注意事项
+
+==== 必须在同步块中使用
+
+[source, java, linenums]
+----
+// 错误用法
+public void wrongWait() throws InterruptedException {
+    obj.wait();  // 抛出 IllegalMonitorStateException
+}
+
+// 正确用法
+public void correctWait() throws InterruptedException {
+    synchronized (obj) {
+        obj.wait();
+    }
+}
+----
+
+==== 使用 while 循环检查条件
+
+[source, java, linenums]
+----
+public class SafeWaitExample {
+    private boolean condition = false;
+    
+    public void safeWait() throws InterruptedException {
+        synchronized (this) {
+            // 使用 while 而不是 if, 防止虚假唤醒
+            while (!condition) {
+                wait();
+            }
+            // 执行条件满足后的操作
+        }
+    }
+    
+    public void changeCondition() {
+        synchronized (this) {
+            condition = true;
+            notifyAll();
+        }
+    }
+}
+----
+
+==== notify() vs notifyAll()
+
+[source, java, linenums]
+----
+public class NotifyComparison {
+    private final Object lock = new Object();
+    
+    public void useNotify() {
+        synchronized (lock) {
+            // 只唤醒一个等待线程
+            lock.notify();
+        }
+    }
+    
+    public void useNotifyAll() {
+        synchronized (lock) {
+            // 唤醒所有等待线程
+            lock.notifyAll();
+        }
+    }
+}
+----
+
+=== 底层实现机制
+
+==== JVM 层面的实现
+
+[source, c++, linenums]
+----
+// HotSpot JVM 中的 ObjectMonitor 结构(简化)
+class ObjectMonitor {
+    Thread* _owner;           // 当前持有锁的线程
+    ObjectWaiter* _WaitSet;   // 等待队列
+    ObjectWaiter* _EntryList; // 阻塞队列
+    
+    void wait(jlong millis, bool interruptible) {
+        // 1. 创建 ObjectWaiter 节点并加入 _WaitSet
+        ObjectWaiter node(Thread::current());
+        AddWaiter(&node);
+        
+        // 2. 释放锁
+        exit();
+        
+        // 3. 线程进入等待状态
+        park(millis);
+        
+        // 4. 被唤醒后重新竞争锁
+        enter();
+    }
+    
+    void notify() {
+        // 从 _WaitSet 中移出一个线程到 _EntryList
+        TransferWaiters();
+    }
+}
+----
+
+=== 总结
+
+. **锁的释放与获取:** wait() 会释放锁, 被唤醒后需要重新获取锁
+
+. **线程状态变化:** RUNNABLE → WAITING/TIMED_WAITING → BLOCKED → RUNNABLE
+
+. **协作机制:** 必须与 notify()/notifyAll() 配合使用
+
+. **条件检查:** 必须在循环中检查条件, 防止虚假唤醒
+
+. **同步要求:** 必须在同步代码块中使用
+
+理解 wait() 的原理对于编写正确的多线程程序至关重要, 它提供了线程间高效协作的基础机制.

@@ -1,0 +1,303 @@
+== Agent Instructions讲解
+
+Agent Instructions(agent 指令) 是 AI 编码助手配置体系中**始终生效**的全局上下文文件. 与 Prompt 的一次性触发和 Skill 的按需匹配不同, Agent Instructions 在 agent 启动时自动注入, 贯穿整个对话周期, 适用于项目中的绝大多数工作. 本文系统讲解 Agent Instructions 的设计理念、文件结构、编写方法和最佳实践.
+
+参考: <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>>, <<大模型/prompt写作指南.adoc#, prompt写作指南>>, <<大模型/skills写作指南.adoc#, skills写作指南>>, <<大模型/AGENT.md写作指南.adoc#, AGENT.md写作指南>>
+
+=== 什么是 Agent Instructions
+
+Agent Instructions:: 一种**始终生效**的 agent 配置文件, 放置在项目约定目录下, 用于定义 agent 在执行项目任务时**必须遵循的通用规则和上下文信息**. 常见的文件名包括 `copilot-instructions.md` 和 `*.instructions.md`.
+
+Agent Instructions 在 AI agent 定制化配置体系中承担 **"基础层"** 的角色——它不像 Skill 那样只有在匹配特定领域时才加载, 也不像 Prompt 那样需要用户手动触发, 而是在 agent 启动后**自动、持续**地作用于每一次交互.
+
+其他配置文件的定位对比:
+
+* **Prompt:** 用户手动触发的**一次性指令**, 面向特定对话任务
+* **Skill:** agent **自动匹配**的领域知识包, 按需加载
+* **Agent Instructions:** **始终生效**的全局上下文, 适用于项目中的大多数工作
+* **AGENT.md:** agent 的**启动配置**, 定义 agent 的身份、可用工具、行为约束和适用场景
+
+=== Agent Instructions 的核心特性
+
+==== 始终生效
+
+Agent Instructions 的最大特点是**无需匹配,始终存在**. 无论用户提出的任务是代码审查、功能开发、Bug 修复还是文档编写, Agent Instructions 中的规则都会被 agent 自动加载.
+
+* Skill 需要 `description` 字段与任务意图匹配后才加载
+* Prompt 需要用户通过 `/` 斜杠命令或附件方式主动调用
+* Agent Instructions 从 agent 启动到对话结束**始终在上下文中**
+
+==== 全局范围
+
+Agent Instructions 的作用范围是整个项目, 而非特定的文件、目录或场景. 这使得它特别适合定义:
+
+* **项目级编码规范** - 如命名约定、代码风格、架构约束
+* **通用行为规则** - 如语言偏好、输出格式、确认流程
+* **技术栈声明** - 如项目使用的框架、依赖、构建工具
+
+==== 自动加载, 无需干预
+
+Agent Instructions 的加载是**无感的**——开发者只需将文件放置在约定位置, agent 在启动时就会自动读取并应用其中的指令. 用户无需在每次对话中手动提及规则.
+
+==== 不支持工具限制
+
+与 AGENT.md 不同, Agent Instructions **不支持**通过 `tools` 字段限制 agent 可用的工具集. 它专注于定义行为规则和上下文信息, 而非 agent 的能力边界. 如需限制工具, 应使用 AGENT.md.
+
+=== Agent Instructions vs Prompt vs Skill vs AGENT.md
+
+[plantuml, "Agent Instructions 与其他配置的关系", format=png]
+----
+@startuml
+package "AI Agent 配置体系" {
+  [Agent Instructions] as AI
+  [AGENT.md] as AM
+  [Skill] as SK
+  [Prompt] as PR
+}
+
+note top of AI
+  始终生效
+  全局上下文
+  适用于大多数工作
+end note
+
+note top of AM
+  启动配置
+  定义身份和工具
+  场景匹配生效
+end note
+
+note top of SK
+  按需匹配
+  领域专业知识
+  附带资产文件
+end note
+
+note top of PR
+  用户手动触发
+  一次性指令
+  面向特定任务
+end note
+@enduml
+----
+
+完整的对比表见 <<大模型/AGENT.md写作指南.adoc#, AGENT.md vs Prompt vs Skill vs Agent Instructions 选择指南>>, 此处概括核心差异:
+
+[cols="2,4"]
+|===
+| 特性 | Agent Instructions
+
+| 触发方式
+| **始终加载**, 无需匹配
+
+| 适用范围
+| **项目全局**, 适用于所有任务
+
+| 附带资产
+| 不支持
+
+| 用户可见性
+| 不可见, 自动生效
+
+| 工具限制
+| 不支持
+
+| 文件命名
+| `copilot-instructions.md` / `*.instructions.md`
+
+| 放置位置
+| 项目根目录 / `.github/`
+|===
+
+=== Agent Instructions 的文件结构与放置位置
+
+==== 文件命名
+
+Agent Instructions 支持两种命名方式:
+
+`copilot-instructions.md`:: GitHub Copilot 的标准命名. 放置在项目根目录或 `.github/` 目录下, 作为项目的**唯一全局指令文件**.
+
+`*.instructions.md`:: 按模式命名的指令文件. 放置在 `.github/prompts/` 目录下, 支持通过 `applyTo` 字段限定生效范围. 例如 `code-review.instructions.md` 仅在代码审查相关场景生效.
+
+==== 放置位置
+
+[source]
+----
+项目根目录/
+  copilot-instructions.md         # (推荐) 项目级全局指令
+
+.github/
+  copilot-instructions.md         # 等效的替代位置
+  prompts/
+    code-review.instructions.md   # 特定场景指令
+    database.instructions.md      # 特定场景指令
+----
+
+`copilot-instructions.md` 在项目根目录和 `.github/` 目录下的行为是等效的, 但如果两者都存在, **根目录的优先级更高**.
+
+==== 文件格式
+
+Agent Instructions 使用 **Markdown** 格式编写, 无需 YAML frontmatter. 这与 Skill 和 AGENT.md 有所不同——后两者需要 frontmatter 中的 `description` 字段实现匹配发现.
+
+[source,markdown]
+----
+# 编码规范
+- 所有 Java 类名使用 PascalCase
+- 所有方法名使用 camelCase
+- 禁止使用 System.out.println, 统一使用 Logger
+
+# 技术栈
+项目使用 Spring Boot 3.2 + MyBatis + MySQL 8.0
+构建工具: Maven
+
+# 行为规则
+- 修改代码前必须先运行测试
+- 输出使用简体中文
+- 每个 PR 必须包含对应测试
+----
+
+=== Agent Instructions 的编写方法
+
+==== 高频在先, 低频在后
+
+将最常被用到的规则放在文件**开头**, 因为 agent 在处理长上下文时, 对开头部分的关注度更高. 文件的阅读顺序就是 agent 的优先级顺序.
+
+* **文件开头:** 编码规范、技术栈声明、通用行为规则
+* **文件中部:** 架构约束、依赖管理规则
+* **文件末尾:** 边缘场景规则、低频率发生的最佳实践
+
+==== 指令明确, 可执行
+
+Agent Instructions 中的每一条指令都应是 agent **可以执行的行动**, 而非模糊的建议.
+
+* **不推荐:** "代码质量要好"
+* **推荐:** "所有公共方法必须包含 Javadoc 注释, 且需要标注 @param 和 @return"
+
+* **不推荐:** "注意性能问题"
+* **推荐:** "禁止在 for 循环中调用数据库查询; 批量操作使用 IN 查询或 batch insert"
+
+==== 使用负面清单
+
+当某些行为需要禁止时, 使用**具体的"不要做" 列表**比模糊的"注意规范" 更有效.
+
+[source,markdown]
+----
+# 禁止事项
+- 禁止引入新的第三方依赖, 除非经过架构师审批
+- 禁止在 Controller 层直接操作 Repository
+- 禁止在日志中打印密码、Token 等敏感信息
+- 禁止使用 `@Autowired` 字段注入, 统一使用构造器注入
+----
+
+==== 保持简洁
+
+Agent Instructions 会占用 agent 的上下文窗口. 过长的指令文件会挤占其他上下文空间, 导致 agent 在处理复杂任务时"记不住" 足够的信息.
+
+* **目标长度:** 50-200 行, 聚焦于**必须遵守**的核心规则
+* **如果超过 200 行:** 考虑拆分为多个 `*.instructions.md` 文件, 使用 `applyTo` 限定分别生效
+
+==== 合理使用 applyTo
+
+对于只在特定场景生效的规则, 使用 `*.instructions.md` 模式配合 `applyTo` 字段, 避免全局指令文件过度膨胀.
+
+[source,markdown]
+----
+---
+applyTo: "src/main/java/**/*.java"
+---
+
+# Java 特定规则
+- 所有类必须定义在 `com.company` 包下
+- 异常类型优先使用业务异常, 而非通用 Exception
+----
+
+=== Agent Instructions 的加载与执行流程
+
+[plantuml, "Agent Instructions 加载与执行流程", format=png]
+----
+@startuml
+actor User as U
+participant "AI Agent" as A
+database "项目目录" as P
+
+U -> A: 启动对话/打开项目
+A -> P: 扫描 copilot-instructions.md
+A -> P: 扫描 .github/prompts/*.instructions.md
+P --> A: 返回匹配的指令文件
+A -> A: 指令注入对话上下文
+note right
+  指令贯穿整个对话周期
+  无需二次匹配
+end note
+loop 每次 agent 响应
+  A -> A: 应用指令规则
+  A -> A: 生成符合规范的输出
+end
+A --> U: 返回结果
+@enduml
+----
+
+. **项目打开:** 用户打开项目或启动新对话时, agent 自动触发
+
+. **指令发现:** agent 扫描约定位置(`copilot-instructions.md`, `.github/prompts/*.instructions.md`)
+
+. **指令加载:** 所有匹配的指令文件被注入 agent 的对话上下文
+
+. **持续生效:** 在整个对话周期中, agent 每次生成响应都会受到指令约束
+
+. **无感执行:** 用户无需手动提及规则, agent 自动遵循
+
+=== 编写最佳实践
+
+==== 与 AGENT.md 协同分工
+
+Agent Instructions 和 AGENT.md 的功能有部分重叠, 合理的分工策略是:
+
+* **Agent Instructions:** 定义**做什么**(编码规范、行为规则、技术约束)
+* **AGENT.md:** 定义**谁来做**(agent 身份、可用工具、触发场景)
+
+避免在两者中定义相互矛盾的规则, 否则 agent 行为会变得不可预测.
+
+==== 版本化维护
+
+Agent Instructions 应纳入**版本控制**, 并随项目演变持续更新:
+
+* 引入新的框架或依赖时, 同步更新技术栈声明
+* 发现常见错误模式时, 将其加入禁止事项
+* 定期审查, 移除已过时的规则
+
+==== 团队共识驱动
+
+Agent Instructions 应是**团队共识的体现**, 而非个人偏好:
+
+* 通过团队讨论确定核心规则
+* 在 Code Review 中对照 Instructions 检查一致性
+* 将 Instructions 作为新成员 onboarding 的参考文档
+
+==== 测试验证
+
+编写完成后, 通过以下方式验证 Agent Instructions 的有效性:
+
+* 提出几个典型任务, 检查 agent 的输出是否符合指令要求
+* 检查指令之间是否存在逻辑冲突
+* 用简短的 Prompt 测试每条关键指令是否被 agent 遵守
+
+=== 常见误区与注意事项
+
+* **与 AGENT.md 内容重复或矛盾:** 两者都定义了行为规则, 内容冲突会导致 agent 行为不可预测. 明确分工: Instructions 管"规则", AGENT.md 管"身份和工具"
+* **指令过于宽泛:** "代码要高质量" 这类模糊指令对 agent 毫无约束力. 每条指令必须可执行、可验证
+* **文件过长:** 超过 200 行的 Instructions 会大量挤占上下文窗口. 考虑按场景拆分并使用 `applyTo`
+* **忽略文件命名:** 使用 `copilot-instructions.md` 而非随意命名, 否则 agent 可能无法发现指令文件
+* **缺乏维护:** Instructions 不随项目演进而更新, 会导致 agent 基于过时规则执行任务
+
+=== 总结
+
+Agent Instructions 是 AI agent 配置体系中 **最基础、最通用** 的一层. 高质量的 Agent Instructions 需要:
+
+* 始终生效的全局规则, 适用于项目中的大多数工作
+* 明确可执行的指令, 每条规则都能被 agent 直接执行
+* 简洁聚焦, 避免过度占用上下文窗口
+* 与 AGENT.md 合理分工, 避免规则冲突
+* 随项目演进而持续维护
+
+优秀的 Agent Instructions, 能够在不增加用户操作负担的前提下, 将 AI agent 的行为与项目的技术规范和组织惯例对齐, 是保障 AI 编码助手输出质量和一致性的**基础设施**.

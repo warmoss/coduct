@@ -1,0 +1,135 @@
+== ThreadLocalRandom讲解
+
+=== 为什么需要 ThreadLocalRandom?
+在理解 ThreadLocalRandom 之前, 我们先看看它的前辈 Random 类有什么问题.
+
+**Random 类的问题:**
+
+. **线程安全与竞争:** Random 类是线程安全的, 但它使用一个**原子种子变量(seed)** 来保证线程安全. 这意味着, 当多个线程同时调用 next() 方法时, 它们会竞争这个唯一的种子变量.
+
+. **性能瓶颈:** 在高并发环境下, 这种对共享变量的竞争会导致大量的 CAS(Compare-And-Swap)**操作失败和重试**, 从而造成严重的性能下降. 线程越多, 竞争越激烈, 性能就越差.
+
+**解决方案的思路:**
+
+既然性能问题的根源在于多个线程共享一个种子变量, 那么最直接的解决办法就是**让每个线程都拥有自己独立的种子变量**. 这样线程之间就完全不会产生竞争, 从而极大地提升性能.
+
+ThreadLocalRandom 正是基于这个思路实现的.
+
+=== ThreadLocalRandom 的核心思想
+ThreadLocalRandom 利用了 ThreadLocal 的思想. 它不是简单地将自己作为一个静态实例共享, 而是将**随机数生成器的种子(seed)存储在每个线程的本地变量中**.
+
+具体来说:
+
+. 每个线程都维护着自己独立的随机数种子.
+
+. 当线程调用 ThreadLocalRandom.current().nextXxx() 方法时, 它直接从自己的线程本地存储中获取种子, 进行计算和更新.
+
+. 由于种子是线程本地的, 所以不存在任何竞争, 实现了极高的并发性能.
+
+=== 如何使用 ThreadLocalRandom?
+使用 ThreadLocalRandom 非常简单, 但有一个**必须遵守**的规则.
+
+**正确用法:**
+
+. **获取实例:** 通过静态方法 ThreadLocalRandom.current() 获取当前线程的 ThreadLocalRandom 实例.
+
+. **生成随机数:** 调用该实例上的各种 nextXxx() 方法.
+
+**示例代码:**
+
+[source, java, linenums]
+----
+import java.util.concurrent.ThreadLocalRandom;
+
+public class ThreadLocalRandomDemo {
+
+    public static void main(String[] args) {
+        // 错误用法: 创建一个实例并在多个线程间共享
+        // ThreadLocalRandom random = ThreadLocalRandom.current();
+
+        for (int i = 0; i < 3; i++) {
+            new Thread(() -> {
+                // 正确用法: 在每个线程内部调用 current() 来获取属于自己的实例
+                ThreadLocalRandom random = ThreadLocalRandom.current();
+
+                // 生成一个 [0, 100) 范围内的随机整数
+                int intValue = random.nextInt(100);
+                // 生成一个 [0.0, 1.0) 范围内的随机浮点数
+                double doubleValue = random.nextDouble();
+                // 生成一个随机布尔值
+                boolean booleanValue = random.nextBoolean();
+
+                System.out.println(Thread.currentThread().getName() +
+                                  ": int=" + intValue +
+                                  ", double=" + doubleValue +
+                                  ", boolean=" + booleanValue);
+            }).start();
+        }
+    }
+}
+----
+
+[CAUTION]
+.重要注意事项
+====
+不要将 ThreadLocalRandom.current() 返回的实例保存起来在多个线程间共享. 例如:
+
+[source, java, linenums]
+----
+// 错误! 这违背了设计的初衷!
+public static final ThreadLocalRandom SHARED_RANDOM = ThreadLocalRandom.current();
+----
+
+这样做会导致所有使用这个共享实例的线程实际上都在竞争同一个种子(即最初调用 current() 的那个线程的种子), 从而退化到和 Random 类似的性能问题, 甚至可能引发数据错误.
+====
+
+=== ThreadLocalRandom 与 Random 的对比
+
+[cols="2,4,6"]
+|===
+|特性|Random|ThreadLocalRandom
+
+|**线程安全机制**
+|基于原子的种子变量, 通过 CAS
+|基于线程本地存储(ThreadLocal), 无共享状态
+
+|**并发性能**
+|高并发下竞争激烈, 性能差
+|无竞争, 性能极高, 且随线程数增加保持稳定
+
+|**种子管理**
+|全局共享一个种子
+|每个线程独立管理自己的种子
+
+|**初始化**
+|可以指定种子, 便于复现结果
+|种子在第一次调用 current() 时初始化, 不可控
+
+|**使用场景**
+|单线程或低并发场景
+|**高并发、多线程场景的首选**
+
+|===
+
+=== 适用场景
+* **高性能服务器应用:** 如游戏服务器、交易系统等需要为大量并发请求生成随机数的场景.
+
+* **并行计算/分治算法:** 在 Fork/Join 池或 ExecutorService 中执行的任务, 每个任务都需要生成随机数.
+
+* **模拟测试:** 需要大量随机数据生成的压力测试.
+
+=== 在 Fork/Join 框架中的特殊优化
+在 Fork/Join 池(由 ForkJoinTask 创建)中, ThreadLocalRandom 的行为与在普通线程中略有不同. 它会尝试在子任务中继承或衍生父任务的种子, 以避免在池中产生相关性. 不过, 对于普通开发者来说, 使用方式是完全一样的, 只需调用 ThreadLocalRandom.current() 即可, 框架底层已经做好了优化.
+
+=== 总结
+ThreadLocalRandom 是一个专门为高并发环境设计的随机数生成器, 它通过 "**空间换时间**" 的策略, 将竞争从全局级别降低到线程级别, 从而解决了 Random 类的性能瓶颈.
+
+**核心要点:**
+
+. **原理:** 为每个线程维护一个独立的随机数种子.
+
+. **用法:** 在每个线程内部通过 ThreadLocalRandom.current() 获取实例并使用.
+
+. **禁忌:** 不要跨线程共享 ThreadLocalRandom 实例.
+
+. **选择:** 在编写多线程程序时, 应优先选择 ThreadLocalRandom 而不是 Random.

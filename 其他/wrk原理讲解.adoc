@@ -1,0 +1,465 @@
+== wrk原理讲解
+
+=== 概述
+
+**wrk** 是一个现代的 HTTP 基准测试工具, 由 Will Glozer 开发, 基于 C 语言编写. 它利用操作系统的事件驱动机制和多线程模型, 能在单机上产生巨大的并发请求压力. 其核心设计理念是: **轻量、高性能、可脚本化**.
+
+wrk 解决的核心问题:
+
+* **性能压测:** 在开发阶段快速评估 HTTP 服务的吞吐量和延迟分布
+* **连接复用:** 通过 HTTP/1.1 长连接和连接池管理, 模拟真实浏览器行为
+* **灵活扩展:** 内嵌 LuaJIT 脚本引擎, 支持自定义请求构造和响应处理
+* **轻量依赖:** 仅依赖 OpenSSL 和系统网络 API, 无运行时环境要求
+
+=== wrk 是什么?
+
+**wrk**:: 一个基于 `epoll`/`kqueue` 和 Redis-style 网络库 (`ae`) 构建的多线程 HTTP 基准测试工具, 支持 Lua 脚本扩展.
+
+**HTTP/1.1 长连接**:: 通过在单个 TCP 连接上复用多个 HTTP 请求, 减少连接建立的三次握手开销, 提高请求吞吐量.
+
+**LuaJIT**:: Lua 的即时编译器, wrk 内嵌 LuaJIT 运行环境, 允许用户在压测阶段动态修改请求参数或处理响应数据.
+
+**延迟分布**:: wrk 以 `Latency Distribution` 形式统计请求响应时间, 包含平均值、标准差和百分位值(P50/P75/P99), 比单纯的平均延迟更有参考价值.
+
+WARNING: wrk 仅支持 HTTP/1.1 协议, 不支持 HTTP/2 或 HTTPS (但支持 TLS). 如果需要压测 HTTP/2 服务, 可考虑使用 `h2load` 或 `ghz`.
+
+=== 核心架构
+
+wrk 的整体架构围绕三个核心组件设计:
+
+[plantuml,"wrk 架构概览",format=png]
+----
+@startuml
+package "wrk 进程" {
+  [主线程] as main
+  [工作线程 1] as w1
+  [工作线程 2] as w2
+  [工作线程 N] as wn
+}
+
+package "网络 I/O" {
+  [epoll/kqueue] as ev
+  [Socket 连接池] as pool
+}
+
+package "Lua 脚本引擎" {
+  [LuaJIT VM] as lua
+  [请求构造钩子] as hook_req
+  [响应处理钩子] as hook_resp
+}
+
+main --> w1 : 创建线程
+main --> w2 : 创建线程
+main --> wn : 创建线程
+
+w1 --> ev : 事件循环
+w2 --> ev
+wn --> ev
+
+w1 --> pool : 管理连接
+w2 --> pool
+wn --> pool
+
+w1 --> lua : 调用脚本
+w2 --> lua
+wn --> lua
+
+hook_req --> lua : request() 回调
+hook_resp --> lua : response() 回调
+@enduml
+----
+
+三个核心组件的各自职责:
+
+* **主线程:** 负责创建工作线程池、解析命令行参数、加载 Lua 脚本, 并在测试完成后汇总各线程的统计结果
+* **工作线程:** 每个工作线程运行独立的事件循环, 维护自己的连接池和定时器, 互不共享状态, 避免锁竞争
+* **Lua 脚本引擎:** 在每个工作线程中运行独立的 LuaJIT 虚拟机实例, 提供 `request()` 和 `response()` 两个钩子函数供自定义
+
+=== 基本用法
+
+==== 命令行参数
+
+[source,shell]
+----
+wrk <选项> <被测 URL>
+
+常用选项:
+  -c, --connections  保持打开的连接数 (默认 10)
+  -d, --duration     测试持续时间 (默认 10s)
+  -t, --threads      使用的线程数 (默认 2)
+  -s, --script       加载 Lua 脚本文件
+  -H, --header       添加自定义请求头
+      --latency      打印详细的延迟统计
+  -T, --timeout      每个请求的超时时间 (默认 2s)
+----
+
+==== 基础压测示例
+
+[source,shell]
+----
+# 使用 4 个线程、100 个并发连接、持续 30 秒压测
+wrk -t4 -c100 -d30s --latency http://localhost:8080/api
+
+# 输出示例:
+Running 30s test @ http://localhost:8080/api
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    45.62ms   12.34ms 356.00ms   82.17%
+    Req/Sec    554.23    98.56     1.02k    70.83%
+  Latency Distribution
+     50%   42.13ms
+     75%   51.09ms
+     90%   62.87ms
+     99%  112.56ms
+  66250 requests in 30.00s, 48.52MB read
+  Requests/sec:   2208.47
+  Transfer/sec:      1.62MB
+----
+
+=== 核心原理
+
+==== 事件驱动模型
+
+wrk 在不同操作系统上使用不同的事件驱动 API 实现高性能 I/O:
+
+[cols="2,2,2"]
+|===
+| 操作系统 | 事件 API | wrk 实现
+
+| Linux
+| `epoll`
+| `src/ae_epoll.c`
+
+| macOS/BSD
+| `kqueue`
+| `src/ae_kqueue.c`
+
+| Solaris
+| `evport`
+| `src/ae_evport.c`
+|===
+
+事件驱动模型的核心是单线程事件循环:
+
+[source,c]
+----
+// wrk 事件循环核心逻辑 (简化伪代码)
+void worker_run(thread *t) {
+    // 每个工作线程独立的事件循环
+    while (!stop) {
+        // 等待就绪事件, 超时后处理定时任务
+        int n = aeApiPoll(t->loop, 100);
+
+        for (int i = 0; i < n; i++) {
+            connection *c = fired_events[i].data;
+            if (fired_events[i].mask & AE_READABLE) {
+                // Socket 可读: 读取响应数据       // <1>
+                socket_readable(c);
+            }
+            if (fired_events[i].mask & AE_WRITABLE) {
+                // Socket 可写: 发送请求            // <2>
+                socket_writable(c);
+            }
+        }
+
+        // 检查定时器: 超时重试或关闭连接          // <3>
+        check_timeouts(t);
+    }
+}
+----
+<1> 响应数据到达时解析并统计
+<2> Socket 可写时发送下一个 HTTP 请求
+<3> 超时连接关闭或重新建立
+
+关键点: wrk 的每个工作线程使用 **非阻塞 I/O** + **事件驱动**, 一个线程可以同时管理数百甚至数千个并发连接, 无需为每个连接创建独立线程.
+
+==== 连接管理与复用
+
+wrk 的请求发送流程利用了 HTTP/1.1 长连接的特性:
+
+[plantuml,"wrk 连接复用流程",format=png]
+----
+@startuml
+participant "工作线程" as T
+participant "连接池" as P
+participant "远端正端" as S
+
+== 初始阶段 ==
+T -> P: 创建 N 个连接 (N = connections/threads)
+P -> S: TCP 三次握手
+S --> P: 连接就绪
+
+== 压测阶段 ==
+T -> P: 获取空闲连接
+P --> T: 返回连接 C1
+T -> S: GET /api HTTP/1.1 (通过 C1)
+S --> T: HTTP/1.1 200 OK (通过 C1)
+T -> P: 回收连接 C1 (复用)
+note right: 连接不关闭, 供下一个请求使用
+
+T -> P: 获取空闲连接
+P --> T: 返回连接 C1 (同一连接)
+T -> S: GET /api HTTP/1.1 (通过 C1)
+S --> T: HTTP/1.1 200 OK (通过 C1)
+@enduml
+----
+
+连接复用的关键点:
+
+* **预热阶段:** wrk 首先创建指定数量的连接并保持打开状态, 连接建立完毕后进入正式测试
+* **请求流水线:** 在同一个连接上连续发送请求, 减少 TCP 握手和慢启动的开销
+* **连接池自动管理:** 连接断开时会自动重建, 无需用户干预
+
+==== 统计机制
+
+wrk 在每个工作线程中维护独立的统计数据, 测试完成后汇总:
+
+[source,c]
+----
+// wrk 统计数据收集 (简化伪代码)
+typedef struct {
+    uint64_t requests;     // 总请求数
+    uint64_t bytes;        // 总接收字节数
+    uint64_t start;        // 测试开始时间
+    uint64_t stop;         // 测试结束时间
+    stats latencies;       // 延迟分布统计 (使用压缩直方图)
+} thread_stats;
+
+void record_latency(thread *t, uint64_t latency_us) {
+    // 使用对数桶 (log bucket) 压缩存储延迟数据          // <1>
+    // 节省内存的同时保持足够的精度
+    stats_record(t->stats.latencies, latency_us);
+}
+----
+<1> wrk 使用对数桶算法存储延迟, 而非记录每个请求的延迟值, 在大量请求场景下内存占用极小
+
+==== Lua 脚本引擎
+
+wrk 的 Lua 脚本支持三个关键钩子函数:
+
+[source,lua]
+----
+-- 初始化阶段调用, 每个线程调用一次
+function setup(thread)
+    -- 可在此设置线程本地变量
+    thread:set("id", 1)
+end
+
+-- 每个请求发送前调用, 必须返回一个 HTTP 请求字符串
+function request()
+    -- wrk 提供了 wrk.format 辅助函数构造请求
+    return wrk.format("GET", "/api/users?id=" .. math.random(1, 1000))
+end
+
+-- 每个响应到达后调用
+function response(status, headers, body)
+    -- 可用于统计特定状态码出现次数
+    if status ~= 200 then
+        print("非 200 响应: " .. status)
+    end
+end
+
+-- 测试完成后调用
+function done(summary, latency, requests)
+    -- summary: 汇总统计信息
+    -- latency: 延迟百分位数据
+    -- requests: 请求速率分布
+    io.write("总请求数: " .. summary.requests .. "\n")
+    io.write("错误数: " .. summary.errors.status .. "\n")
+end
+----
+
+Lua 脚本的典型应用场景:
+
+* **动态请求参数:** 每次请求使用不同的 URL 或请求体, 模拟真实用户行为
+* **会话模拟:** 使用 Cookie 或 Token 维持会话状态
+* **断言检查:** 在 `response()` 中校验响应状态码或内容
+* **自定义统计:** 在 `done()` 中输出额外的统计指标
+
+[source,lua]
+----
+-- 完整示例: 模拟用户登录后的请求
+counter = 0
+
+request = function()
+    counter = counter + 1
+    local path = "/api/v2/products"
+    if counter % 10 == 0 then
+        -- 每 10 次请求模拟一次写入操作
+        return wrk.format("POST", path, {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. token
+        }, '{"name": "test", "price": 99}')
+    end
+    return wrk.format("GET", path)
+end
+
+response = function(status, headers, body)
+    if status == 429 then
+        -- 记录被限流的次数
+        rate_limited = (rate_limited or 0) + 1
+    end
+end
+
+done = function(summary, latency, requests)
+    print("被限流次数: " .. (rate_limited or 0))
+end
+----
+
+=== 工作流程
+
+wrk 从启动到输出结果的完整流程:
+
+[plantuml,"wrk 完整工作流程",format=png]
+----
+@startuml
+start
+:解析命令行参数;
+:加载 Lua 脚本 (如有);
+
+partition "预热阶段" {
+  :创建工作线程池;
+  :各线程建立 TCP 连接;
+  :等待所有连接就绪;
+}
+
+partition "压测阶段" {
+  :启动计时器;
+
+  while (持续时间未到?)
+    :事件循环:
+     等待 Socket 事件;
+
+    if (Socket 可写) then (yes)
+      :发送 HTTP 请求;
+      :记录请求数++;
+    endif
+
+    if (Socket 可读) then (yes)
+      :读取 HTTP 响应;
+      :记录延迟;
+      :记录字节数;
+      :回收连接 (复用);
+    endif
+
+    :处理超时和重试;
+  endwhile
+
+  :通知各线程停止;
+}
+
+partition "汇总阶段" {
+  :等待所有线程完成;
+  :合并各线程统计数据;
+  :计算平均值/标准差/百分位;
+  :调用 Lua done() 回调 (如有);
+}
+
+:输出测试报告;
+stop
+@enduml
+----
+
+=== 与同类工具对比
+
+[cols="2,2,2,2"]
+|===
+| 特性 | wrk | Apache ab | siege | hey
+
+| 语言
+| C
+| C
+| C
+| Go
+
+| 并发模型
+| 事件驱动 + 多线程
+| 多进程
+| 多线程
+| Goroutine
+
+| 连接复用
+| 支持 (HTTP/1.1)
+| 支持
+| 支持
+| 支持
+
+| Lua 脚本
+| 内置 LuaJIT
+| 不支持
+| 不支持
+| 不支持
+
+| HTTP/2
+| 不支持
+| 不支持
+| 不支持
+| 不支持
+
+| 延迟分布
+| 详细 (含百分位)
+| 基础 (仅平均)
+| 基础 (仅平均)
+| 详细 (含百分位)
+
+| 安装
+| 需编译
+| 系统自带
+| 包管理器
+| 单二进制
+|===
+
+=== 最佳实践与注意事项
+
+. **选择合适的线程数:**
+   * 通常设置为 CPU 核心数即可, 过多线程反而因上下文切换降低性能
+   * 可通过 `lscpu` (Linux) 或 `wmic cpu get NumberOfCores` (Windows) 查看核心数
+
+. **预热 (Warm-up):**
+   * JIT 编译的应用 (如 Java/Node.js) 需要预热, 忽略前几秒的测试数据
+   * 可在 Lua 脚本的 `done()` 中输出每分钟统计数据, 观察速率变化
+
+. **理解连接数与并发的关系:**
+   * `-c` 参数控制**打开连接数**, 并非每秒请求数
+   * 实际并发受服务端处理能力和网络延迟双重影响
+
+. **网络瓶颈识别:**
+   * 如果 `Latency` 稳定但 `Req/Sec` 上不去, 可能是服务端瓶颈
+   * 如果 `Latency` 不断增大, 说明连接已积压, 服务端处理能力接近极限
+
+. **使用 Lua 脚本模拟真实场景:**
+   * 纯 GET 请求压测过于理想化, 建议加入不同 URI 和请求方法的混合流量
+   * 加入思考时间 (通过 `wrk.sleep()`) 模拟用户真实操作间隔
+
+[source,lua]
+----
+-- 模拟用户的思考时间和混合请求
+function request()
+    wrk.sleep(math.random() * 0.5)  -- 随机等待 0~500ms
+    local r = math.random()
+    if r < 0.7 then
+        -- 70% 的请求为浏览
+        return wrk.format("GET", "/products")
+    elseif r < 0.9 then
+        -- 20% 为搜索
+        return wrk.format("GET", "/search?q=" .. math.random(1000))
+    else
+        -- 10% 为下单
+        return wrk.format("POST", "/orders", nil, '{"productId": 1}')
+    end
+end
+----
+
+CAUTION: 压测工具产生的请求流量可能被 WAF、限流器或 CDN 拦截. 建议在压测前确认目标环境已关闭或适当放宽限制, 并避免对生产环境直接施压.
+
+=== 总结
+
+wrk 凭借 **事件驱动 I/O** 和 **Lua 脚本扩展** 两大核心能力, 成为轻量级 HTTP 压测领域的标杆工具.
+
+关键要点:
+
+* **性能来源:** 基于 `epoll`/`kqueue` 的事件循环, 单线程可管理数千并发连接, 配合多线程充分利用多核 CPU
+* **连接复用:** HTTP/1.1 长连接 + 连接池管理, 消除连接建立开销, 提升吞吐量
+* **可编程性:** LuaJIT 脚本引擎支持 `request()` 和 `response()` 钩子, 实现复杂业务场景的压测模拟
+* **统计能力:** 对数桶延迟存储算法在极低内存开销下提供精确的百分位延迟分析
+* **局限性:** 不支持 HTTP/2, 不支持 Windows 原生运行 (需 WSL), 不适合压测需要长连接的 WebSocket 场景

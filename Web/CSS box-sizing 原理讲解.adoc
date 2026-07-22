@@ -1,0 +1,100 @@
+== CSS box-sizing 原理讲解
+
+**box-sizing** 属性用于控制元素宽高(width/height)的计算方式, 直接影响盒模型的表现. 理解它可以帮助你更轻松地控制元素尺寸, 避免布局溢出.
+
+=== 盒模型基础
+
+在 CSS 中, 每个元素都被看作一个矩形盒子, 由内到外包括:
+
+* **content(内容):** 实际显示文本或图片的区域
+
+* **padding(内边距):** 内容与边框之间的空白
+
+* **border(边框):** 围绕内边距的边框线
+
+* **margin(外边距):** 盒子与其他元素之间的空白
+
+**默认情况**下(`box-sizing: content-box`), 你设置的 width 和 height 只作用于 content 区域.
+`盒子的实际宽度 = width + padding-left/right + border-left/right`
+这导致当你给元素添加内边距或边框时, 盒子会"变大", 可能破坏布局.
+
+=== box-sizing 的作用
+
+box-sizing 允许你改变 width/height 所包含的范围, 可选值有两个:
+
+* **content-box(默认值)**
++
+width = 内容宽度
++
+盒子总宽度 = width + padding + border
+
+* **border-box**
++
+width = 内容宽度 + padding + border
++
+盒子总宽度固定为你设置的 width, 内容区域会被压缩以适应内边距和边框.
+
+=== 为什么常用 border-box?
+
+* **直观:** 设置的宽度就是最终占据的宽度, 内边距和边框向内挤, 不会撑破父容器.
+
+* **响应式友好:** 百分比宽度(如 width: 50%)配合 border-box 时, padding 和 border 都在这个百分比内, 不会额外溢出.
+
+* **简化计算:** 不用手动做加减法, 尤其适合栅格布局或卡片设计.
+
+=== 全局推荐用法
+
+许多项目将所有元素的 box-sizing 统一为 border-box, 常用重置方案:
+
+[source, css]
+----
+/* 方案1: 直接全局设置 */
+* {
+  box-sizing: border-box;
+}
+
+/* 方案2: 带继承, 便于局部覆盖(更灵活) */
+html {
+  box-sizing: border-box;
+}
+*, *::before, *::after {
+  box-sizing: inherit;
+}
+----
+
+第二个方案允许你在某个组件内改回 content-box, 例如:
+
+[source, css]
+----
+.special-component {
+  box-sizing: content-box;  /* 该组件及其子元素恢复默认行为 */
+}
+----
+
+=== 兼容性
+
+* 现代浏览器(包括移动端)完全支持.
+
+* IE8 及以上支持, 但 IE8 中需要写标准写法, 且不支持 inherit.
+
+* 如果需要兼容 IE6/7, 可以使用 hack 或避免使用 border-box, 不过这些浏览器已极少使用.
+
+=== 注意事项
+
+* margin 始终不计入 width, 无论哪种盒模型, 外边距都会额外增加元素占据的空间.
+
+* 使用 border-box 时, 若同时设置 min-width / max-width, 它们也会作用于整个盒子(包含 padding 和 border).
+
+* 表单元素(如 input、select)在不同浏览器默认样式可能不同, 建议也统一设置 box-sizing: border-box 以保证一致性.
+
+=== 总结
+
+[cols="1,3,3"]
+|===
+|值|宽度计算方式|适用场景
+
+|content-box|宽度仅包含内容, 实际占位 = 设置值 + 内边距 + 边框|需要精确控制内容尺寸时(较少用)
+|border-box|宽度包含内容、内边距、边框|绝大多数布局场景, 更符合人类直觉
+|===
+
+掌握 box-sizing 是写出稳定、可预测布局的关键一步. 建议在新建项目时优先采用全局 border-box, 能省去许多烦恼.

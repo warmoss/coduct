@@ -1,0 +1,399 @@
+== MySQL分区原理讲解
+
+=== 什么是分区?
+
+分区(Partitioning) 是将一个表的数据按照某种规则分散存储到多个物理子表中, 但对用户来说仍是一个逻辑表的技术.
+
+=== 分区原理核心机制
+
+==== 分区类型
+
+===== RANGE分区
+
+[source, sql]
+----
+-- 按范围分区(常用)
+CREATE TABLE sales (
+    id INT,
+    sale_date DATE,
+    amount DECIMAL(10,2)
+)
+PARTITION BY RANGE (YEAR(sale_date)) (
+    PARTITION p0 VALUES LESS THAN (2020),
+    PARTITION p1 VALUES LESS THAN (2021),
+    PARTITION p2 VALUES LESS THAN (2022),
+    PARTITION p3 VALUES LESS THAN (2023)
+);
+----
+
+**原理:**
+
+* 根据分区键值的范围将数据分配到不同分区
+
+* 每个分区存储特定范围的数据
+
+===== LIST分区
+
+[source, sql]
+----
+-- 按离散值列表分区
+CREATE TABLE employees (
+    id INT,
+    department_id INT
+)
+PARTITION BY LIST (department_id) (
+    PARTITION p1 VALUES IN (1, 2, 3),
+    PARTITION p2 VALUES IN (4, 5, 6),
+    PARTITION p3 VALUES IN (7, 8, 9)
+);
+----
+
+===== HASH分区
+
+[source, sql]
+----
+-- 哈希分区
+CREATE TABLE orders (
+    id INT,
+    order_date DATE
+)
+PARTITION BY HASH(id)
+PARTITIONS 4;
+----
+
+**原理:**
+
+* 对分区键进行哈希计算
+
+* 根据哈希值均匀分配到各个分区
+
+===== KEY分区
+
+[source, sql]
+----
+-- 键分区(类似HASH但使用MySQL内部哈希函数)
+CREATE TABLE logs (
+    id INT,
+    log_time DATETIME
+)
+PARTITION BY KEY(id)
+PARTITIONS 4;
+----
+
+==== 分区存储结构
+
+[source, text]
+----
+表结构:
+sales.frm  -- 表定义文件
+
+分区文件:
+sales#P#p0.ibd  -- 分区p0的数据文件
+sales#P#p1.ibd  -- 分区p1的数据文件
+sales#P#p2.ibd  -- 分区p2的数据文件
+...
+----
+
+==== 分区查找原理(分区剪裁)
+
+===== 分区剪裁(Partition Pruning)
+
+[source, sql]
+----
+-- 查询时, MySQL优化器会进行分区剪裁
+EXPLAIN SELECT * FROM sales WHERE sale_date >= '2022-01-01';
+----
+
+**执行过程:**
+
+. 分析WHERE条件
+
+. 确定涉及的分区(只访问p2分区)
+
+. 忽略不相关的分区
+
+===== 分区查找算法
+
+[source, text]
+----
+查询: WHERE sale_date = '2022-06-15'
+分区规则: BY RANGE(YEAR(sale_date))
+
+步骤:
+1. 计算分区键: YEAR('2022-06-15') = 2022
+2. 匹配分区: 2022 ∈ [2022, 2023) → 分区p2
+3. 只在p2分区中搜索数据
+----
+
+=== 分区性能优化原理
+
+==== 数据分布优化
+
+[source, sql]
+----
+-- 查看分区数据分布
+SELECT 
+    PARTITION_NAME,
+    TABLE_ROWS,
+    AVG_ROW_LENGTH,
+    DATA_LENGTH
+FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_NAME = 'sales';
+----
+
+==== 并行查询优化
+
+[source, sql]
+----
+-- MySQL 8.0支持分区级别的并行扫描
+SELECT /*+ PARALLEL(sales, 4) */ *
+FROM sales
+WHERE sale_date BETWEEN '2021-01-01' AND '2022-12-31';
+----
+
+**原理:**
+
+* 不同分区可以在不同线程中并行扫描
+
+* 减少I/O等待时间
+
+==== 索引优化
+
+[source, sql]
+----
+-- 每个分区都有自己的索引
+CREATE INDEX idx_date ON sales(sale_date);
+-- 每个分区都会创建独立的B+树索引
+----
+
+=== 分区维护原理
+
+==== 分区添加与删除
+
+[source, sql]
+----
+-- 添加分区
+ALTER TABLE sales ADD PARTITION (
+    PARTITION p4 VALUES LESS THAN (2024)
+);
+
+-- 删除分区(数据会丢失)
+ALTER TABLE sales DROP PARTITION p0;
+
+-- 重组分区
+ALTER TABLE sales REORGANIZE PARTITION p1,p2 INTO (
+    PARTITION p1_2 VALUES LESS THAN (2022)
+);
+----
+
+==== 分区交换(快速数据迁移)
+
+[source, sql]
+----
+-- 创建与分区结构相同的普通表
+CREATE TABLE sales_2022 LIKE sales;
+ALTER TABLE sales_2022 REMOVE PARTITIONING;
+
+-- 交换分区数据
+ALTER TABLE sales EXCHANGE PARTITION p2 
+WITH TABLE sales_2022 WITHOUT VALIDATION;
+----
+
+=== 分区适用场景与限制
+
+==== 适用场景
+
+. **时间序列数据:** 按时间范围分区, 便于归档
+
+. **大数据表:** 提高查询性能
+
+. **数据归档:** 快速删除旧数据
+
+. **热点数据分离:** 将热点数据放在更快存储上
+
+==== 使用限制
+
+[source, sql]
+----
+-- 分区键限制
+-- 1. 必须是表主键或唯一索引的一部分
+-- 2. 不能使用某些数据类型(如TEXT/BLOB)
+
+-- 错误示例
+CREATE TABLE invalid_table (
+    id INT,
+    content TEXT,
+    PRIMARY KEY (id)
+)
+PARTITION BY KEY(content); -- 错误: TEXT不能作为分区键
+----
+
+=== 内部实现机制
+
+==== 分区元数据管理
+
+[source, sql]
+----
+-- 分区信息存储在系统表中
+SELECT * FROM INFORMATION_SCHEMA.PARTITIONS 
+WHERE TABLE_SCHEMA = 'your_db' 
+AND TABLE_NAME = 'sales';
+----
+
+==== 分区锁机制
+
+* **分区级锁:** MySQL 5.6+支持, 减少锁冲突
+
+* **表级锁:** 早期版本, 整个表被锁定
+
+==== 查询执行流程
+
+[source, text]
+----
+执行SELECT查询:
+1. 解析SQL语句
+2. 优化器分析WHERE条件
+3. 确定涉及的分区(分区剪裁)
+4. 对每个涉及的分区:
+   a. 获取分区级锁
+   b. 使用分区本地索引查找
+   c. 读取数据
+5. 合并结果集
+6. 返回给客户端
+----
+
+=== 实际案例分析
+
+==== 按日期分区的日志表
+
+[source, sql]
+----
+-- 创建分区表
+CREATE TABLE log_events (
+    id BIGINT AUTO_INCREMENT,
+    event_time DATETIME NOT NULL,
+    event_type VARCHAR(50),
+    event_data JSON,
+    PRIMARY KEY (id, event_time)
+)
+PARTITION BY RANGE (TO_DAYS(event_time)) (
+    PARTITION p202301 VALUES LESS THAN (TO_DAYS('2023-02-01')),
+    PARTITION p202302 VALUES LESS THAN (TO_DAYS('2023-03-01')),
+    PARTITION p202303 VALUES LESS THAN (TO_DAYS('2023-04-01')),
+    PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+
+-- 自动维护分区(需要事件调度器)
+DELIMITER $$
+CREATE EVENT auto_manage_partitions
+ON SCHEDULE EVERY 1 MONTH
+DO BEGIN
+    -- 删除3个月前的分区
+    SET @old_partition = DATE_FORMAT(DATE_SUB(NOW(), INTERVAL 3 MONTH), 'p%Y%m');
+    SET @sql = CONCAT('ALTER TABLE log_events DROP PARTITION ', @old_partition);
+    PREPARE stmt FROM @sql;
+    EXECUTE stmt;
+    
+    -- 添加下个月的分区
+    SET @new_month = DATE_FORMAT(DATE_ADD(NOW(), INTERVAL 1 MONTH), '%Y-%m-01');
+    SET @new_partition = DATE_FORMAT(DATE_ADD(NOW(), INTERVAL 1 MONTH), 'p%Y%m');
+    SET @sql = CONCAT(
+        'ALTER TABLE log_events REORGANIZE PARTITION p_future INTO (',
+        'PARTITION ', @new_partition, ' VALUES LESS THAN (TO_DAYS("', @new_month, '")),',
+        'PARTITION p_future VALUES LESS THAN MAXVALUE)'
+    );
+    PREPARE stmt FROM @sql;
+    EXECUTE stmt;
+END$$
+DELIMITER ;
+----
+
+=== 性能监控与调优
+
+==== 监控分区使用情况
+
+[source, sql]
+----
+-- 查看分区访问统计
+SELECT 
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    PARTITION_NAME,
+    TABLE_ROWS,
+    UPDATE_TIME,
+    DATA_LENGTH,
+    INDEX_LENGTH
+FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_ROWS > 0
+ORDER BY TABLE_ROWS DESC;
+
+-- 检查查询是否使用了分区剪裁
+EXPLAIN PARTITIONS 
+SELECT * FROM sales 
+WHERE sale_date BETWEEN '2022-01-01' AND '2022-12-31';
+----
+
+==== 常见问题与解决方案
+
+**数据倾斜问题**
+
+[source, sql]
+----
+-- 检查数据分布
+SELECT 
+    PARTITION_NAME,
+    COUNT(*) as row_count
+FROM sales
+GROUP BY PARTITION_NAME;
+
+-- 解决方案: 重新定义分区规则
+ALTER TABLE sales PARTITION BY RANGE (YEAR(sale_date)) (
+    PARTITION p_old VALUES LESS THAN (2020),
+    PARTITION p_2020 VALUES LESS THAN (2021),
+    PARTITION p_2021 VALUES LESS THAN (2022),
+    PARTITION p_2022 VALUES LESS THAN (2023),
+    PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+----
+
+**分区数量过多**
+
+[source, sql]
+----
+-- 合并小分区
+ALTER TABLE sales REORGANIZE PARTITION p1,p2,p3 INTO (
+    PARTITION p_combined VALUES LESS THAN (2023)
+);
+----
+
+=== 总结
+
+==== 分区优势
+
+* **性能提升:** 分区剪裁减少数据扫描量
+
+* **管理便捷:** 快速归档和删除历史数据
+
+* **可用性提高:** 分区故障不影响整个表
+
+* **并行处理:** 支持分区级并行查询
+
+==== 分区注意事项
+
+* **分区键选择:** 选择查询常用的字段
+
+* **分区数量:** 避免过多分区(一般不超过100个)
+
+* **跨分区查询:** 可能性能更差
+
+* **索引设计:** 每个分区有独立索引
+
+==== 使用建议
+
+* 对于TB级大表, 分区是必要的
+
+* 时间序列数据优先考虑RANGE分区
+
+* 定期监控分区数据分布
+
+* 配合业务需求设计分区策略

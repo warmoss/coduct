@@ -1,0 +1,191 @@
+== 桥接器设计模式原理讲解
+
+桥接器模式(Bridge Pattern)是一种**结构型设计模式**, 旨在将"抽象"与"实现"解耦, 使两者可以独立变化. 当类存在**两个或多个独立变化的维度**时, 若使用继承会导致类爆炸, 而桥接器模式通过组合替代继承来解决这一问题.
+
+=== 概念定义
+
+*抽象(Abstraction):: 定义高层控制逻辑的接口, 持有一个对实现部分的引用
+*细化抽象(Refined Abstraction):: 扩展抽象接口, 提供更具体的业务逻辑
+*实现者(Implementor):: 定义实现部分的接口, 通常只提供基本操作
+*具体实现(Concrete Implementor):: 实现实现者接口, 提供具体操作细节
+
+桥接器模式的核心思想是**将继承关系转化为组合关系**, 让抽象部分持有实现部分的引用, 从而在运行时动态切换实现.
+
+=== 核心原理
+
+桥接器模式解决的问题根源在于**多维度的继承爆炸**. 假设有一个形状类, 需要按"形状"和"颜色"两个维度变化:
+
+* 传统继承方案: 每个形状×每种颜色都需要一个子类(红色圆形, 蓝色圆形, 红色方形, 蓝色方形...)
+* 桥接器方案: 将颜色作为独立维度, 形状持有颜色的引用, 只需 `形状数 + 颜色数` 个类
+
+[plantuml,"桥接器模式类图",format=png]
+----
+@startuml
+interface Implementor {
+  + operationImpl(): void
+}
+
+class ConcreteImplementorA {
+  + operationImpl(): void
+}
+
+class ConcreteImplementorB {
+  + operationImpl(): void
+}
+
+class Abstraction {
+  # impl: Implementor
+  + operation(): void
+}
+
+class RefinedAbstraction {
+  + operation(): void
+}
+
+Abstraction o--> Implementor
+Abstraction <|-- RefinedAbstraction
+Implementor <|.. ConcreteImplementorA
+Implementor <|.. ConcreteImplementorB
+@enduml
+----
+
+=== 工作流程
+
+桥接器模式的运作遵循以下步骤:
+
+. **识别独立维度** - 找出类中两个或多个独立变化的维度, 确定哪个是抽象、哪个是实现
+. **定义抽象接口** - 创建抽象类或接口, 声明高层操作; 操作委托给实现者完成
+. **定义实现者接口** - 创建实现者接口, 声明底层基本操作
+. **实现具体实现** - 为每个实现维度创建具体实现类
+. **组装桥接** - 客户端创建抽象对象时传入具体实现, 建立桥接关系
+
+[plantuml,"桥接器模式时序图",format=png]
+----
+@startuml
+actor Client
+participant RefinedAbstraction
+participant ConcreteImplementor
+
+Client -> RefinedAbstraction: 创建(concreteImpl)
+Client -> RefinedAbstraction: operation()
+RefinedAbstraction -> ConcreteImplementor: operationImpl()
+ConcreteImplementor --> RefinedAbstraction: 返回结果
+RefinedAbstraction --> Client: 返回结果
+@enduml
+----
+
+=== 代码示例
+
+以"消息发送"为例, 消息有**类型**(普通消息、紧急消息)和**渠道**(邮件、短信)两个维度:
+
+[source,java]
+----
+// 实现者接口: 消息渠道
+interface MessageSender {
+    void send(String message, String recipient);
+}
+
+// 具体实现: 邮件发送
+class EmailSender implements MessageSender {
+    @Override
+    public void send(String message, String recipient) {
+        System.out.println("发送邮件给 " + recipient + ": " + message);
+    }
+}
+
+// 具体实现: 短信发送
+class SmsSender implements MessageSender {
+    @Override
+    public void send(String message, String recipient) {
+        System.out.println("发送短信给 " + recipient + ": " + message);
+    }
+}
+
+// 抽象: 消息类型
+abstract class Message {
+    protected MessageSender sender;                          // <1>
+
+    public Message(MessageSender sender) {
+        this.sender = sender;
+    }
+
+    public abstract void send(String message, String recipient);
+}
+
+// 细化抽象: 普通消息
+class NormalMessage extends Message {
+    public NormalMessage(MessageSender sender) {
+        super(sender);
+    }
+
+    @Override
+    public void send(String message, String recipient) {
+        sender.send("[普通] " + message, recipient);         // <2>
+    }
+}
+
+// 细化抽象: 紧急消息
+class UrgentMessage extends Message {
+    public UrgentMessage(MessageSender sender) {
+        super(sender);
+    }
+
+    @Override
+    public void send(String message, String recipient) {
+        sender.send("[紧急] " + message, recipient);
+    }
+}
+
+// 客户端使用
+public class Client {
+    public static void main(String[] args) {
+        MessageSender email = new EmailSender();
+        MessageSender sms = new SmsSender();
+
+        Message normalEmail = new NormalMessage(email);       // <3>
+        Message urgentSms = new UrgentMessage(sms);
+
+        normalEmail.send("您好", "alice@example.com");
+        urgentSms.send("服务器宕机", "13800138000");
+    }
+}
+----
+<1> 抽象持有实现者的引用, 建立桥接
+<2> 委托给实现者执行实际发送
+<3> 客户端自由组合抽象与实现
+
+输出结果:
+
+[source,shell]
+----
+发送邮件给 alice@example.com: [普通] 您好
+发送短信给 13800138000: [紧急] 服务器宕机
+----
+
+=== 适用场景
+
+桥接器模式适用于以下场景:
+
+* **多维度变化** - 类有两个或以上独立变化的维度, 且需要自由组合
+* **运行时切换实现** - 需要在运行时动态选择或替换实现
+* **避免类爆炸** - 使用继承会导致子类数量激增时
+* **实现细节对抽象透明** - 希望抽象和实现各自独立演化
+
+=== 与适配器模式的区别
+
+[cols="3*"]
+|===
+| 维度 | 桥接器模式 | 适配器模式
+
+| **目的** | 将抽象与实现解耦, 使两者可独立变化 | 让不兼容的接口协同工作
+| **设计时间** | 预先设计, 在架构阶段确定 | 事后补救, 用于集成已有组件
+| **关系** | 抽象与实现是组合关系 | 适配器与被适配者是转换关系
+| **变化方向** | 两个维度均可能变化 | 仅目标接口固定
+|===
+
+=== 总结
+
+* 桥接器模式通过**组合替代继承**, 将多维变化分解为独立层次, 显著降低类的数量
+* 核心是抽象持有实现者的引用, 两者通过接口进行松耦合交互
+* 与适配器模式的区别在于: 桥接器是**事前设计**, 适配器是**事后整合**
+* 过度使用可能增加系统复杂度, 仅在确实存在多维度变化时才引入

@@ -1,0 +1,290 @@
+== Spring SSE讲解
+
+=== 什么是 SSE?
+SSE 是一种允许服务器向客户端(通常是浏览器) *单向、实时推送数据* 的 Web 技术. 它是基于 HTTP 协议的一种轻量级标准.
+
+核心特性::
+
+* *单向通信:* 数据只能从服务器流向客户端.
+
+* *基于 HTTP:* 无需特殊协议, 使用简单的 HTTP 请求-响应机制, 易于使用和调试.
+
+* *内置重连:* 协议内置了自动重连机制, 连接中断后客户端会自动尝试重新连接.
+
+* *文本数据:* 通常用于推送文本数据(如 JSON), 也支持二进制数据(需编码).
+
+* *事件流格式:* 数据以特定的 *text/event-stream* 格式传输.
+
+与 WebSocket 的对比::
+
+[cols="1,3,3"]
+|===
+|特性|Server-Sent Events (SSE)|WebSocket
+
+|*通信方向*
+|*单向*(服务器 -> 客户端)
+|*双向*(全双工)
+
+|*协议*
+|HTTP
+|独立的 *ws* 或 *wss* 协议
+
+|*复杂度*
+|简单, 无需额外协议
+|相对复杂, 有自定义协议
+
+|*自动重连*
+|*内置支持*
+|需手动实现
+
+|*适用场景*
+|实时通知、新闻推送、行情更新、进度报告
+|聊天应用、实时游戏、协同编辑
+
+|===
+
+*简单来说: 如果你只需要服务器向客户端推送消息, 而不需要客户端频繁地向服务器发送消息, SSE 是更简单、更合适的选择.*
+
+=== SSE 事件流格式
+服务器返回的响应内容类型必须是 *text/event-stream*, 并且消息体需要遵循特定格式:
+
+[source, plaintext, linenums]
+----
+// 注释: 这是一个基本消息, `data:` 后的内容就是消息体
+data: This is a message from server.
+
+// 注释: 消息可以包含多行数据, 每行都以 `data:` 开头
+data: First line of message.
+data: Second line of message.
+
+// 注释: 可以指定事件的类型, 客户端可以根据不同类型进行不同处理
+event: userJoined
+data: {"username": "Alice", "time": "12:00"}
+
+// 注释: 可以指定事件的 ID, 用于重连时断点续传
+id: 12345
+data: This message has an ID.
+
+// 注释: 可以指定重连时间(毫秒), 告诉客户端如果断线, 多久后重连
+retry: 5000
+data: Setting retry time to 5 seconds.
+
+// 注释: 一个空行表示一条消息的结束, 客户端收到空行才会触发事件
+----
+
+=== 在 Spring 中实现 SSE
+Spring 提供了非常简洁的 API 来支持 SSE, 主要通过 *SseEmitter* 类来实现.
+
+==== 服务端实现-创建控制器
+
+创建一个 *@RestController* 并定义一个方法来建立 SSE 连接并返回 *SseEmitter* 对象.
+
+[source, java, linenums]
+----
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.io.IOException;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+@RestController
+@RequestMapping("/sse")
+public class SseController {
+
+    // 用于保存所有活跃的 SseEmitter, 以便向所有客户端广播消息
+    // CopyOnWriteArrayList 是线程安全的, 适合读多写少的场景
+    private final CopyOnWriteArrayList<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+
+    /**
+     * 客户端连接 SSE 的入口
+     * @return SseEmitter
+     */
+    @GetMapping("/connect")
+    public SseEmitter connect() {
+        // 创建一个新的 SseEmitter, 设置超时时间(例如 30 分钟)
+        // 设置为 0L 表示永不超时, 但通常不建议
+        SseEmitter emitter = new SseEmitter(30 * 60 * 1000L);
+        emitters.add(emitter);
+
+        // 移除 SseEmitter 的回调函数(在完成或超时后自动移除)
+        emitter.onCompletion(() -> emitters.remove(emitter));
+        emitter.onTimeout(() -> emitters.remove(emitter));
+
+        // 可选: 发送一个初始连接成功的消息
+        try {
+            emitter.send(SseEmitter.event()
+                        .name("connect") // 事件名
+                        .data("Connected successfully.") // 数据
+                        .id("1")); // ID
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        return emitter;
+    }
+
+    /**
+     * 一个模拟业务逻辑的方法, 用于向所有连接的客户端推送消息
+     */
+    public void sendMessageToAllClients(String message) {
+        // 遍历所有 emitter 并发送消息
+        for (SseEmitter emitter : emitters) {
+            try {
+                // 构建并发送事件
+                emitter.send(SseEmitter.event()
+                            .name("message") // 事件类型
+                            .data(message)   // 数据内容
+                            .id(String.valueOf(System.currentTimeMillis()))); // ID
+            } catch (IOException e) {
+                // 如果发送失败(通常是客户端已断开), 移除该 emitter
+                emitter.completeWithError(e);
+                emitters.remove(emitter);
+            }
+        }
+    }
+
+    // ... 其他方法, 比如提供一个 API 来触发 sendMessageToAllClients
+    @GetMapping("/broadcast")
+    public String broadcast(String msg) {
+        sendMessageToAllClients(msg);
+        return "OK";
+    }
+}
+----
+
+==== 服务端实现-关键点说明
+
+* *SseEmitter:* 核心类, 代表一个 SSE 连接. 它同时也是一个 *ResponseBodyEmitter*.
+
+* *emitter.send():* 用于发送数据. 数据可以是 *String*, *Object* (会被 Jackson 序列化为 JSON) 等.
+
+* *SseEmitter.event():* 一个工具方法, 用于构建一个事件, 可以链式调用设置 *name*, *data*, *id*, *reconnectTime* 等属性.
+
+* *生命周期管理:* 务必处理 *onCompletion* 和 *onTimeout* 事件, 及时从集合中移除失效的 emitter, 防止内存泄漏.
+
+* *异常处理:* *send()* 方法会抛出 *IOException*(通常是因为客户端已断开连接), 必须捕获并处理.
+
+==== 客户端实现 (JavaScript)
+在浏览器端, 使用 *EventSource* API 来连接 SSE 端点.
+
+[source, html, linenums]
+----
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SSE Client</title>
+</head>
+<body>
+    <div id="message-container"></div>
+
+    <script>
+        // 1. 创建 EventSource 对象, 连接服务器的 SSE 端点
+        const eventSource = new EventSource('http://your-spring-server:8080/sse/connect');
+
+        const messageContainer = document.getElementById('message-container');
+
+        // 2. 监听通用消息(没有指定 event name 的消息)
+        eventSource.onmessage = function(event) {
+            const message = document.createElement('p');
+            message.textContent = `Generic Message: ${event.data}`;
+            messageContainer.appendChild(message);
+            console.log('Received message:', event);
+        };
+
+        // 3. 监听特定事件类型的消息(对应服务器端的 event.name(‘xxx’))
+        eventSource.addEventListener('connect', function(event) {
+            console.log('Connected event:', event.data);
+        });
+
+        eventSource.addEventListener('message', function(event) {
+            const message = document.createElement('p');
+            message.textContent = `Specific Event [message]: ${event.data}`;
+            messageContainer.appendChild(message);
+            console.log('Message event:', event);
+        });
+
+        eventSource.addEventListener('userJoined', function(event) {
+            const data = JSON.parse(event.data); // 假设服务器发送的是 JSON 字符串
+            console.log(`User ${data.username} joined at ${data.time}`);
+        });
+
+        // 4. 处理错误事件
+        eventSource.onerror = function(error) {
+            console.error('EventSource error:', error);
+            // 错误发生后, EventSource 会自动尝试重连
+        };
+    </script>
+</body>
+</html>
+----
+
+=== 高级用法与最佳实践
+
+==== 关联用户身份
+上面的例子是广播. 实际应用中, 通常需要向特定用户推送消息. 可以在创建 *SseEmitter* 时将其与用户 ID(例如从 Session 或 JWT 中获取)关联起来, 存入一个 *Map<String, SseEmitter>* 中.
+
+[source, java, linenums]
+----
+private final Map<String, SseEmitter> userEmitters = new ConcurrentHashMap<>();
+
+@GetMapping("/connect")
+public SseEmitter connect(HttpServletRequest request) {
+    // 从 session 或 token 中获取用户ID (这里只是示例)
+    String userId = getUserIdFromRequest(request); 
+
+    SseEmitter emitter = new SseEmitter();
+    userEmitters.put(userId, emitter);
+
+    emitter.onCompletion(() -> userEmitters.remove(userId));
+    emitter.onTimeout(() -> userEmitters.remove(userId));
+
+    return emitter;
+}
+
+// 向特定用户发送消息的方法
+public void sendMessageToUser(String userId, String message) {
+    SseEmitter emitter = userEmitters.get(userId);
+    if (emitter != null) {
+        try {
+            emitter.send(message);
+        } catch (IOException e) {
+            emitter.completeWithError(e);
+            userEmitters.remove(userId);
+        }
+    }
+}
+----
+
+==== 性能与扩展性
+
+* 对于海量连接(数万以上), *SseEmitter* 会占用大量内存和线程资源(每个异步请求占用一个线程). 在这种场景下, 考虑使用 *Project Reactor* 的 *Flux* 和 *WebFlux*(非阻塞式编程模型)来实现 SSE, 性能会高得多.
+
+* Spring WebFlux 示例:
+
+[source, java, linenums]
+----
+@GetMapping(path = "/stream-flux", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux<String> streamFlux() {
+    return Flux.interval(Duration.ofSeconds(1))
+               .map(sequence -> "Event #" + sequence + " - " + Instant.now());
+}
+----
+
+==== 安全性
+
+* 为 SSE 端点添加身份验证和授权(如 Spring Security), 确保只有合法用户才能建立连接.
+
+* 注意跨域问题, 如果客户端在不同域名下, 需要在服务器端配置 CORS.
+
+=== 总结
+Spring 通过 *SseEmitter* 类让实现 SSE 变得非常简单, 非常适合构建服务器向客户端推送数据的实时应用, 如 dashboard、通知系统、实时排行榜等.
+
+* *核心类:* *SseEmitter*
+
+* *服务端步骤:* 创建 *SseEmitter* -> 管理其生命周期 -> 调用 *send()* 发消息.
+
+* *客户端步骤:* 使用 *EventSource* API 连接 -> 监听 *onmessage* 或自定义事件.
+
+* *注意事项:* 做好连接管理防止内存泄漏, 根据场景选择阻塞式(Servlet)或非阻塞式(WebFlux)实现.

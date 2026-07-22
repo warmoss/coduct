@@ -1,0 +1,237 @@
+== argon2原理讲解
+
+=== 概述
+
+argon2 是一种内存密集型(memory-hard)密码哈希函数, 由 Alex Biryukov、Daniel Dinu 和 Dmitry Khovratovich 设计, 于 2015 年赢得 **Password Hashing Competition(PHC)** 并成为行业推荐标准. 它通过可调节的内存、时间和并行度参数, 提供比 bcrypt 和 scrypt 更强的抗暴力破解能力.
+
+=== 三种变体
+
+argon2 提供三种变体, 分别针对不同的攻击场景:
+
+**Argon2d**:: 数据依赖型(data-dependent), 内存访问顺序依赖于输入数据. 抗 GPU/ASIC 攻击能力强, 但对 **侧信道攻击**(side-channel attack)较弱. 适用于加密货币等不受侧信道攻击威胁的场景.
+
+**Argon2i**:: 数据独立型(data-independent), 内存访问顺序与输入数据无关. 抗侧信道攻击能力强, 但抗 GPU 攻击能力略低于 Argon2d. 适用于密码哈希等可能遭受侧信道攻击的场景.
+
+**Argon2id**:: **混合模式**, 结合了 Argon2i 和 Argon2d 的优点. 前半部分使用 Argon2i(抗侧信道), 后半部分使用 Argon2d(抗 GPU). 适用于绝大多数通用密码存储场景, 是 **推荐默认选择**.
+
+=== 核心特性
+
+==== 1. 内存硬度(Memory-Hardness)
+
+argon2 的核心优势在于可控的内存消耗. 与传统哈希函数不同, argon2 需要占用大量内存进行计算:
+
+* 攻击者无法通过减少内存使用来加速计算(否则会导致哈希失败)
+* 硬件加速(ASIC、GPU)需要配备大量高速内存, 成本极高
+* 内存大小可自定义, 从 1KB 到数 GB 均可
+
+==== 2. 可调节参数
+
+argon2 提供三个独立可调参数, 分别控制三个维度的计算成本:
+
+**m_cost(内存成本)**:: 使用的内存大小(单位 KB). 增加内存成本使 ASIC/GPU 攻击更加困难, 因为硬件需要配备更多内存.
+
+**t_cost(时间成本)**:: 迭代次数. 增加时间成本使计算更慢, 增加暴力破解的时间开销.
+
+**parallelism(并行度)**:: 并行线程数(即通道数, lane count). 利用多核 CPU 加速计算, 但不降低安全性.
+
+==== 3. 抗 Tradeoff 攻击
+
+argon2 的设计考虑了 **时间-内存权衡攻击**(Time-Memory Tradeoff, TMTO). 即使攻击者愿意用更多时间换取更少内存, argon2 的计算效率也会大幅下降, 使得这种攻击得不偿失.
+
+=== 算法原理
+
+argon2 的核心数据结构为 **内存矩阵**(memory matrix), 包含多个通道(lane)和列(column). 算法分为三个阶段.
+
+==== 第一阶段: 初始化(Initialization)
+
+[source, text]
+----
+输入: password(密码), salt(盐值), 变体类型, 
+      m_cost(内存成本, KB), t_cost(时间成本), 
+      parallelism(并行度), 关联数据(可选)
+----
+
+. 根据 m_cost 和 parallelism 计算每个通道的段大小(segment size)
+. 使用 Blake2b 对 password 和 salt 进行预处理, 生成初始块(block)
+. 将初始块复制填充到所有内存块中, 构建初始内存矩阵
+
+==== 第二阶段: 内存填充(Memory Filling)
+
+内存矩阵按 **切片(slice)** 划分. 每个切片包含每个通道中的一个段(segment). 计算过程按切片顺序进行:
+
+[source, text]
+----
+对于 t_cost 中的每个 时间步(time step):
+  对于每个 切片(共 4 个切片):
+    对于每个 通道(lane):
+      对于该通道当前切片中的每个 块(block):
+        1. 确定引用的前驱块位置(取决于变体类型)
+        2. 从已填充的内存块中读取 2 个引用块
+        3. 对引用块和当前块进行压缩函数(compression function)
+        4. 将结果写回当前块
+----
+
+**引用块的选择策略**:
+
+* Argon2i: 使用伪随机函数(PRF)独立于数据选择引用位置
+* Argon2d: 使用当前块的哈希值作为索引选择引用位置
+* Argon2id: 前半个切片使用 Argon2i 策略, 后半个切片使用 Argon2d 策略
+
+**压缩函数(Compression Function)** 基于 Blake2b 实现, 包含:
+
+. **轮函数(G-function)**: 对两个 128 位输入进行混合
+. **置换函数(P-function)**: 对块中的各个 64 位字进行排列
+. 多轮混合后输出新的 1024 位(128 字节)块
+
+==== 第三阶段: 最终哈希(Finalization)
+
+. 将所有通道的最后一块进行 XOR 合并
+. 对合并结果使用 Blake2b 进行最终哈希
+. 输出指定长度的哈希值
+
+=== 哈希输出格式
+
+argon2 的输出格式为:
+
+```
+$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$R9udfOOvV8VlBf7E1kOxrQ
+```
+
+|===
+| 部分 | 值示例 | 说明
+
+| 算法标识 | `$argon2id$` | 变体类型
+| 版本号 | `v=19` | 版本 0x13(十进制 19)
+| 内存成本 | `m=65536` | 64 MB 内存
+| 时间成本 | `t=3` | 3 次迭代
+| 并行度 | `p=4` | 4 个并行通道
+| 盐值(Base64) | `c29tZXNhbHQ` | Base64 编码的盐值
+| 哈希值(Base64) | `R9udfOOvV8VlBf7E1kOxrQ` | Base64 编码的哈希值
+|===
+
+=== 安全性分析
+
+==== 抗暴力破解
+
+* 内存成本 m=65536(64 MB)时, GPU 并行数受限于显存大小
+* 高端 GPU(24 GB 显存)最多只能同时运行约 375 个 argon2 实例
+* 相比之下, bcrypt 在 GPU 上可并行数千个实例
+
+==== 抗 ASIC 攻击
+
+* ASIC 需要集成大量片上 SRAM(数 MB 至数 GB)
+* SRAM 面积大、成本高, 使得专用 ASIC 芯片的性价比极低
+* 增加内存成本可直接淘汰旧硬件
+
+==== 抗 Rainbow Table
+
+* 盐值长度推荐 16 字节(128 位), 提供 2^128 种可能性
+* Rainbow Table 的预计算成本因内存硬度的加入而呈指数级增长
+
+=== 参数选择建议
+
+|===
+| 场景 | m_cost | t_cost | parallelism | 说明
+
+| 低安全(开发环境) | 19456(19 MB) | 2 | 1 | 快速验证
+| 一般 Web 应用 | 65536(64 MB) | 3 | 4 | 推荐默认
+| 高安全需求 | 262144(256 MB) | 4 | 8 | 敏感系统
+| 极高安全 | 1048576(1 GB) | 5 | 8 | 密钥派生场景
+|===
+
+**通用推荐**: Argon2id + m=65536(64 MB) + t=3 + p=4
+
+=== 使用注意事项
+
+. **优先使用 Argon2id**: 除非有特殊需求, Argon2id 是适用于绝大多数场景的最安全选择
+. **盐值必须随机且足够长**: 使用密码学安全的随机数生成器, 盐值长度至少 16 字节
+. **不要自己实现 argon2**: 使用成熟库(libargon2、bcrypt-next), 避免实现漏洞
+. **参数要根据硬件调整**: 以应用响应时间在可接受范围内(通常 0.5~2 秒)为准
+. **版本检查**: 确保使用 v1.3(v=19), 该版本修复了早期版本中的安全漏洞
+
+=== 代码示例
+
+==== Java 使用 argon2(使用 argon2-jvm)
+
+[source, java]
+----
+import de.mkammerer.argon2.Argon2;
+import de.mkammerer.argon2.Argon2Factory;
+import de.mkammerer.argon2.Argon2Factory.Argon2Types;
+
+// 创建 Argon2id 实例
+Argon2 argon2 = Argon2Factory.create(Argon2Types.ARGON2id);
+
+String password = "mySecurePassword123";
+
+// 哈希密码 (memory: 65536 KB, time: 3, parallelism: 4)
+String hash = argon2.hash(3, 65536, 4, password.toCharArray());
+// $argon2id$v=19$m=65536,t=3,p=4$...
+
+// 验证密码
+boolean isValid = argon2.verify(hash, password.toCharArray());
+
+// 重要: 清除密码数组
+argon2.wipeArray(password.toCharArray());
+----
+
+==== Node.js 使用 argon2
+
+[source, javascript]
+----
+const argon2 = require('argon2');
+
+// 哈希密码
+try {
+  const hash = await argon2.hash('mySecurePassword123', {
+    type: argon2.argon2id,
+    memoryCost: 65536,  // 64 MB
+    timeCost: 3,         // 3 次迭代
+    parallelism: 4       // 4 个并行线程
+  });
+
+  // 验证密码
+  const isValid = await argon2.verify(hash, 'mySecurePassword123');
+} catch (err) {
+  console.error('哈希失败:', err);
+}
+----
+
+==== Python 使用 argon2-cffi
+
+[source, python]
+----
+from argon2 import PasswordHasher
+
+ph = PasswordHasher(
+    time_cost=3,
+    memory_cost=65536,   # 64 MB
+    parallelism=4,
+    hash_len=32,
+    type='argon2id'
+)
+
+# 哈希密码
+hash = ph.hash("mySecurePassword123")
+
+# 验证密码
+try:
+    ph.verify(hash, "mySecurePassword123")
+    print("密码验证通过")
+except Exception as e:
+    print("密码验证失败:", e)
+
+# 如需升级参数(验证旧哈希后重新哈希)
+def verify_and_rehash(ph, hash, password, new_params):
+    try:
+        result = ph.verify(hash, password)
+        if ph.check_needs_rehash(hash):
+            return ph.hash(password)
+        return hash
+    except Exception:
+        return None
+----
+
+=== 总结
+
+argon2 作为 PHC 竞赛的胜出者, 代表了密码哈希技术的最新标准. 它通过三个可独立调节的维度(内存、时间、并行度)提供了前所未有的灵活性. 与 bcrypt 和 scrypt 相比, argon2 在抗 ASIC/GPU 攻击方面具有显著优势, 且 Argon2id 变体同时兼顾了侧信道防护. 对于所有新的密码存储需求, **Argon2id** 是最推荐的默认选择.

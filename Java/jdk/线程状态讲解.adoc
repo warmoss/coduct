@@ -1,0 +1,112 @@
+== 线程状态讲解
+
+=== Java线程的六种状态
+
+==== NEW(新建)
+
+* **描述:** 线程被创建, 但尚未启动. 换句话说, 在代码中你使用了 new Thread() 创建了一个线程对象, 但还没有调用它的 start() 方法.
+
+* **进入条件:** 通过 new Thread() 创建后.
+
+* **下一步:** 调用 start() 方法后, 线程进入 RUNNABLE 状态.
+
+[source, java, linenums]
+----
+Thread thread = new Thread(() -> {
+    // 线程要执行的任务
+});
+System.out.println(thread.getState()); // 输出: NEW
+----
+
+==== RUNNABLE(可运行)
+
+* **描述:** 这个状态可以理解为"就绪"或"运行中". 调用了 start() 方法后, 线程就处于RUNNABLE状态.
+** **注意:** 处于此状态的线程不一定正在占用CPU执行, 它可能正在运行, 也可能正在等待CPU时间片. 这取决于操作系统的线程调度器.
+
+* **进入条件:** 调用线程的 start() 方法.
+
+* **关键点:** 在Java层面, 将"就绪(Ready)"和"运行(Running)"合并为了一个状态.
+
+[source, java, linenums]
+----
+thread.start();
+System.out.println(thread.getState()); // 输出: RUNNABLE(很可能, 但不保证)
+----
+
+==== BLOCKED(阻塞)
+
+* **描述:** 线程被阻塞, **正在等待一个监视器锁(monitor lock)**.
+
+* **进入条件:** 当一个线程试图进入一个**被synchronized关键字修饰的同步代码块或方法**, 而该锁正被其他线程持有, 那么该线程就会进入BLOCKED状态.
+
+* **退出条件:** 持有锁的线程释放了锁, 然后系统会从所有阻塞在这个锁上的线程中选择一个来获得锁, 使其变为RUNNABLE.
+
+**场景:** 线程A和线程B竞争同一个 synchronized 锁. 线程A拿到了锁, 正在执行. 此时线程B来尝试获取锁, 发现锁已被占用, 线程B的状态就变为 BLOCKED.
+
+==== WAITING(无限期等待)
+
+* **描述:** 线程处于等待状态, 直到被其他线程**显式地唤醒**. 进入这个状态的线程会释放它持有的锁.
+
+* **进入条件:** 调用以下**不带超时参数**的方法:
+
+** Object.wait(): 在其他线程调用此对象的 notify() 或 notifyAll() 方法前, 线程会一直等待.
+
+** Thread.join(): 等待目标线程执行终止. 例如, 在主线程中调用 thread.join(), 主线程会等待 thread 执行完毕.
+
+** LockSupport.park(): JUC(java.util.concurrent)包中的底层API.
+
+* **退出条件:** 被其他线程通过对应的唤醒方法唤醒(如 notify(), notifyAll(), 或目标线程终止, 或 LockSupport.unpark(thread)).
+
+==== TIMED_WAITING(超时等待)
+
+* **描述:** 线程处于等待状态, 但只会等待**指定的时间**. 时间一到, 它会自动被系统唤醒, 或者在被其他线程提前唤醒.
+
+* **进入条件:** 调用以下**带超时参数**的方法:
+
+** Thread.sleep(long millis)
+
+** Object.wait(long timeout)
+
+** Thread.join(long millis)
+
+** LockSupport.parkNanos(long nanos)
+
+** LockSupport.parkUntil(long deadline)
+
+* **退出条件:** 等待时间到期, 或者被其他线程唤醒.
+
+**注意:** sleep() 方法很特殊, 它会使线程进入TIMED_WAITING状态, 但**不会释放任何锁资源**. 而 wait() 方法会释放锁.
+
+==== TERMINATED(终止)
+
+* **描述:** 线程已经执行完毕, 结束了它的生命周期. 线程一旦进入此状态, 就不能再"重启".
+
+* **进入条件:** 线程的 run() 方法正常执行结束, 或者因为一个未捕获的异常而意外终止.
+
+[source, java, linenums]
+----
+thread.join(); // 主线程等待thread执行完毕
+System.out.println(thread.getState()); // 输出: TERMINATED
+----
+
+=== 总结与要点
+
+. **RUNNABLE是核心:** 大部分状态最终都是要回到RUNNABLE, 以等待CPU调度.
+
+. **区分BLOCKED和WAITING:**
+
+** BLOCKED 是因为**竞争同步锁(synchronized)失败**而被动发生的.
+
+** WAITING/TIMED_WAITING 通常是线程**主动调用某个方法**而进入的.
+
+. **释放锁的时机:**
+
+** 进入 synchronized 块时获取锁, 退出(正常退出或异常退出)时释放锁.
+
+** 调用 wait() 方法会**释放当前持有的锁**.
+
+** 调用 sleep() 方法**不会释放锁**.
+
+. **实际应用:** 在排查多线程问题时(如性能瓶颈、死锁), 使用JStack等工具获取线程堆栈快照, 第一件事就是看各个线程处于什么状态, 从而推断出它们正在做什么, 为何等待.
+
+理解并掌握这些状态及其转换, 是写出正确、高效并发程序的关键一步.

@@ -1,0 +1,19 @@
+= 算法
+
+include::Trie树讲解.adoc[]
+
+include::Compressed Trie树讲解.adoc[]
+
+include::KMP算法讲解.adoc[]
+
+include::Aho-Corasick算法讲解.adoc[]
+
+include::百度UID原理讲解.adoc[]
+
+include::ObjectId原理讲解.adoc[]
+
+include::ObjectId查询效率分析.adoc[]
+
+include::UUID原理讲解.adoc[]
+
+include::美团leaf算法原理讲解.adoc[]

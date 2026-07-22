@@ -1,0 +1,233 @@
+== CountDownLatch原理讲解
+
+=== 引言
+
+在多线程编程中, 一个常见场景是**主线程需要等待一组子线程全部执行完毕后再继续执行**. CountDownLatch 是 Java 并发包(`java.util.concurrent`)中提供的一个同步辅助类, 用于解决这类**线程间协同等待**的问题. 与 `Object.wait()` 的点对点通知不同, CountDownLatch 实现了一对多的等待/通知模式.
+
+=== 核心概念
+
+CountDownLatch:: 一个同步工具类, 允许一个或多个线程等待, 直到在其他线程中执行的一组操作完成. 其核心是一个**计数器**, 计数器的初始值由构造函数指定, 每个线程完成任务后调用 `countDown()` 方法使计数器减一, 等待的线程通过 `await()` 方法阻塞直到计数器归零.
+
+关键术语:
+
+* **计数器(Counter)**: CountDownLatch 内部维护的一个整型状态值, 代表需要等待完成的操作数量
+* **countDown()**: 使计数器减一的操作, 当计数器减到 0 时, 所有等待的线程被释放
+* **await()**: 阻塞当前线程直到计数器归零, 或等待超时
+
+=== 核心原理
+
+==== 基于 AQS 实现
+
+CountDownLatch 底层基于 **AQS(AbstractQueuedSynchronizer)** 实现. AQS 是 Java 并发包的基石, 提供了一个基于**CLH 队列(Craig, Landin, and Hagersten lock queue)** 的同步框架.
+
+CountDownLatch 内部定义了一个继承 AQS 的内部类 `Sync`, 将计数器状态存储在 AQS 的 `state` 字段中:
+
+[source,java]
+----
+private static final class Sync extends AbstractQueuedSynchronizer {
+    Sync(int count) {
+        setState(count);  // 初始化 state = 计数器值
+    }
+
+    int getCount() {
+        return getState();
+    }
+
+    // tryAcquireShared: 当 state == 0 时返回 1(表示可获取), 否则返回 -1
+    protected int tryAcquireShared(int acquires) {
+        return (getState() == 0) ? 1 : -1;
+    }
+
+    // tryReleaseShared: 对 state 进行 CAS 减一操作
+    protected boolean tryReleaseShared(int releases) {
+        for (;;) {
+            int c = getState();
+            if (c == 0)
+                return false;
+            int nextc = c - 1;
+            if (compareAndSetState(c, nextc))
+                return nextc == 0;
+        }
+    }
+}
+----
+
+核心机制如下:
+
+. **初始化**: `new CountDownLatch(N)` 将 AQS 的 `state` 设置为 N
+. **await()**: 调用 `tryAcquireShared(1)`, 若 `state != 0` 则当前线程加入 CLH 队列阻塞等待
+. **countDown()**: 调用 `tryReleaseShared(1)`, 通过 **CAS(Compare-And-Swap)** 原子性地将 `state` 减一; 当减到 0 时, 唤醒 CLH 队列中所有等待线程
+
+==== CLH 队列等待机制
+
+当 `await()` 发现计数器未归零时, 当前线程会被包装成 **Node 节点** 加入 AQS 的 CLH 队列并挂起. CLH 队列是一个**双向链表**, 通过自旋和 `LockSupport.park()` 实现高效的线程阻塞与唤醒.
+
+[plantuml, "CountDownLatch 工作流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title CountDownLatch 工作流程
+
+== 初始化 ==
+participant "主线程" as Main
+participant "CountDownLatch" as CDL
+participant "AQS State" as State
+
+Main -> CDL: new CountDownLatch(3)
+CDL -> State: setState(3)
+
+== 子线程执行 ==
+participant "线程 A" as TA
+participant "线程 B" as TB
+participant "线程 C" as TC
+
+Main -> CDL: await()
+CDL -> State: tryAcquireShared() → state=3, 阻塞
+
+TA -> CDL: countDown()
+CDL -> State: CAS state: 3→2
+TB -> CDL: countDown()
+CDL -> State: CAS state: 2→1
+TC -> CDL: countDown()
+CDL -> State: CAS state: 1→0
+CDL -> Main: 唤醒
+
+== 继续执行 ==
+Main -> Main: 所有线程完成, 继续执行
+@enduml
+----
+
+=== 核心方法
+
+CountDownLatch 提供了简洁的 API:
+
+[source,java]
+----
+// 构造函数: 初始化计数器
+public CountDownLatch(int count)
+// 使当前线程等待直到计数器归零(可响应中断)
+public void await() throws InterruptedException
+// 带超时的等待, 超时后不再阻塞
+public boolean await(long timeout, TimeUnit unit) throws InterruptedException
+// 计数器减一
+public void countDown()
+// 获取当前计数值(主要用于调试)
+public long getCount()
+----
+
+=== 使用场景与示例
+
+==== 场景一: 主线程等待多个子线程完成
+
+这是最常见的用法, 类似 `join()` 的增强版:
+
+[source,java]
+----
+public class CountDownLatchDemo {
+    private static final int WORKER_COUNT = 5;
+
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch latch = new CountDownLatch(WORKER_COUNT);
+
+        for (int i = 0; i < WORKER_COUNT; i++) {
+            int taskId = i;
+            new Thread(() -> {
+                try {
+                    System.out.println("Worker " + taskId + " 开始工作");
+                    Thread.sleep((long) (Math.random() * 1000));
+                    System.out.println("Worker " + taskId + " 完成工作");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    latch.countDown();  // 无论成功或异常都需 countDown
+                }
+            }).start();
+        }
+
+        latch.await();  // 主线程等待所有 Worker 完成
+        System.out.println("所有 Worker 已完成, 主线程继续执行");
+    }
+}
+----
+
+==== 场景二: 多个线程同时开始(门闩效果)
+
+利用 `CountDownLatch(1)` 实现**同时启动**的效果, 多个子线程在 `await()` 处等待, 主线程调用 `countDown()` 后所有子线程同时开始执行:
+
+[source,java]
+----
+public class SimultaneousStartDemo {
+    public static void main(String[] args) throws InterruptedException {
+        CountDownLatch startSignal = new CountDownLatch(1);
+        int workerCount = 5;
+
+        for (int i = 0; i < workerCount; i++) {
+            int taskId = i;
+            new Thread(() -> {
+                try {
+                    startSignal.await();  // 所有线程在此等待
+                    System.out.println("Worker " + taskId + " 在 " 
+                        + System.currentTimeMillis() + " 开始执行");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().reset();
+                }
+            }).start();
+        }
+
+        Thread.sleep(1000);  // 做一些准备工作
+        System.out.println("发令枪响!");
+        startSignal.countDown();  // 所有线程同时启动
+    }
+}
+----
+
+==== 场景三: 带超时的等待
+
+当不希望无限阻塞时, 可使用带超时的 `await()`:
+
+[source,java]
+----
+CountDownLatch latch = new CountDownLatch(3);
+// ... 启动多个线程执行任务 ...
+boolean completed = latch.await(5, TimeUnit.SECONDS);
+if (!completed) {
+    System.out.println("等待超时, 部分任务可能未完成");
+}
+----
+
+=== CountDownLatch 与 CyclicBarrier 对比
+
+`java.util.concurrent` 中还提供了另一个同步工具 **CyclicBarrier** (可循环屏障), 二者容易混淆, 核心区别如下:
+
+|===
+| 特性 | CountDownLatch | CyclicBarrier
+
+| 核心机制
+| 计数器**递减**, 归零后不可重置
+| 计数器**递增**, 达到阈值后可**重置**(循环使用)
+
+| 参与方式
+| 等待方(调用 `await()`)与计数方(调用 `countDown()`)角色分离
+| 所有线程到达屏障后相互等待, 角色统一
+
+| 可重用性
+| 不可重用, 计数归零后即失效
+| 可重用, 调用 `reset()` 后恢复初始状态
+
+| 运行时可执行动作
+| 无
+| 可通过 `barrierAction` 参数指定到达屏障时执行的动作
+
+| 适用场景
+| 等待一组线程完成; 同时启动多个线程
+| 分阶段并行计算, 各阶段间同步
+|===
+
+=== 注意事项与最佳实践
+
+* **计数器的值必须与线程数匹配**: `countDown()` 的调用次数必须等于初始计数值, 否则等待线程将永远阻塞. 建议在 `finally` 块中调用 `countDown()` 确保异常时也能正确执行
+* **不可重用**: CountDownLatch 计数归零后不能再恢复, 如需循环等待应使用 `CyclicBarrier`
+* **性能**: CountDownLatch 基于 AQS 的 CAS 操作实现, 性能开销较小, 适合大多数并发协同场景
+* **调试**: `getCount()` 方法返回当前计数值, 可用于监控和调试, 但注意该方法不是线程安全的快照
+* **替代方案**: Java 8 引入的 `CompletableFuture` 提供了更灵活的异步编排能力, 在某些场景可替代 CountDownLatch

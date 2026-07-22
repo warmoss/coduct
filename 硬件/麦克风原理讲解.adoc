@@ -1,0 +1,293 @@
+== 麦克风原理讲解
+
+=== 引言
+
+麦克风(Microphone)是将**声波**(机械振动)转换为**电信号**的换能器, 是音频采集链路的起点. 无论是语音助手、电话通信还是专业录音, 麦克风的性能直接决定了整个系统的音质天花板. 本文从物理原理出发, 剖析各类麦克风的工作机制、核心参数和选型要点.
+
+=== 基本概念
+
+换能器(Transducer):: 将一种能量形式转换为另一种形式的器件. 麦克风将声能(机械能)转换为电能
+振膜(Diaphragm):: 麦克风中直接响应声压变化的薄片, 随声波振动而运动
+灵敏度(Sensitivity):: 给定声压下麦克风输出的电信号强度, 通常以 stem:[dBV/Pa] 或 stem:[mV/Pa] 表示
+频率响应(Frequency Response):: 麦克风在不同频率下的灵敏度变化曲线, 理想的频率响应应平坦
+指向性(Polar Pattern):: 麦克风对不同方向声源的敏感程度, 常见类型包括全向型、心形、超心形和8字型
+
+=== 核心工作原理
+
+所有麦克风都基于一个核心物理过程: **声波使振膜振动, 振膜的机械运动通过某种机制转换为电信号**. 区别在于具体的换能方式.
+
+==== 声-电转换基础
+
+声波本质是空气中压强的周期性变化. 当声波到达振膜时, 振膜两侧产生压差, 使振膜发生位移. 这个位移量正比于声压, 频率等于声波频率. 麦克风的任务就是将这个机械位移忠实地转换为电信号.
+
+声压级(Sound Pressure Level, SPL)以分贝为单位, 参考基准为 stem:[20 \mu Pa](人耳可感知的最小声压):
+
+[stem]
+----
+SPL = 20 \log_{10}(p / p_0)
+----
+
+其中 stem:[p] 为实测声压, stem:[p_0 = 20 \mu Pa].
+
+=== 麦克风主要类型
+
+根据换能方式的不同, 麦克风分为以下几类:
+
+==== 动圈麦克风(Dynamic Microphone)
+
+动圈麦克风基于**电磁感应**原理. 振膜上连接一个位于磁场中的线圈, 振膜振动时线圈切割磁感线, 产生感应电动势.
+
+[plantuml, "动圈麦克风工作原理", format=png]
+----
+@startuml
+title 动圈麦克风原理示意
+component 振膜 as diaphragm
+component 线圈 as coil
+component 磁铁 as magnet
+
+diaphragm -> coil : 带动线圈振动
+magnet --> coil : 提供恒定磁场
+coil -> magnet : 切割磁感线产生感应电流
+note right of coil : 感应电动势 e = Blv
+@enduml
+----
+
+感应电动势服从法拉第定律:
+
+[stem]
+----
+e = -Blv
+----
+
+其中 stem:[B] 为磁感应强度, stem:[l] 为线圈有效长度, stem:[v] 为线圈运动速度.
+
+* 优点: 结构坚固、无需外部供电、能承受高声压级(SPL > 140 dB)
+* 缺点: 高频响应有限(通常 < 15 kHz)、灵敏度较低
+* 典型应用: 现场演出、乐器拾音
+
+==== 电容麦克风(Condenser Microphone)
+
+电容麦克风利用**可变电容器**原理. 振膜作为一个极板, 固定背板作为另一极板, 两者构成一个平行板电容器. 振膜振动时极板间距变化, 导致电容值变化.
+
+电容值公式:
+
+[stem]
+----
+C = \epsilon_0 \epsilon_r A / d
+----
+
+其中 stem:[\epsilon_0] 为真空介电常数, stem:[\epsilon_r] 为介质的相对介电常数, stem:[A] 为极板面积, stem:[d] 为极板间距.
+
+电容变化通过外部偏置电路转换为电压变化. 需要**极化电压**(通常 48V 幻象电源)和内置前置放大器.
+
+* 优点: 灵敏度高、频率响应宽(可达 20 Hz - 20 kHz)、瞬态响应优秀
+* 缺点: 需要外部供电、对湿度敏感、结构相对脆弱
+* 典型应用: 录音棚、语音采集、高声品质录音
+
+==== 驻极体麦克风(Electret Condenser Microphone, ECM)
+
+驻极体麦克风是电容麦克风的变种. **驻极体材料**(如聚四氟乙烯 FEP)经高压极化后永久带有电荷, 替代了外部极化电压, 因此仅需偏置电压即可工作.
+
+[source,text]
+----
+驻极体麦克风结构示意
+┌────────────────────┐
+│  驻极体振膜 (+Q)    │ ← 永久极化
+│  空气间隙           │
+│  背极板 (-Q)        │
+│  JFET 前置放大器    │ ← 需偏置电压 (1.5-10V)
+└────────────────────┘
+信号输出
+----
+
+* 优点: 体积小、成本低、仅需低电压偏置
+* 缺点: 长期稳定性不如纯电容麦克风、高频略逊
+* 典型应用: 手机、耳机、笔记本、IoT 设备
+
+==== MEMS 麦克风(Micro-Electro-Mechanical Systems)
+
+MEMS 麦克风是**微机电系统**技术制造的电容式麦克风. 振膜和背板通过半导体工艺蚀刻在硅晶圆上, 尺寸通常在毫米级. 内置前置放大器和 Sigma-Delta ADC, 直接输出数字 PDM(Pulse Density Modulation)或 I2S 信号.
+
+[plantuml, "MEMS 麦克风内部框图", format=png]
+----
+@startuml
+title MEMS 麦克风内部结构
+rectangle "MEMS 传感器" {
+  (振膜) as mems_dia
+  (背极板) as mems_back
+  mems_dia - mems_back : 可变电容
+}
+rectangle "ASIC" {
+  (电荷泵) as charge_pump
+  (前置放大器) as preamp
+  (Sigma-Delta ADC) as adc
+  (PDM 接口) as pdm_if
+  charge_pump - preamp
+  preamp - adc
+  adc - pdm_if
+}
+mems_back - charge_pump : 偏置
+@enduml
+----
+
+* 优点: 超小体积(3 x 4 x 1 mm 常见)、可回流焊、一致性好、数字输出抗干扰
+* 缺点: 高声压级性能有限(通常 max 120 dB SPL)、噪声地板较高
+* 典型应用: 智能手机、TWS 耳机、智能音箱、汽车座舱
+
+==== 各类型对比
+
+[cols="2,4,4,4,4"]
+|===
+| 特性 | 动圈 | 电容 | 驻极体 | MEMS
+
+| 换能原理 | 电磁感应 | 可变电容 | 可变电容(预极化)| 可变电容(MEMS)
+| 灵敏度 | 低 (1-3 mV/Pa) | 高 (10-50 mV/Pa) | 中 (5-20 mV/Pa) | 中 (5-15 mV/Pa)
+| 频率响应 | 50 Hz - 15 kHz | 20 Hz - 20 kHz | 30 Hz - 18 kHz | 30 Hz - 20 kHz
+| 供电需求 | 无 | 幻象电源 48V | 偏置电压 1.5-10V | 1.8-3.6V
+| SNR | ∼ 60 dB | ∼ 80 dB | ∼ 65-70 dB | ∼ 60-66 dB
+| 体积 | 大 | 中大 | 小 | 极小
+| 成本 | 中 | 高 | 低 | 极低
+| 典型场景 | 舞台演出 | 录音棚 | 消费电子 | 手机/IoT
+|===
+
+=== 关键性能参数
+
+==== 灵敏度(Sensitivity)
+
+定义为在 1 kHz、1 Pa 声压下的输出电压. 常用 dBV/Pa 表示:
+
+[stem]
+----
+Sensitivity(dBV) = 20 \log_{10}(V_{out} / 1V), at 1 Pa, 1 kHz
+----
+
+例如 -44 dBV 对应约 6.3 mV/Pa. 灵敏度并非越高越好, 需要配合系统动态范围和噪声地板考虑.
+
+==== 信噪比(Signal-to-Noise Ratio, SNR)
+
+信号与自噪声的比值, 以 A 计权(模拟人耳听觉特性)测量:
+
+[stem]
+----
+SNR = 94 dB - N_A
+----
+
+其中 stem:[N_A] 为 A 计权自噪声, 94 dB 对应 1 Pa 参考声压. 通常 MEMS 麦克风 SNR 在 60-66 dB 范围, 专业电容麦克风可达 80 dB 以上.
+
+==== 声学过载点(Acoustic Overload Point, AOP)
+
+麦克风能不失真处理的最大声压级, 超过此值输出发生削波. 动圈麦克风 AOP 最高(> 140 dB SPL), MEMS 麦克风通常为 120-130 dB SPL.
+
+==== 指向性(Polar Pattern)
+
+描述麦克风对不同入射角声源的灵敏度:
+
+全向型(Omnidirectional):: 对所有方向灵敏度一致, 无近讲效应
+心形(Cardioid):: 前端最灵敏, 后端衰减 15-25 dB, 抑制后方噪声
+超心形(Supercardioid):: 比心形前端更窄, 侧向有一定拾取
+8 字型(Figure-8):: 前后两面对称灵敏, 侧面完全抑制
+
+[plantuml, "常见指向性示意图", format=png]
+----
+@startuml
+left to right direction
+circle "全向型" as omni
+circle "心形" as card
+circle "超心形" as super
+circle "8字型" as fig8
+
+omni -down- card : 窄化前端
+card -down- super : 更窄
+super -down- fig8 : 双向对称
+@enduml
+----
+
+全向和指向型麦克风的结构差异在于振膜后腔的**声学端口**设计. 全向型振膜后端封闭, 仅响应声压大小; 指向型振膜后端开放, 响应声压梯度(即振膜两侧的压差), 因此对方向敏感.
+
+==== 频率响应与带宽
+
+理想的麦克风频率响应应平坦 ±1 dB. 实际应用中, 不同场景有不同的偏好:
+
+* 语音通信: 300 Hz - 3.4 kHz 窄带即可, > 7 kHz 可提供更清晰的辅音
+* 音乐录音: 20 Hz - 20 kHz 全频段, 需平坦响应
+* 现场演出: 需低频衰减(低切)以防舞台震动和喷麦
+
+=== 信号链路与系统集成
+
+麦克风在实际系统中的完整信号链路:
+
+[plantuml, "麦克风信号链路", format=png]
+----
+@startuml
+title 麦克风信号处理链路
+actor 声源 as source
+rectangle "麦克风" as mic {
+  (振膜) as diaphragm
+  (换能器) as transducer
+}
+rectangle "前端电路" as frontend {
+  (前置放大器) as preamp
+  (偏置电路) as bias
+}
+rectangle "ADC" as adc
+rectangle "DSP" as dsp
+rectangle "应用处理器" as app
+
+source -> diaphragm : 声波(机械振动)
+diaphragm -> transducer : 转换为电信号
+transducer -> preamp : 微弱信号
+bias -> preamp : 供电/偏置
+preamp -> adc : 放大后模拟信号
+adc -> dsp : 数字音频流(PDM/I2S)
+dsp -> app : 处理后的音频数据
+@enduml
+----
+
+各环节的关键考虑:
+
+. **声学设计**: 麦克风开孔位置、防尘网、防风罩等影响频率响应和噪声
+. **前置放大**: MEMS 麦克风将放大器集成在 ASIC 中, 外部无需额外电路; 驻极体麦克风通常需外接 JFET 或运放
+. **ADC 采样**: 语音应用常用 16-bit/16 kHz, 音乐录音 24-bit/48 kHz 或更高
+. **数字接口**: PDM 用于近距离传输(< 10 cm), I2S/TDM 用于远距离多通道
+
+=== 麦克风阵列
+
+多麦克风协同使用可实现比单个麦克风更丰富的功能:
+
+波束成形(Beamforming):: 通过相位差计算声源方向, 动态增强目标方向信号
+噪声抑制(Noise Suppression):: 利用空间差异区分目标声和噪声, 提升信噪比
+声源定位(Sound Source Localization, SSL):: 基于到达时间差(TDOA)计算声源角度
+
+[plantuml, "双麦克风波束成形示意", format=png]
+----
+@startuml
+title 双麦克风延时求和波束成形
+rectangle "声源" as src
+rectangle "Mic1" as m1
+rectangle "Mic2" as m2
+rectangle "延时器 τ1" as d1
+rectangle "延时器 τ2" as d2
+circle "求和" as sum
+circle "输出" as out
+
+src --> m1 : 距离 d1
+src --> m2 : 距离 d2 (d2 > d1)
+m1 --> d1 : x1(t)
+m2 --> d2 : x2(t)
+d1 --> sum
+d2 --> sum
+sum --> out : y(t) = x1(t-τ1) + x2(t-τ2)
+@enduml
+----
+
+当 stem:[τ_i = d_i / c](stem:[c] 为声速 ≈ 343 m/s), 各麦克风信号对齐后同相相加, 目标方向信号增强, 非目标方向信号部分抵消.
+
+=== 总结与选型建议
+
+* 麦克风是声-电换能器, 核心是将振膜机械振动转换为电信号
+* **动圈麦克风**坚固耐用, 适合现场演出; **电容麦克风**音质最优, 适合录音棚; **驻极体**性价比高, 适合消费电子; **MEMS** 体积最小、可批量生产, 主导智能手机市场
+* 选型需综合权衡灵敏度、SNR、AOP、频率响应和指向性
+* 现代音频设备多采用 **MEMS 麦克风阵列**配合 DSP 实现波束成形和噪声抑制
+* 实际系统性能不止取决于麦克风本身, 声学结构设计(开孔、密封、防尘网)同等关键
+
+WARNING: 避免将麦克风开孔对准通风口或扬声器, 气流噪声和低频过载可能导致永久性振膜损伤.

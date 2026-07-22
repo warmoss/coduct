@@ -1,0 +1,236 @@
+== 如何防止短链被遍历
+
+=== 问题背景
+
+短链服务(Short URL Service)将长 URL 映射为简短的可跳转链接(如 `https://t.cn/Abc123`), 广泛用于短信营销、社交媒体分享、二维码等场景. 核心原理是维护一张 **键值映射表**: 短码(Short Code)到原始 URL 的映射.
+
+然而, 如果短码生成算法具有**可预测性**(例如基于自增 ID 的 Base62 编码), 攻击者可以通过枚举短码来遍历所有短链接, 造成严重的安全隐患:
+
+* **隐私泄露:** 遍历到他人私密链接(如"仅自己可见"的分享).
+* **数据爬取:** 批量获取短链背后的原始 URL, 用于恶意分析或竞品信息收集.
+* **撞库攻击:** 结合其他信息, 推测用户行为模式.
+
+=== 什么是短链遍历攻击
+
+短链遍历:: 攻击者通过系统性地枚举短码, 访问本不应公开的短链接资源的行为.
+
+[plantuml, "短链遍历攻击时序图", format=png]
+----
+@startuml
+actor Attacker as A
+participant "Short URL Service" as S
+database "URL Mapping DB" as DB
+
+A -> S: GET /Xa0001
+S -> DB: 查询短码 Xa0001
+DB --> S: https://private.doc
+S --> A: 302 重定向
+A -> S: GET /Xa0002
+S -> DB: 查询短码 Xa0002
+DB --> S: https://private.doc2
+A -> S: GET /Xa0003
+note right: 批量枚举...
+@enduml
+----
+
+一个典型的可预测短码生成算法是: 数据库自增 ID 配合 Base62 编码(0-9a-zA-Z). 例如 ID=1 编码为 `000001`, ID=2 编码为 `000002`, 攻击者只需递增即可遍历所有链接.
+
+=== 防止遍历的核心方案
+
+防止短链被遍历的核心思路是: **让短码不可预测** 或 **在访问时增加验证屏障**.
+
+==== 方案一: 随机短码
+
+最直接的方案是使用**随机字符串**作为短码, 而非对自增 ID 编码.
+
+[source,java]
+----
+import java.security.SecureRandom;
+
+public class ShortCodeGenerator {
+    private static final String CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    private static final SecureRandom RANDOM = new SecureRandom();
+
+    public static String generate(int length) {
+        StringBuilder sb = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            sb.append(CHARS.charAt(RANDOM.nextInt(CHARS.length())));
+        }
+        return sb.toString();
+    }
+}
+----
+
+**关键考量:**
+
+* **短码长度:** 7 位 Base62 的碰撞空间为 stem:[62^7 \approx 3.5 \times 10^{12}], 暴力破解成本极高.
+* **碰撞处理:** 生成短码后需检查数据库唯一性, 若冲突则重新生成. 冲突概率极低时可忽略, 也可用 **重试机制** 兜底.
+* **随机数质量:** 必须使用 `SecureRandom`(或等价的密码学安全伪随机数生成器, CSPRNG), 禁止使用 `Math.random()` 或 `Random`, 因其输出可被预测.
+
+==== 方案二: 加密ID
+
+保留自增 ID 的**有序性**优势, 但通过**对称加密**将 ID 转换为不可预测的密文, 再将密文编码为短码.
+
+[plantuml, "加密ID方案流程图", format=png]
+----
+@startuml
+start
+:自增 ID;
+:使用 AES/Chacha20 加密;
+:将密文 Base62 编码;
+:得到短码;
+stop
+@enduml
+----
+
+[source,java]
+----
+import javax.crypto.Cipher;
+import javax.crypto.spec.SecretKeySpec;
+import java.util.Base64;
+
+public class EncryptedShortCode {
+    private static final String ALGORITHM = "AES/ECB/NoPadding";
+
+    public static String encryptId(long id, byte[] key) throws Exception {
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        SecretKeySpec spec = new SecretKeySpec(key, "AES");
+        cipher.init(Cipher.ENCRYPT_MODE, spec);
+
+        // 将 long 转为 8 字节
+        byte[] input = new byte[8];
+        for (int i = 7; i >= 0; i--) {
+            input[i] = (byte)(id & 0xFF);
+            id >>= 8;
+        }
+        byte[] encrypted = cipher.doFinal(input);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(encrypted);
+    }
+}
+----
+
+**优缺点:**
+
+* **优势:** 保留数据库自增 ID 的索引优势, 解密后可直接查询, 无需额外索引.
+* **风险:** 密钥管理是核心挑战; 密钥泄露则全部短码可被解码.
+* **注意:** AES 分组加密输出固定 16 字节, 可进一步截断(如取前 8 字节)以缩短短码, 但会引入微弱碰撞概率.
+
+==== 方案三: Hash 短码
+
+对原始 URL 或 ID 进行 Hash, 取前 n 位作为短码.
+
+[source,java]
+----
+import java.security.MessageDigest;
+import java.util.Base64;
+
+public class HashShortCode {
+    public static String hash(String url) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        byte[] digest = md.digest(url.getBytes());
+
+        // 取前 6 字节, Base64 编码得到 8 字符短码
+        byte[] truncated = new byte[6];
+        System.arraycopy(digest, 0, truncated, 0, 6);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(truncated);
+    }
+}
+----
+
+**关键注意:**
+
+* **碰撞处理:** Hash 截断必然存在碰撞, 需要配合 **冲突链表** 或 **开放寻址** 解决. 通常在短码尾部追加递增序号.
+* **一致性:** 同一 URL 每次 Hash 结果相同, 可通过增加 **随机盐值(salt)** 使相同 URL 生成不同短码(实现防遍历 + 防重识别).
+
+==== 方案四: 访问频率限制(Rate Limiting)
+
+即使短码被猜到, 也可以通过**访问频率限制**大幅降低攻击者的遍历效率.
+
+[source,java]
+----
+// 基于令牌桶的限流伪代码
+public class RateLimiter {
+    private final Map<String, TokenBucket> buckets = new ConcurrentHashMap<>();
+
+    public boolean allowAccess(String ip) {
+        TokenBucket bucket = buckets.computeIfAbsent(ip, k -> new TokenBucket(10, 1));
+        return bucket.tryAcquire();
+    }
+}
+----
+
+**限流维度:**
+
+[cols="3*"]
+|===
+| 维度 | 说明 | 示例值
+
+| IP 地址 | 单 IP 频繁访问不同短码 | 每分钟 100 次
+| 用户 Token | 登录用户维度限流 | 每分钟 300 次
+| 短码自身 | 单个短码被大量访问时触发 | 每分钟 1000 次
+| 全局 | 服务整体 QPS 保护 | 每秒 10000 次
+|===
+
+**深入讲解可参考** <<安全算法/hmac讲解.adoc, HMAC 鉴权>> 中的令牌验证原理.
+
+==== 方案五: 验证令牌
+
+对于**隐私内容**, 在短链中附加一次性或时效性令牌, 服务端验证令牌有效后才允许跳转.
+
+[source,text]
+----
+原始短链: https://t.cn/Abc123
+防遍历短链: https://t.cn/Abc123?token=xyz...     // <1>
+----
+<1> 令牌由服务端签发, 包含过期时间, 签名为 HMAC 或 RSA 签名.
+
+令牌验证可以结合 <<../Web/http/XSS攻击讲解.adoc, 前端安全机制>> 中的 Cookie 校验等措施, 形成**多层防御**.
+
+=== 方案对比
+
+[cols="4*"]
+|===
+| 方案 | 安全性 | 性能影响 | 实现复杂度
+
+| 随机短码 | 高 | 低(需碰撞检查) | 低
+| 加密 ID | 高 | 中(加解密开销) | 中
+| Hash 短码 | 中 | 低 | 中
+| 频率限制 | 辅助 | 低 | 低
+| 验证令牌 | 最高 | 中 | 高
+|===
+
+[[recommendation]]
+=== 推荐组合方案
+
+实际生产环境中, 单一方案往往不够, 推荐**组合策略**:
+
+. **短码生成:** 使用**随机短码**(7-8 位 Base62)作为基础, 结合数据库唯一索引保证无碰撞.
+. **访问控制:** 对公开短链配合**频率限制**, 对私密内容增加**令牌验证**.
+. **监控告警:** 监控短码访问的 **404 率** 和 **单 IP 访问短码数量**, 一旦异常快速响应.
+
+[source,yaml]
+----
+# 短链服务配置示例
+short-url:
+  code-length: 7                    # 短码长度
+  charset: base62                   # 编码字符集
+  rate-limit:
+    per-ip: 100/min                 # 单 IP 限流
+    per-code: 1000/min              # 单短码限流
+  private-token:
+    enabled: true                   # 私密内容启用令牌
+    ttl: 7d                         # 令牌有效期 7 天
+----
+
+=== 总结
+
+防止短链被遍历的**核心原则**: 让短码不可预测 + 访问时增加验证屏障.
+
+* **随机短码**是最简单有效的方案, 配合 `SecureRandom` 和唯一约束即可满足大部分场景.
+* **加密 ID** 适用于需要保留自增 ID 优势的场景, 但需妥善管理密钥.
+* **频率限制**和**令牌验证**作为辅助防御层, 大幅增加攻击成本.
+* 没有绝对安全的方案, 应基于**业务敏感度**选择合适的安全等级, 并辅以**监控和告警**及时感知异常.
+
+=== 我的方案
+
+基于vindex随机的预生成方案

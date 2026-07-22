@@ -1,0 +1,285 @@
+== MySQL窗口函数原理讲解
+
+=== 窗口函数概述
+
+窗口函数(Window Function)是MySQL 8.0引入的重要功能, 允许在查询中对一组相关的行(称为"窗口")执行计算, 而**不减少查询结果的行数**.
+
+**与聚合函数的区别:**
+
+* 聚合函数: 将多行合并为一行(如GROUP BY)
+
+* 窗口函数: 为每一行返回一个值, 保持原有行数
+
+=== 窗口函数基本语法
+
+[source, sql]
+----
+SELECT 
+    column1,
+    column2,
+    window_function(column3) OVER (
+        [PARTITION BY partition_column]
+        [ORDER BY order_column]
+        [frame_clause]
+    ) AS alias
+FROM table_name;
+----
+
+=== 窗口函数的三要素
+
+==== PARTITION BY - 分区
+
+将结果集划分为多个分组, 窗口函数在每个分组内独立计算
+
+[source, sql]
+----
+-- 按部门分区, 在每个部门内分别计算
+SELECT 
+    employee_id,
+    department,
+    salary,
+    AVG(salary) OVER (PARTITION BY department) as dept_avg_salary
+FROM employees;
+----
+
+==== ORDER BY - 排序
+
+定义分区内的行顺序, 影响:
+
+* 排名函数(ROW_NUMBER, RANK等)的顺序
+
+* 累积计算的范围
+
+[source, sql]
+----
+-- 按工资降序排列
+SELECT 
+    employee_id,
+    salary,
+    ROW_NUMBER() OVER (ORDER BY salary DESC) as salary_rank
+FROM employees;
+----
+
+==== FRAME CLAUSE - 窗口框架
+
+定义当前行相关的计算范围
+
+[source, sql]
+----
+-- 计算移动平均(当前行及前2行)
+SELECT 
+    order_date,
+    daily_sales,
+    AVG(daily_sales) OVER (
+        ORDER BY order_date 
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) as moving_avg
+FROM sales;
+----
+
+=== 窗口框架类型
+
+==== ROWS - 物理行
+
+[source, sql]
+----
+-- 当前行及前后各1行
+ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+
+-- 从分区开始到当前行
+ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+
+-- 当前行到分区结束
+ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
+----
+
+==== RANGE - 逻辑范围
+
+[source, sql]
+----
+-- 与当前行值相差不超过10的所有行
+RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING
+
+-- 默认框架(当有ORDER BY时)
+RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+----
+
+=== 窗口函数分类
+
+==== 排名函数
+
+[source, sql]
+----
+-- ROW_NUMBER(): 连续编号(1,2,3,...)
+SELECT 
+    name,
+    score,
+    ROW_NUMBER() OVER (ORDER BY score DESC) as rank1
+FROM students;
+
+-- RANK(): 有间隔的排名(1,2,2,4,...)
+RANK() OVER (ORDER BY score DESC) as rank2
+
+-- DENSE_RANK(): 密集排名(1,2,2,3,...)
+DENSE_RANK() OVER (ORDER BY score DESC) as rank3
+
+-- NTILE(n): 将数据分为n组
+NTILE(4) OVER (ORDER BY score DESC) as quartile
+----
+
+==== 分布函数
+
+[source, sql]
+----
+-- PERCENT_RANK(): (rank-1)/(总行数-1)
+-- CUME_DIST(): 累积分布
+----
+
+=== 前后值函数
+
+[source, sql]
+----
+-- LAG(column, n): 获取前n行的值
+SELECT 
+    date,
+    sales,
+    LAG(sales, 1) OVER (ORDER BY date) as prev_sales,
+    sales - LAG(sales, 1) OVER (ORDER BY date) as sales_change
+FROM daily_sales;
+
+-- LEAD(column, n): 获取后n行的值
+----
+
+==== 首尾值函数
+
+[source, sql]
+----
+-- FIRST_VALUE(): 窗口第一行的值
+-- LAST_VALUE(): 窗口最后一行的值
+-- NTH_VALUE(column, n): 第n行的值
+----
+
+==== 聚合函数作为窗口函数
+
+[source, sql]
+----
+SELECT 
+    month,
+    revenue,
+    SUM(revenue) OVER (ORDER BY month) as cumulative_revenue,
+    AVG(revenue) OVER (ORDER BY month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as moving_avg,
+    MAX(revenue) OVER (PARTITION BY YEAR(month)) as year_max
+FROM monthly_sales;
+----
+
+=== 执行原理
+
+==== 查询执行顺序
+
+[source, text]
+----
+FROM → WHERE → GROUP BY → HAVING → WINDOW → SELECT → ORDER BY → LIMIT
+----
+
+==== 窗口函数执行步骤
+
+[source, sql]
+----
+-- 示例查询
+SELECT 
+    department,
+    employee,
+    salary,
+    RANK() OVER (PARTITION BY department ORDER BY salary DESC) as dept_rank
+FROM employees
+WHERE salary > 50000;
+----
+
+执行流程:
+
+. **FROM employees:** 读取表数据
+
+. **WHERE salary > 50000:** 过滤行
+
+. **窗口函数计算:**
+
+** 按department分区
+
+** 在每个分区内按salary降序排序
+
+** 计算每行的排名
+
+. **SELECT:** 选择输出列
+
+==== 性能优化考虑
+
+[source, sql]
+----
+-- 创建合适索引可以优化窗口函数性能
+CREATE INDEX idx_dept_salary ON employees(department, salary DESC);
+
+-- 多个窗口函数共享同一窗口定义
+SELECT 
+    employee,
+    salary,
+    AVG(salary) OVER w as avg_salary,
+    MAX(salary) OVER w as max_salary
+FROM employees
+WINDOW w AS (PARTITION BY department ORDER BY hire_date);
+----
+
+=== 实用示例
+
+==== 示例1: 计算累计百分比
+
+[source, sql]
+----
+SELECT 
+    product,
+    sales,
+    SUM(sales) OVER (ORDER BY sales DESC) as running_total,
+    SUM(sales) OVER () as total_sales,
+    SUM(sales) OVER (ORDER BY sales DESC) / SUM(sales) OVER () as cumulative_percent
+FROM products;
+----
+
+==== 示例2: 查找连续记录
+
+[source, sql]
+----
+-- 查找连续登录的用户
+SELECT 
+    user_id,
+    login_date,
+    LAG(login_date) OVER (PARTITION BY user_id ORDER BY login_date) as prev_login,
+    DATEDIFF(login_date, LAG(login_date) OVER (PARTITION BY user_id ORDER BY login_date)) as days_diff
+FROM logins;
+----
+
+==== 示例3: 分组内排名筛选
+
+[source, sql]
+----
+-- 每个部门工资前三名
+SELECT * FROM (
+    SELECT 
+        department,
+        employee,
+        salary,
+        DENSE_RANK() OVER (PARTITION BY department ORDER BY salary DESC) as rank
+    FROM employees
+) ranked
+WHERE rank <= 3;
+----
+
+=== 注意事项
+
+* **性能问题:** 窗口函数可能消耗较多内存和CPU资源
+
+* **索引使用:** PARTITION BY和ORDER BY的列有索引可提升性能
+
+* **版本要求:** MySQL 8.0+ 完整支持
+
+* **内存限制:** 大数据集可能需要调整tmp_table_size和max_heap_table_size
+
+窗口函数极大地增强了SQL的分析能力, 使得复杂的数据分析任务可以直接在数据库层完成, 减少应用程序的计算负担.

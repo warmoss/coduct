@@ -1,0 +1,248 @@
+== 802.1X原理讲解
+
+=== 为什么需要802.1X?
+
+传统局域网基于 **物理接入即信任** 的模型: 只要设备插入网线或连上Wi-Fi, 就能访问网络资源. 这种模型存在严重安全隐患:
+
+* **未授权接入:** 任何人都可以通过物理接口接入内部网络, 不需要任何身份验证.
+* **ARP欺骗/中间人攻击:** 攻击者接入局域网后可以伪造IP/MAC地址进行攻击.
+* **病毒扩散:** 一台带毒设备接入网络后可以迅速感染整个局域网.
+* **管理盲区:** 网络管理员无法控制谁在接入网络, 也无法审计接入行为.
+
+**802.1X** 正是为解决这些问题而设计的端口级网络访问控制协议.
+
+=== 802.1X是什么?
+
+**802.1X** 是IEEE标准定义的一种 **基于端口的网络访问控制协议**, 全称是 **IEEE 802.1X - Port-Based Network Access Control**. 它的核心思想是: **在设备接入网络之前, 先验证其身份; 验证通过后才允许其访问网络资源**.
+
+它工作在 **数据链路层(OSI第二层)**, 不依赖上层协议(IP), 因此适用于以太网和无线网络.
+
+=== 核心角色
+
+802.1X定义了三个参与角色:
+
+请求者(Supplicant)::
+  需要接入网络的客户端设备, 如电脑、手机. 客户端上需要运行802.1X客户端软件(如Windows内置的Wired AutoConfig服务、Linux的wpa_supplicant).
+
+认证者(Authenticator)::
+  网络接入设备, 如交换机、无线接入点. 充当 **中间代理** 角色, 在客户端和认证服务器之间转发认证消息. 它控制端口的 `开放/关闭` 状态, 只有认证通过的客户端才能通过该端口通信.
+
+认证服务器(Authentication Server)::
+  通常是 **RADIUS** 服务器, 负责实际验证客户端身份. 它持有用户数据库(账号密码或证书), 根据认证者转发过来的凭据决定是否允许接入.
+
+[plantuml, "802.1X 三种角色关系", format=png]
+----
+@startuml
+rectangle "请求者(Supplicant)" as client
+rectangle "认证者(Authenticator)" as switch
+rectangle "认证服务器(Authentication Server)\n(RADIUS Server)" as radius
+
+client <--> switch: EAP over LAN (EAPoL)
+switch <--> radius: EAP over RADIUS
+@enduml
+----
+
+=== 端口的两种状态
+
+802.1X将物理端口逻辑划分为两个虚拟端口:
+
+* **非受控端口(Uncontrolled Port):** 仅允许 **EAPoL(EAP over LAN)** 认证流量通过, 用于传递认证消息. 客户端在认证前唯一能通信的就是这个端口.
+* **受控端口(Controlled Port):** 允许所有网络流量通过. 仅在认证成功后开放.
+
+[source,text]
+----
++---------------------------------------------+
+|                  交换机                       |
+|  +------------------+  +------------------+  |
+|  |  非受控端口       |  |   受控端口        |  |
+|  | (仅EAPoL通过)    |  | (所有流量通过)    |  |
+|  +--------+---------+  +--------+---------+  |
+|           |                     |            |
+|           +---------+-----------+            |
+|                     |                        |
+|               物理端口(接入)                  |
++---------------------------------------------+
+        |
+   客户端设备
+----
+
+=== EAP框架
+
+**EAP**(Extensible Authentication Protocol) 是802.1X的核心认证框架. 它本身不是一个具体的认证方法, 而是一个 **插件式框架**, 允许使用多种认证方式.
+
+==== EAP在企业无线网络中的位置
+
+EAP位于 **数据链路层之上, 网络层之下**, 直接在以太网帧中传输, 不依赖IP.
+
+[source,text]
+----
++------------------+
+|    Application   |
++------------------+
+|    TCP/UDP       |
++------------------+
+|    IP            |
++------------------+  <- 不经过IP层
+|    EAP           |
++------------------+
+|    802.1X        |
++------------------+
+|    802.3/802.11  |
++------------------+
+----
+
+==== 常见EAP方法
+
+|===
+| EAP方法 | 认证方式 | 安全性 | 部署复杂度 | 典型场景
+
+| **EAP-MD5** | 用户名+密码(哈希) | 低 | 低 | 不推荐, 已被淘汰
+| **EAP-TLS** | 双向证书 | 高 | 高 | 企业有线网络
+| **EAP-PEAP** | 服务器证书+客户端密码 | 高 | 中 | 企业Wi-Fi
+| **EAP-TTLS** | 服务器证书+客户端密码/证书 | 高 | 中 | 兼容性要求高的场景
+| **EAP-FAST** | 受保护的凭据(隧道) | 中高 | 中 | Cisco设备环境
+| **EAP-SIM** | SIM卡 | 高 | 低 | 移动运营商Wi-Fi
+|===
+
+=== 认证流程
+
+以一个典型的企业有线网络场景为例, 客户端通过支持802.1X的交换机接入网络, 使用 **EAP-PEAP** 认证:
+
+==== 第一阶段: 初始化(EAPoL-Start)
+
+. 客户端设备接入交换机端口, 端口初始状态为 **未授权(Unauthorized)**, 仅非受控端口开放.
+. 客户端发送 **EAPoL-Start** 报文发起认证请求.
+
+==== 第二阶段: 认证协商
+
+. 交换机收到EAPoL-Start后, 回复 **EAP-Request/Identity** 报文, 要求客户端提供身份信息.
+. 客户端回复 **EAP-Response/Identity** 报文, 包含用户名(如 `alice@company.com`).
+. 交换机将客户端的身份信息封装成 **RADIUS Access-Request** 报文, 转发给RADIUS服务器.
+
+==== 第三阶段: 隧道建立
+
+. RADIUS服务器回复 **EAP-Request** 启动PEAP隧道建立, 发送服务器证书.
+. 客户端验证服务器证书的合法性(是否由受信任CA签发、是否过期、域名是否匹配).
+. 验证通过后, 客户端和服务器之间建立TLS加密隧道.
+
+==== 第四阶段: 客户端认证
+
+. 在已建立的TLS隧道内, 服务器向客户端请求用户名和密码.
+. 客户端通过加密隧道提交凭据(密码明文或NTLM哈希).
+. RADIUS服务器验证凭据, 验证通过后发送 **EAP-Success** 消息.
+
+==== 第五阶段: 授权
+
+. 交换机收到RADIUS服务器的 **Access-Accept** 报文, 将对应端口状态切换为 **已授权(Authorized)**.
+. 受控端口开放, 客户端可以正常访问网络资源.
+. 交换机可能同时下发 **VLAN分配** 或 **ACL策略**, 将客户端置于特定网络段或应用特定访问控制.
+
+[plantuml, "802.1X 完整认证流程 (EAP-PEAP)", format=png]
+----
+@startuml
+participant "客户端(Supplicant)" as client
+participant "交换机(Authenticator)" as sw
+participant "RADIUS服务器" as radius
+
+== 初始化 ==
+client -> sw: EAPoL-Start
+sw -> client: EAP-Request/Identity
+
+== 身份提交 ==
+client -> sw: EAP-Response/Identity (用户名)
+sw -> radius: RADIUS Access-Request (EAP-Response/Identity)
+
+== 服务器证书认证 ==
+radius -> sw: RADIUS Access-Challenge (EAP-Request, Server Cert)
+sw -> client: EAP-Request (服务器证书)
+client -> client: 验证服务器证书
+
+== TLS隧道建立 ==
+client -> sw: EAP-Response (TLS建立)
+sw -> radius: RADIUS Access-Request
+note right: TLS隧道已建立
+
+== 在隧道内认证 ==
+radius -> sw: RADIUS Access-Challenge (EAP-Request, 请求密码)
+sw -> client: EAP-Request (请求密码)
+client -> sw: EAP-Response (密码, TLS加密)
+sw -> radius: RADIUS Access-Request
+
+== 认证结果 ==
+radius -> sw: RADIUS Access-Accept (EAP-Success)
+sw -> client: EAP-Success
+sw -> sw: 端口切换为已授权
+note right: 客户端可正常访问网络
+@enduml
+----
+
+[NOTE]
+====
+EAP-PEAP的核心安全思想是 **先建立安全隧道, 再在隧道内传输敏感凭据**. 即使网络被窃听, 攻击者也只能看到证书交换阶段, 无法获取用户密码.
+====
+
+=== RADIUS属性的关键作用
+
+在802.1X中, 交换机和RADIUS服务器之间的通信使用RADIUS协议, 通过标准属性传递认证授权信息:
+
+|===
+| RADIUS属性 | 编号 | 类型 | 说明
+| **User-Name** | 1 | Text | 客户端用户名
+| **User-Password** | 2 | Text | 客户端密码(加密传输)
+| **NAS-IP-Address** | 4 | IP | 认证者的IP地址(交换机)
+| **NAS-Port** | 5 | Integer | 客户端接入的端口号
+| **Service-Type** | 6 | Integer | 服务类型(如Framed = 拨号或802.1X)
+| **Framed-MTU** | 12 | Integer | 链路MTU
+| **EAP-Message** | 79 | String | 封装EAP报文(关键属性)
+| **Message-Authenticator** | 80 | String | 消息完整性校验
+| **Tunnel-Private-Group-ID** | 81 | String | VLAN分配(用于下发VLAN ID)
+| **Filter-ID** | 11 | Text | ACL策略名称(用于下发访问控制)
+|===
+
+[IMPORTANT]
+====
+**EAP-Message**(属性79) 是最关键的RADIUS属性. 交换机将客户端发送的EAP报文封装在此属性中传给RADIUS服务器, 服务器也将响应封装在此属性返回. 这保证了EAP认证流程在交换机与RADIUS之间透明传输.
+====
+
+=== 认证方式对比
+
+==== 802.1X 认证 vs MAC认证 vs Portal认证
+
+|===
+| 特性 | 802.1X认证 | MAC认证 | Portal认证
+| 认证粒度 | 用户级(证书/账号) | 设备级(MAC地址) | 用户级(Web页面)
+| 安全性 | 高(EAP加密隧道) | 低(MAC可伪造) | 中(HTTP可劫持)
+| 用户体验 | 透明(后台完成) | 透明(自动完成) | 需要手动登录
+| 部署复杂度 | 高(需RADIUS+PKI) | 低 | 中
+| 适用场景 | 企业内网、办公网络 | 打印机、IoT设备 | 访客网络、酒店Wi-Fi
+|===
+
+==== EAP-TLS 与 EAP-PEAP 对比
+
+|===
+| 特性 | EAP-TLS | EAP-PEAP
+| 客户端证书 | 必需 | 不需要
+| 服务器证书 | 必需 | 必需
+| 凭据保护 | 双向证书 | TLS隧道+密码
+| 部署复杂度 | 高(需管理客户端证书) | 中
+| 安全性 | 最高 | 高
+| 典型应用 | 高安全要求的企业内网 | 企业Wi-Fi
+|===
+
+=== 常见部署注意事项
+
+* **证书管理:** EAP-TLS要求为每台设备签发客户端证书, 证书生命周期管理(颁发、续期、吊销)是关键运维工作. 很多企业使用SCEP或MDM(如Intune)自动分发证书.
+* **RADIUS高可用:** 交换机应配置多台RADIUS服务器, 防止单点故障. 主流交换机支持主备模式.
+* **端口安全与802.1X结合:** 可以同时启用端口安全(MAC地址限制)和802.1X, 在认证通过后再做MAC绑定, 防止非法设备替换合法设备.
+* **Guest VLAN:** 802.1X认证失败或超时时, 可将设备划入访客VLAN, 使其只能访问互联网而无法进入内网. 这是企业常见做法.
+* **动态VLAN下发:** RADIUS服务器可以根据用户的角色(如员工、访客、管理员)返回不同的VLAN ID, 实现 **基于身份的精细网络隔离**.
+
+=== 总结
+
+* **802.1X** 是一种基于端口的网络访问控制协议, 核心思想是 **先认证后接入**.
+* 三个核心角色: **请求者**(客户端)、**认证者**(交换机/AP)、**认证服务器**(RADIUS).
+* 使用 **EAP框架** 实现灵活的认证方式选择, 从简单的EAP-MD5到高安全的EAP-TLS.
+* 端口分为 **非受控端口**(仅认证流量)和 **受控端口**(认证通过后开放).
+* 企业推荐使用 **EAP-PEAP**(密码+服务器证书) 或 **EAP-TLS**(双向证书), 后者安全性最高但部署复杂.
+* RADIUS服务器可动态 **下发VLAN和ACL** 策略, 实现基于身份的网络隔离和访问控制.
+* **常见误区:** 802.1X仅能控制 **网络接入层** 的访问, 无法替代应用层的身份认证和授权(如SSH、Web登录).

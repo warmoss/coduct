@@ -1,0 +1,435 @@
+== ubuntu cgroup原理讲解
+
+=== 概述
+
+**cgroup**(Control Group) 是 Linux 内核提供的一种 **资源隔离** 和 **限制** 机制. 它允许将进程按层级组织到组中, 并对组设置 CPU、内存、磁盘 I/O、网络等资源的配额. 容器技术(如 Docker、LXC)的核心底层依赖正是 cgroup.
+
+cgroup 解决的核心问题:
+
+* **资源争抢:** 多个进程同时运行时, 防止某个进程耗尽系统资源导致其他进程不可用
+* **资源配额:** 为不同业务设定确切的资源上限, 如 "这个容器最多用 2 核 CPU 和 1 GB 内存"
+* **监控统计:** 实时跟踪进程组的资源使用量, 为运维决策提供数据支撑
+
+=== cgroup 是什么?
+
+**cgroup**:: 一个内核特性, 将进程组织成层级树, 并沿树分发资源控制策略.
+
+**cgroup 子系统**:: 也叫 resource controller, 每种资源对应一个子系统. 例如 `cpu` 子系统控制 CPU 时间分配, `memory` 子系统控制内存上限.
+
+**cgroup 层级**:: 子系统与 cgroup 树绑定形成的层次结构. 子 cgroup 继承父 cgroup 的限制, 但可以进一步细化.
+
+[[cgroup-v1-vs-v2]]
+=== cgroup v1 与 v2
+
+Linux 存在两代 cgroup 实现, Ubuntu 自 21.10 起默认使用 cgroup v2.
+
+[cols="1,2,2"]
+|===
+| 特性 | cgroup v1 | cgroup v2
+
+| 层级模型
+| 每个子系统独立挂载一棵树, 多树并存
+| 所有子系统共享一棵统一层级树
+
+| 进程归属
+| 一个进程可在不同子树上属于不同 cgroup
+| 一个进程只能属于一个 cgroup (统一模型)
+
+| 线程管理
+| 仅支持进程级别
+| 支持线程级别细分 (`cgroup.threads`)
+
+| 接口文件
+| 各子系统自定义接口, 风格不统一
+| 统一 `*.max` `*.current` `*.events` 命名规范
+
+| 内核版本
+| Linux 2.6.24+
+| Linux 4.5+ (5.2+ 趋于稳定)
+|===
+
+WARNING: 不要在同一系统上混用 v1 和 v2, 这会导致不可预期的行为. 可通过 `/sys/fs/cgroup/` 目录判断: 若存在 `cgroup.controllers` 文件则为 v2, 否则为 v1.
+
+=== 核心架构
+
+cgroup v2 的架构可以用三要素概括:
+
+[plantuml,"cgroup v2 架构",format=png]
+----
+@startuml
+rectangle "系统根 cgroup (/sys/fs/cgroup)" {
+  rectangle "cpu" as cpu_ctrl
+  rectangle "memory" as mem_ctrl
+  rectangle "io" as io_ctrl
+}
+
+rectangle "用户 cgroup (user.slice)" {
+  rectangle "CPU 限制" as cpu_limit
+  rectangle "内存限制" as mem_limit
+}
+
+rectangle "系统服务 (system.slice)" {
+  rectangle "sshd"
+  rectangle "dockerd"
+}
+
+rectangle "容器 (docker/<id>)" {
+  rectangle "容器进程" as container_proc
+}
+
+cpu_ctrl --> cpu_limit
+mem_ctrl --> mem_limit
+cpu_limit --> container_proc
+mem_limit --> container_proc
+@enduml
+----
+
+三要素说明:
+
+* **控制器(Controller):** 即子系统, 负责具体资源的核算与限制. 常见的控制器包括:
+
+** `cpu` - CPU 时间分配, 设置权重和带宽上限
+** `memory` - 内存上限、交换分区控制
+** `io` - 块设备 I/O 带宽限制
+** `pids` - 进程/线程数上限
+** `cpuset` - CPU 核绑定和内存节点绑定
+** `hugetlb` - 大页内存限制
+
+* **层级树(Hierarchy):** 所有控制器共享一颗统一的树. 树根是 `/sys/fs/cgroup`, 每个目录即一个 cgroup 节点. 子节点继承父节点的限制, 但可覆盖.
+
+* **资源分布(Resource Distribution):** 资源分配采用 **比例共享** (如 CPU 权重) 或 **硬限制** (如内存上限) 两种模式. 内核在事件驱动(如内存不足)或周期调度(如 CPU 时间片)时执行限制.
+
+=== cgroup 文件系统接口
+
+cgroup v2 通过 **虚拟文件系统(VFS)** 暴露接口, 位于 `/sys/fs/cgroup/`. 所有操作通过读写文件完成, 无需系统调用.
+
+[source,shell]
+----
+# 查看根 cgroup 已启用的控制器
+cat /sys/fs/cgroup/cgroup.controllers
+
+# 查看根 cgroup 的子控制器
+cat /sys/fs/cgroup/cgroup.subtree_control
+
+# 创建一个新的 cgroup
+sudo mkdir /sys/fs/cgroup/mygroup
+
+# 为 mygroup 启用 memory 和 cpu 控制器
+echo "+memory +cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+echo "+memory +cpu" | sudo tee /sys/fs/cgroup/mygroup/cgroup.subtree_control
+
+# 设置内存上限为 512MB
+echo "536870912" | sudo tee /sys/fs/cgroup/mygroup/memory.max
+
+# 将当前 shell 进程加入 cgroup
+echo $$ | sudo tee /sys/fs/cgroup/mygroup/cgroup.procs
+----
+
+核心接口文件说明:
+
+[cols="2,3,3"]
+|===
+| 文件 | 位置 | 说明
+
+| `cgroup.controllers`
+| 每个目录
+| 该 cgroup 可用的控制器列表(只读)
+
+| `cgroup.subtree_control`
+| 每个目录
+| 向子 cgroup 启用的控制器列表(读写)
+
+| `cgroup.procs`
+| 每个目录
+| 该 cgroup 中的进程 PID 列表(读写, 写即迁移)
+
+| `cgroup.threads`
+| 每个目录
+| 该 cgroup 中的线程 TID 列表(v2 新增)
+
+| `cpu.max`
+| cpu 控制器
+| CPU 带宽上限, 格式 `$quota $period`
+
+| `memory.max`
+| memory 控制器
+| 内存硬上限(字节)
+
+| `memory.current`
+| memory 控制器
+| 当前内存使用量(只读)
+
+| `io.max`
+| io 控制器
+| 磁盘 I/O 带宽上限
+|===
+
+=== CPU 资源控制
+
+CPU 控制器支持两种限制模式: **权重分配** 和 **带宽上限**.
+
+==== 权重分配
+
+`cpu.weight` 文件设置 cgroup 的相对权重(范围 1-10000), 内核在 CPU 时间片调度时按权重比例分配.
+
+[source,shell]
+----
+# 创建两个竞争 cgroup
+sudo mkdir -p /sys/fs/cgroup/{high,low}
+
+# high 组权重 1000, low 组权重 100
+echo 1000 | sudo tee /sys/fs/cgroup/high/cpu.weight
+echo 100  | sudo tee /sys/fs/cgroup/low/cpu.weight
+
+# 将高优先级的进程加入 high 组
+echo "<PID>" | sudo tee /sys/fs/cgroup/high/cgroup.procs
+----
+
+当 CPU 争抢时, high 组获得约 10 倍于 low 组的 CPU 时间. 这类似于 `nice` 值, 但工作粒度是进程组而非单个进程.
+
+==== 带宽上限
+
+`cpu.max` 文件设置绝对上限, 格式为 `$quota $period`. 含义: 在每个 `$period` 微秒周期内, 该 cgroup 最多运行 `$quota` 微秒.
+
+[source,shell]
+----
+# 限制 cgroup 最多使用 0.5 核(50000/100000)
+echo "50000 100000" | sudo tee /sys/fs/cgroup/mygroup/cpu.max
+----
+
+若 `quota` 设为 `max`, 表示不限制. 这是容器 CPU 限制的底层实现: `docker run --cpus=0.5` 即设置此文件.
+
+=== 内存资源控制
+
+内存控制器提供两类限制:
+
+* **硬限制(Hard Limit):** 通过 `memory.max` 设置. 进程组使用的内存(含 page cache)超过此值后, 内核回收内存; 若无法回收则触发 OOM Killer.
+
+[source,shell]
+----
+# 限制 mygroup 最多使用 256MB 内存
+echo "268435456" | sudo tee /sys/fs/cgroup/mygroup/memory.max
+
+# 查看当前内存使用
+cat /sys/fs/cgroup/mygroup/memory.current
+----
+
+* **保护值(Protection):** 通过 `memory.low` 和 `memory.high` 实现. 这是一种 **尽力保证** 而非硬限制:
+
+** `memory.low` - 保证该 cgroup 至少可用的内存量(不触发回收)
+** `memory.high` - 软限制, 超过后内核主动回收, 但进程不会被立即杀死
+
+[source,shell]
+----
+# 保证 mygroup 至少有 128MB 内存可用
+echo "134217728" | sudo tee /sys/fs/cgroup/mygroup/memory.low
+----
+
+[[oom-behavior]]
+==== OOM Killer 行为
+
+`memory.oom.group` 文件控制 OOM 触发时的行为(仅 v2):
+
+* `0`(默认) - 仅杀死触发 OOM 的进程
+* `1` - 杀死整个 cgroup 的所有进程, 适合容器场景
+
+[source,shell]
+----
+# 设置 OOM 时杀死整个 cgroup
+echo 1 | sudo tee /sys/fs/cgroup/mygroup/memory.oom.group
+----
+
+=== I/O 资源控制
+
+I/O 控制器限制块设备的读写带宽和 IOPS. 主要接口文件:
+
+[cols="2,3"]
+|===
+| 文件 | 说明
+
+| `io.max`
+| 设置每设备的带宽上限, 格式: `$major:$minor rbps=$val wbps=$val riops=$val wiops=$val`
+
+| `io.weight`
+| 设置 I/O 权重(1-10000), 类似 CPU 权重
+
+| `io.stat`
+| 该 cgroup 的 I/O 统计数据(只读)
+|===
+
+[source,shell]
+----
+# 获取磁盘主次设备号
+ls -l /dev/sda
+# brw-rw---- 1 root disk 8, 0 ...
+
+# 限制 sda 设备读带宽 10MB/s, 写带宽 5MB/s
+echo "8:0 rbps=10485760 wbps=5242880" | sudo tee /sys/fs/cgroup/mygroup/io.max
+
+# 关键服务设置高 I/O 权重(相对值)
+echo 1000 | sudo tee /sys/fs/cgroup/important-service/io.weight
+----
+
+=== PID 资源控制
+
+`pids` 控制器限制 cgroup 内可创建的进程/线程总数. 这在容器场景中尤为重要, 可防止 fork bomb 耗尽系统 PID.
+
+[source,shell]
+----
+# 限制 mygroup 最多创建 100 个进程/线程
+echo 100 | sudo tee /sys/fs/cgroup/mygroup/pids.max
+
+# 查看当前进程数
+cat /sys/fs/cgroup/mygroup/pids.current
+----
+
+=== cgroup 与容器技术
+
+Docker、containerd、LXC 等容器运行时均依赖 cgroup 实现资源隔离. 以 Docker 为例:
+
+[source,shell]
+----
+# Docker 默认自动创建容器 cgroup
+docker run --cpus=1.5 --memory=512m --memory-swap=512m nginx
+
+# 查看容器对应的 cgroup 目录
+ls /sys/fs/cgroup/docker/<container-id>/
+----
+
+每个容器在 cgroup 树中拥有独立的目录, 其中:
+
+* `cpu.max` 对应 `--cpus` 参数
+* `memory.max` 对应 `--memory` 参数
+* `pids.max` 对应 `--pids-limit` 参数
+* `io.max` 对应 `--device-read-bps` / `--device-write-bps` 参数
+
+[plantuml,"Docker 容器的 cgroup 组织",format=png]
+----
+@startuml
+package "cgroup 根" {
+  package "system.slice" as sys
+  package "docker" as docker {
+    package "容器 A (cpus=1.5, mem=512m)" as cA {
+      (sh)
+      (nginx)
+    }
+    package "容器 B (cpus=0.5, mem=256m)" as cB {
+      (python app)
+    }
+  }
+}
+@enduml
+----
+
+=== 工具与实战
+
+==== systemd-cgtop
+
+实时查看 cgroup 资源使用:
+
+[source,shell]
+----
+systemd-cgtop
+----
+
+输出示例:
+
+[source,text]
+----
+Control Group                                  Tasks   %CPU   Memory  Input/s Output/s
+/system.slice/docker-xxx.scope                    5   12.3   245.7M       0B       0B
+/user.slice/user-1000.slice                       8    2.1   102.4M       0B       0B
+----
+
+==== systemd-cgls
+
+以树形结构展示 cgroup 层级:
+
+[source,shell]
+----
+systemd-cgls
+----
+
+==== cgcreate / cgset / cgget
+
+libcgroup 工具集, 简化 cgroup 操作:
+
+[source,shell]
+----
+# 安装
+sudo apt install cgroup-tools
+
+# 创建 cgroup
+sudo cgcreate -g cpu,memory:/mygroup
+
+# 设置限制
+sudo cgset -r cpu.max="50000 100000" mygroup
+sudo cgset -r memory.max=268435456 mygroup
+
+# 在 cgroup 中启动进程
+sudo cgexec -g cpu,memory:/mygroup stress --cpu 1 --vm 1 --vm-bytes 256M
+
+# 查看统计数据
+sudo cgget -r memory.current -r cpu.stat mygroup
+----
+
+==== stress 压力测试
+
+结合 `stress` 工具验证 cgroup 限制:
+
+[source,shell]
+----
+# 安装 stress
+sudo apt install stress
+
+# 创建一个 cgroup 并限制 CPU 为 0.5 核
+sudo mkdir /sys/fs/cgroup/stress-test
+echo "+cpu" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+echo "50000 100000" | sudo tee /sys/fs/cgroup/stress-test/cpu.max
+echo $$ | sudo tee /sys/fs/cgroup/stress-test/cgroup.procs
+
+# 启动 4 个 CPU 密集型进程
+stress --cpu 4 --timeout 30
+
+# 观察: top 显示总 CPU 使用率约 50% (0.5 核)
+----
+
+=== 注意事项与最佳实践
+
+* **避免混用 v1 和 v2:** 部分老旧应用仍依赖 v1 接口. 在 Ubuntu 中可通过内核参数 `systemd.unified_cgroup_hierarchy=0` 回退到 v1, 但建议逐步迁移.
+
+* **systemd 集成:** Ubuntu 中 systemd 是 cgroup 的主要管理者和默认代理. 所有 systemd unit 自动拥有对应的 slice/scope/service cgroup. 通过 `systemctl set-property` 可直接控制 unit 的资源限制:
+
+[source,shell]
+----
+# 限制 nginx 服务最多使用 1 核 CPU
+sudo systemctl set-property nginx.service CPUQuota=100%
+
+# 限制 nginx 服务内存上限 512MB
+sudo systemctl set-property nginx.service MemoryMax=512M
+----
+
+* **内存限制要留余量:** `memory.max` 设得太紧会导致频繁 OOM. 建议为 page cache 和内核结构预留 10-20% 余量.
+
+* **CPU 权重 vs 带宽上限:** 权重适合多租户公平调度, 带宽上限适合严格 SLA 场景. 两者可以同时使用, 权重在 `max` 时发挥主要作用.
+
+* **正确设置 `memory.swap.max`:** cgroup v2 中 swap 控制是独立的. 若只限制 `memory.max` 而不限制 swap, 进程可通过 swap 绕过内存限制.
+
+[source,shell]
+----
+# 同时限制内存和 swap
+echo 268435456 | sudo tee /sys/fs/cgroup/mygroup/memory.max
+echo 0 | sudo tee /sys/fs/cgroup/mygroup/memory.swap.max     # 禁用 swap
+----
+
+* **监控比限制更重要:** 先通过 `memory.current`、`cpu.stat`、`io.stat` 了解真实资源使用, 再设定合理限制. 突降限制可能导致大规模 OOM.
+
+=== 总结
+
+cgroup 是 Linux 容器化和资源管理的基石. cgroup v2 通过统一层级、统一接口和线程级管理, 解决了 v1 的碎片化和不一致问题. 核心要点:
+
+* cgroup v2 将所有控制器挂载到单一层级树, 一个进程只属于一个 cgroup
+* 通过 `/sys/fs/cgroup/` 虚拟文件系统接口操作, 支持 CPU、内存、I/O、PID 等资源限制
+* Docker 等容器运行时深度依赖 cgroup 实现资源隔离
+* systemd 是 Ubuntu 上 cgroup 的主要管理者, 推荐通过 `systemctl set-property` 配置资源限制
+* 实践中的关键: 硬件资源留余量、区分权重与硬限制、优先监控后限制

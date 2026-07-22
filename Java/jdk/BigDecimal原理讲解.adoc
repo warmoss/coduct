@@ -1,0 +1,262 @@
+== BigDecimal原理讲解
+
+=== 概述
+
+**BigDecimal** 是 Java 中用于高精度计算的类, 主要解决两个问题:
+
+. **精度问题:** float 和 double 使用二进制浮点数, 无法精确表示十进制小数
+
+. **范围问题:** int、long 等整型有范围限制
+
+=== 核心数据结构
+
+==== 内部表示
+
+[source, java]
+----
+public class BigDecimal extends Number implements Comparable<BigDecimal> {
+    // 未缩放的值(整数)
+    private final BigInteger intVal;
+    
+    // 标度(小数点后的位数)
+    private final int scale;
+    
+    // 当值在 long 范围内时, 使用这个优化
+    private final transient long intCompact;
+    
+    // 精度(有效数字位数)
+    private transient int precision;
+}
+----
+
+==== 存储原理
+
+BigDecimal 将数值分为两部分:
+
+* **未缩放的值 (unscaled value):** 一个任意精度的整数
+
+* **标度 (scale):** 小数点后的位数
+
+公式: `实际值 = unscaledValue x 10^(-scale)`
+
+示例:
+
+[source, text]
+----
+123.45 = 12345 x 10^(-2)
+intVal = 12345, scale = 2
+----
+
+=== 精度实现机制
+
+==== 避免二进制误差
+
+[source, java]
+----
+// 错误方式: 会引入二进制浮点误差
+BigDecimal wrong = new BigDecimal(0.1);  // 实际值可能是 0.100000000000000005551...
+
+// 正确方式: 使用字符串或整型构造
+BigDecimal correct1 = new BigDecimal("0.1");    // 精确
+BigDecimal correct2 = BigDecimal.valueOf(0.1);  // 内部使用字符串转换
+BigDecimal correct3 = new BigDecimal("1").divide(new BigDecimal("10"));  // 精确
+----
+
+==== 运算时的精度控制
+
+每个运算都可以指定精度和舍入模式:
+
+[source, java]
+----
+public BigDecimal divide(BigDecimal divisor, int scale, RoundingMode roundingMode)
+----
+
+=== 舍入模式(RoundingMode)
+
+Java 提供 8 种舍入模式:
+
+|===
+|模式|描述|示例(保留0位小数)
+|UP|远离零方向舍入|1.1->2, -1.1->-2
+|DOWN|向零方向舍入|1.1->1, -1.1->-1
+|CEILING|向正无穷方向舍入|1.1->2, -1.1->-1
+|FLOOR|向负无穷方向舍入|1.1->1, -1.1->-2
+|HALF_UP|四舍五入|1.5->2, -1.5->-2
+|HALF_DOWN|五舍六入|1.5->1, -1.5->-1
+|HALF_EVEN|银行家舍入法|1.5->2, 2.5->2
+|UNNECESSARY|不需要舍入, 精确值|否则抛出异常
+|===
+
+=== 运算原理
+
+==== 加法
+
+[source, java]
+----
+// 示例: 123.45 + 67.8
+// 调整到相同标度: 123.45 + 67.80
+// 整数相加: 12345 + 6780 = 19125
+// 结果标度: max(2, 2) = 2
+// 结果: 191.25
+----
+
+==== 乘法
+
+[source, java]
+----
+// 示例: 1.2 x 1.5
+// 整数相乘: 12 x 15 = 180
+// 标度相加: 1 + 1 = 2
+// 结果: 1.80
+----
+
+==== 除法(复杂, 需要处理循环小数和舍入)
+
+[source, java]
+----
+// 示例: 1 ÷ 3
+// 需要指定标度和舍入模式
+BigDecimal result = new BigDecimal("1")
+    .divide(new BigDecimal("3"), 10, RoundingMode.HALF_UP);
+// 结果: 0.3333333333
+----
+
+=== 性能优化
+
+==== intCompact 优化
+
+对于在 long 范围内的值, 使用 intCompact 代替 BigInteger 提高性能:
+
+[source, java]
+----
+// 当 |value| ≤ Long.MAX_VALUE 时
+intCompact = unscaledValue.longValue();
+intVal = null;  // 节省内存
+
+// 否则使用 BigInteger
+intCompact = Long.MIN_VALUE;
+intVal = unscaledValue;
+----
+
+==== 缓存
+
+valueOf() 方法缓存了 0-10 的常用值:
+
+[source, java]
+----
+public static BigDecimal valueOf(long val) {
+    if (val >= 0 && val <= 10) {
+        return zeroThroughTen[(int)val];
+    }
+    return new BigDecimal(val);
+}
+----
+
+=== 使用注意事项
+
+==== 构造方法选择
+
+[source, java]
+----
+// 推荐
+BigDecimal a = new BigDecimal("123.456");
+BigDecimal b = BigDecimal.valueOf(123.456);
+
+// 避免
+BigDecimal c = new BigDecimal(123.456);  // 可能精度丢失
+----
+
+==== 比较操作
+
+[source, java]
+----
+// 错误: 使用 equals() 会比较标度
+BigDecimal d1 = new BigDecimal("1.0");
+BigDecimal d2 = new BigDecimal("1.00");
+d1.equals(d2);  // false! 因为标度不同
+
+// 正确: 使用 compareTo()
+d1.compareTo(d2) == 0;  // true
+----
+
+==== 除法处理
+
+[source, java]
+----
+// 必须指定舍入模式或精确除尽
+try {
+    BigDecimal result = a.divide(b);  // 可能抛出 ArithmeticException
+} catch (ArithmeticException e) {
+    // 处理除不尽的情况
+}
+
+// 推荐方式
+BigDecimal result = a.divide(b, 10, RoundingMode.HALF_UP);
+----
+
+=== 内部算法优化
+
+BigDecimal 使用 Karatsuba 和 Toom-Cook 等大数乘法算法:
+
+[source, java]
+----
+// 伪代码展示 Karatsuba 算法原理
+// 对于大整数 x 和 y, 分解为:
+x = a x 10^m + b
+y = c x 10^m + d
+
+// 普通乘法: 4次乘法
+xy = ac x 10^2m + (ad + bc) x 10^m + bd
+
+// Karatsuba: 3次乘法
+z0 = a x c
+z1 = (a + b) x (c + d)
+z2 = b x d
+xy = z0 x 10^2m + (z1 - z0 - z2) x 10^m + z2
+----
+
+=== 实际应用示例
+
+[source, java]
+----
+// 财务计算: 精确计算货币
+public class MoneyCalculator {
+    public static void main(String[] args) {
+        BigDecimal price = new BigDecimal("19.99");
+        BigDecimal quantity = new BigDecimal("3.5");
+        BigDecimal discount = new BigDecimal("0.10"); // 10%
+        
+        // 计算总价
+        BigDecimal subtotal = price.multiply(quantity);
+        BigDecimal discountAmount = subtotal.multiply(discount);
+        BigDecimal total = subtotal.subtract(discountAmount);
+        
+        // 设置货币格式(2位小数, 银行家舍入)
+        total = total.setScale(2, RoundingMode.HALF_EVEN);
+        
+        System.out.println("Total: $" + total); // $62.96
+    }
+}
+----
+
+=== 总结
+
+BigDecimal 的核心优势:
+
+. **精确的十进制表示:** 避免二进制浮点误差
+
+. **任意精度:** 不受固定位数限制
+
+. **灵活的舍入控制:** 8种舍入模式
+
+. **不可变对象:** 线程安全
+
+适用场景:
+
+* 金融计算(货币、利息)
+
+* 科学计算(需要精确小数)
+
+* 商业应用(税务、统计)
+
+* 任何需要精确十进制运算的场景

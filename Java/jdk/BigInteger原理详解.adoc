@@ -1,0 +1,316 @@
+== BigInteger原理详解
+
+=== 概述
+
+**BigInteger** 是 Java 中用于表示**任意大小**整数的类, 位于 java.math 包中. 它可以处理超过基本数据类型范围(long: -2^63 ~ 2^63-1)的大整数.
+
+=== 内部表示
+
+==== 核心数据结构
+
+[source, java]
+----
+public class BigInteger extends Number implements Comparable<BigInteger> {
+    // 符号位: -1表示负数, 0表示零, 1表示正数
+    final int signum;
+    
+    // 绝对值存储, 使用大端表示(big-endian)
+    // 每个int存储32位, 数组的第一个元素是最高有效位
+    final int[] mag;
+}
+----
+
+==== 存储示例
+
+* 数字 `12345678901234567890` 的存储:
+
+** 十六进制: `0xAB54A98C EB1F0AD2`
+
+** mag数组: [0xAB54A98C, 0xEB1F0AD2]
+
+** signum: 1
+
+=== 核心算法原理
+
+==== 加法算法
+
+[source, java]
+----
+// 简化版加法原理
+private static int[] add(int[] x, int[] y) {
+    // 确保x是较长的数组
+    if (x.length < y.length) {
+        int[] tmp = x;
+        x = y;
+        y = tmp;
+    }
+    
+    int xIndex = x.length;
+    int yIndex = y.length;
+    int[] result = new int[xIndex];
+    long sum = 0;
+    
+    // 从最低位开始相加
+    while (yIndex > 0) {
+        sum = (x[--xIndex] & LONG_MASK) + 
+              (y[--yIndex] & LONG_MASK) + 
+              (sum >>> 32);
+        result[xIndex] = (int)sum;
+    }
+    
+    // 处理进位
+    while (xIndex > 0) {
+        sum = (x[--xIndex] & LONG_MASK) + (sum >>> 32);
+        result[xIndex] = (int)sum;
+    }
+    
+    return result;
+}
+----
+
+==== 乘法算法
+
+BigInteger 使用三种乘法算法, 根据操作数大小选择:
+
+**基础乘法(教科书算法)**
+
+* 时间复杂度: stem:[O(n^2)]
+
+* 适用于小数字
+
+**Karatsuba 算法**
+
+* 时间复杂度: stem:[O(n^(log_(2)3)) ~~ O(n^1.585)]
+
+* 递归分治策略
+
+* 临界点: 约80个int(2560位)
+
+[source, java]
+----
+// Karatsuba 算法原理
+// 将大数分为两部分: x = x1 * B^m + x0, y = y1 * B^m + y0
+// 其中 B = 2^32 (基), m = n/2
+
+// 传统需要4次乘法:
+// z = x1y1 * B^2m + (x1y0 + x0y1) * B^m + x0y0
+
+// Karatsuba只需要3次乘法:
+// z0 = x0 * y0
+// z2 = x1 * y1
+// z1 = (x1 + x0) * (y1 + y0) - z2 - z0
+// z = z2 * B^2m + z1 * B^m + z0
+----
+
+**Toom-Cook 算法**
+
+* 更高效的分治算法
+
+* 将数分为3部分或更多
+
+* 临界点: 约240个int(7680位)
+
+**Burnikel-Ziegler 算法**
+
+* 用于超大数除法
+
+* 递归分块策略
+
+==== 除法算法
+
+[source, java]
+----
+// 基础除法算法(Knuth算法D)
+private BigInteger divideKnuth(BigInteger val) {
+    // 使用Knuth的"The Art of Computer Programming"中的算法
+    // 时间复杂度: O(n²)
+}
+----
+
+=== 关键操作实现
+
+**构造方法**
+
+[source, java]
+----
+// 从字符串构造(支持2-36进制)
+public BigInteger(String val, int radix) {
+    // 1. 解析符号
+    // 2. 按进制转换为int数组
+    // 3. 规范化(去除前导零)
+}
+----
+
+**比较操作**
+
+[source, java]
+----
+public int compareTo(BigInteger val) {
+    // 1. 比较符号
+    if (signum != val.signum)
+        return signum > val.signum ? 1 : -1;
+    
+    // 2. 比较绝对值大小
+    return signum * compareMagnitude(val);
+}
+----
+
+**模幂运算(快速幂算法)**
+
+[source, java]
+----
+public BigInteger modPow(BigInteger exponent, BigInteger m) {
+    // 使用 Montgomery 乘法优化
+    // 或使用滑动窗口法
+}
+----
+
+=== 性能优化技术
+
+**延迟规范化**
+
+* 计算过程中允许临时有前导零
+
+* 最终结果时才进行规范化
+
+**缓存常用值**
+
+[source, java]
+----
+private static BigInteger[] posConst = new BigInteger[17];
+private static BigInteger[] negConst = new BigInteger[17];
+
+static {
+    for (int i = 1; i <= 16; i++) {
+        posConst[i] = new BigInteger(i);
+        negConst[i] = new BigInteger(-i);
+    }
+}
+----
+
+**特殊值处理**
+
+* 对 -1, 0, 1, 2, 10 等常用值特殊优化
+
+=== 使用示例
+
+[source, java]
+----
+import java.math.BigInteger;
+
+public class BigIntegerDemo {
+    public static void main(String[] args) {
+        // 创建大整数
+        BigInteger a = new BigInteger("123456789012345678901234567890");
+        BigInteger b = new BigInteger("987654321098765432109876543210");
+        
+        // 基本运算
+        BigInteger sum = a.add(b);
+        BigInteger product = a.multiply(b);
+        BigInteger power = a.pow(100); // 计算a的100次方
+        
+        // 模运算
+        BigInteger mod = a.mod(BigInteger.TEN);
+        
+        // 位运算
+        BigInteger shifted = a.shiftLeft(10); // 左移10位
+        
+        // 素数测试(概率性)
+        boolean isProbablePrime = a.isProbablePrime(100);
+        
+        System.out.println("Sum: " + sum);
+        System.out.println("Product: " + product);
+    }
+}
+----
+
+=== 内存管理
+
+. **不可变性**
+
+** BigInteger 是不可变类(immutable)
+
+** 所有操作返回新对象
+
+** 线程安全
+
+. **大数存储优化**
+
+** 使用可变大小的int数组
+
+** 自动处理符号和大小
+
+=== 应用场景
+
+. **密码学**
+
+** RSA加密/解密
+
+** Diffie-Hellman密钥交换
+
+** 椭圆曲线加密
+
+. **科学计算**
+
+** 高精度计算
+
+** 组合数学(大阶乘)
+
+. **金融系统**
+
+** 高精度货币计算
+
+. **分布式系统**
+
+** 一致性哈希
+
+** ID生成
+
+=== 注意事项
+
+. **性能考虑**
+
+** 大数运算比原生类型慢很多
+
+** 选择合适的算法(Java自动选择)
+
+. **内存使用**
+
+** 每个BigInteger对象有固定开销
+
+** 大数会占用较多内存
+
+. **边界条件**
+
+** 除零会抛出ArithmeticException
+
+** 负数幂次需要特殊处理
+
+=== 源码结构概览
+
+[source, text]
+----
+BigInteger.class
+├── 字段
+│   ├── signum
+│   └── mag[]
+├── 构造方法
+│   ├── BigInteger(String, int)
+│   ├── BigInteger(byte[])
+│   └── BigInteger(int, Random)
+├── 算术运算
+│   ├── add()
+│   ├── subtract()
+│   ├── multiply()
+│   └── divide()
+├── 位运算
+│   ├── shiftLeft()
+│   ├── shiftRight()
+│   └── and()/or()/xor()
+└── 数论方法
+    ├── modPow()
+    ├── gcd()
+    └── modInverse()
+----
+
+BigInteger的设计体现了效率与通用性的平衡, 通过多种算法的智能选择和精细的实现优化, 使得它在处理大整数时既可靠又高效.

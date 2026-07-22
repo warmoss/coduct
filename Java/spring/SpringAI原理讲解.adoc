@@ -1,0 +1,358 @@
+== SpringAI原理讲解
+
+Spring AI 是 Spring 生态系统中的**AI 集成框架**, 为 Java 应用提供与大型语言模型(LLM)交互的统一抽象层. 它解决了传统 AI 集成中"各家 SDK 各自独立, 切换模型需重写大量代码"的痛点, 让开发者能够以 Spring 风格的声明式编程方式使用 AI 能力.
+
+参考: <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>>
+
+=== 核心概念
+
+Spring AI 围绕以下几个核心抽象构建:
+
+Model:: 底层 AI 模型的抽象接口, 如 `ChatModel` 处理文本对话, `ImageModel` 处理图像生成, `EmbeddingModel` 处理向量嵌入. 每种 Model 类型对应不同的 AI 能力维度.
+
+ChatClient:: Spring AI 1.0 引入的**流式构建器 API**, 提供了 Fluent 风格的对话交互方式. 它是开发者与 AI 模型交互的主要入口, 封装了 Prompt 构建、参数配置、输出解析等细节.
+
+Prompt:: 发送给 AI 模型的**完整请求消息集合**, 包含多条 Message 和模型参数(如温度、最大 Token 数). Spring AI 用 `Prompt` 对象统一表达请求.
+
+Message:: 单条对话消息, 包含 `role`(角色) 和 `content`(内容). 角色决定了消息的语义位置:
+
+* `SystemMessage` - 系统指令, 设定 AI 的行为和约束
+* `UserMessage` - 用户输入, 即实际的问题或指令
+* `AssistantMessage` - AI 的回复内容
+* `ToolResponseMessage` - 工具调用返回的结果
+
+Tool/Function Calling:: 允许 AI 模型动态调用外部函数的机制. 开发者通过 `@Tool` 注解或 `ToolCallback` 注册 Java 方法, Spring AI 自动将函数声明以 JSON Schema 形式发给 AI 模型, 模型在需要时请求调用这些函数, Spring AI 执行后返回结果.
+
+Structured Output:: 将 AI 模型的自由文本回复**解析为结构化 Java 对象**的能力. 通过 `BeanOutputConverter` 或 `StructuredOutputConverter` 接口, 开发者可以定义目标类型, Spring AI 自动生成 Schema 并解析模型输出.
+
+Advisor:: 拦截 ChatClient 请求/响应链的**切面组件**, 类似 Spring AOP 的 Advice. 用于横切关注点, 如对话历史管理、内容审查、日志记录、RAG 检索增强等.
+
+=== 架构设计
+
+Spring AI 的架构遵循 **Adapter 模式 + Provider SPI**, 核心思想是在不改变业务代码的前提下切换不同的 AI 提供商.
+
+[plantuml, "Spring AI 架构分层", format=png]
+----
+@startuml
+!theme plain
+skinparam packageStyle rectangle
+
+package "业务代码" as Biz {
+  [ChatClient] as CC
+  [Advisor Chain] as AC
+}
+
+package "核心抽象层" as Core {
+  interface "ChatModel" as CM
+  interface "StreamingChatModel" as SCM
+  interface "EmbeddingModel" as EM
+  interface "ToolCallback" as TC
+}
+
+package "Provider 适配层" as Adapter {
+  class "OpenAiChatModel" as OA
+  class "AzureOpenAiChatModel" as AO
+  class "AnthropicChatModel" as AN
+  class "OllamaChatModel" as OL
+  class "…更多 Provider…" as MORE
+}
+
+package "AI 提供商" as Provider {
+  [OpenAI API] as OAPI
+  [Azure OpenAI] as AAPI
+  [Anthropic API] as CAPI
+  [Ollama (本地)] as LLAPI
+}
+
+Biz --> Core : 使用
+Core <|-- Adapter : 实现
+Adapter --> Provider : 调用
+note top of Core
+  Spring AI 定义的标准接口
+  业务代码只依赖这里
+end note
+note bottom of Adapter
+  各 Provider 的适配实现
+  切换 Provider 只需换依赖
+end note
+@enduml
+----
+
+核心设计思想:
+
+* **面向接口编程** - 业务代码只依赖 `ChatModel` 等抽象接口, 不依赖任何具体 Provider 实现
+* **Provider SPI** - 各 AI 提供商通过 Spring Boot Auto-Configuration 自动注入, 切换只需更改依赖和配置
+* **Fluent API** - `ChatClient` 提供链式调用, 构建 Prompt 和解析输出的过程与 Spring 的 `RestTemplate`、`WebClient` 一脉相承
+
+=== ChatClient API 详解
+
+`ChatClient` 是 Spring AI 1.0 中**最核心的交互入口**, 其设计借鉴了 `WebClient` 的 Fluent 风格.
+
+==== 创建 ChatClient
+
+[source,java]
+----
+@Configuration
+public class AiConfig {
+
+    @Bean
+    public ChatClient chatClient(ChatClient.Builder builder) {
+        // 通过 Builder 创建, 可设置默认参数
+        return builder
+            .defaultSystem("你是一名资深技术顾问, 用中文回答技术问题")
+            .defaultFunctions("getWeather", "searchDocs")  // 默认工具
+            .build();
+    }
+}
+----
+
+==== 基本对话
+
+[source,java]
+----
+@RestController
+public class ChatController {
+
+    private final ChatClient chatClient;
+
+    public ChatController(ChatClient chatClient) {
+        this.chatClient = chatClient;
+    }
+
+    @GetMapping("/chat")
+    public String chat(@RequestParam String message) {
+        return chatClient.prompt()        // <1>
+            .user(u -> u.text(message))   // <2>
+            .call()                       // <3>
+            .content();                   // <4>
+    }
+}
+----
+<1> 开始构建一次对话 prompt
+<2> 设置用户消息
+<3> 同步调用 AI 模型
+<4> 获取文本回复内容
+
+==== 流式响应
+
+[source,java]
+----
+@GetMapping("/chat/stream")
+public Flux<String> chatStream(@RequestParam String message) {
+    return chatClient.prompt()
+        .user(message)
+        .stream()         // 流式调用, 返回 Flux<String>
+        .content();
+}
+----
+
+==== 多轮对话
+
+[source,java]
+----
+@GetMapping("/chat/history")
+public String chatWithHistory(@RequestParam String message) {
+    return chatClient.prompt()
+        .user(message)
+        .advisors(a -> a.param("chat_history", 10))  // <1>
+        .call()
+        .content();
+}
+----
+<1> 通过 Advisor 自动管理最近10条对话历史
+
+=== Tool/Function Calling
+
+Tool Calling 是 Spring AI **最具实用价值的特性之一**, 它让 AI 模型能够突破"仅文本生成"的限制, 调用外部系统获取实时数据或执行操作.
+
+==== 定义工具
+
+[source,java]
+----
+@Component  // 自动注册为工具
+public class WeatherTools {
+
+    @Tool(name = "get_weather", description = "查询指定城市当前天气")
+    public Weather getWeather(String city) {
+        // 调用真实的天气 API
+        return weatherService.fetch(city);
+    }
+}
+----
+
+==== 在 ChatClient 中使用
+
+[source,java]
+----
+chatClient.prompt()
+    .user("北京的天气怎么样? 需要带伞吗?")
+    .tools("get_weather")          // 指定可用工具
+    .call()
+    .content();
+----
+
+AI 模型在处理"北京的天气怎么样"时, 会自动判断需要调用 `get_weather` 函数获取实时数据, 然后基于返回结果生成回答. 整个调用过程对开发者完全透明.
+
+==== 工具调用流程
+
+[plantuml, "Tool Calling 时序图", format=png]
+----
+@startuml
+actor User as U
+participant "ChatClient" as CC
+participant "ChatModel" as CM
+participant "ToolExecutor" as TE
+participant "外部系统" as EXT
+
+U -> CC: 用户提问
+CC -> CM: 发送 Prompt + Tool Schema
+CM -> CM: 模型推理
+alt 模型决定调用工具
+  CM --> CC: 返回 ToolCall 请求
+  CC -> TE: 解析并执行工具
+  TE -> EXT: 调用外部 API / 数据库
+  EXT --> TE: 返回结果
+  TE --> CC: ToolResponseMessage
+  CC -> CM: 发送工具结果
+  CM --> CC: 最终回复
+else 无需调用工具
+  CM --> CC: 直接回复
+end
+CC --> U: 返回结果
+@enduml
+----
+
+=== Structured Output
+
+处理 AI 回复时, 最常见的问题之一是: 如何将自由文本解析为有类型的 Java 对象? Spring AI 提供了两种方式.
+
+==== 使用 BeanOutputConverter
+
+[source,java]
+----
+// 定义目标结构
+public record WeatherResponse(String city, double temperature, String condition, String advice) {}
+
+@GetMapping("/weather/structured")
+public WeatherResponse getWeatherStructured(@RequestParam String city) {
+    return chatClient.prompt()
+        .user(u -> u.text("查询{city}的天气, 并给出出行建议")
+            .param("city", city))
+        .call()
+        .entity(WeatherResponse.class);  // 自动解析为 Java 对象
+}
+----
+
+`ChatClient.call().entity()` 内部自动完成以下步骤:
+
+. 根据 `WeatherResponse` 的字段定义生成 JSON Schema
+. 将 Schema 注入到 System Prompt 中, 要求模型按此格式回复
+. 将模型返回的 JSON 字符串反序列化为 Java 对象
+
+==== 支持的类型
+
+[cols="2,4"]
+|===
+| 类型 | 说明
+
+| `record` / `class`
+| 普通 POJO, 字段按名称映射
+
+| `List<T>`
+| 返回多条结果列表
+
+| `Map<String, T>`
+| 返回键值对结构
+
+| `String`, `Number`, `Boolean`
+| 简单类型, 直接提取
+
+| `ParameterizedTypeReference<T>`
+| 复杂泛型, 如 `List<Record>`
+
+|===
+
+=== Advisor 链
+
+Advisor 是 Spring AI 的**拦截器机制**, 在 ChatClient 的请求/响应链中插入横切逻辑.
+
+[source,java]
+----
+chatClient.prompt()
+    .user("推荐几本技术书籍")
+    .advisors(
+        new MessageChatMemoryAdvisor(chatMemory),  // 对话历史管理
+        new SafeGuardAdvisor(),                      // 安全审查
+        new LoggingAdvisor()                         // 日志记录
+    )
+    .call()
+    .content();
+----
+
+内置的 Advisor 包括:
+
+* `MessageChatMemoryAdvisor` - 自动管理对话历史, 支持持久化
+* `QuestionAnswerAdvisor` - 基于向量数据库的 RAG 检索
+* `SafeGuardAdvisor` - 内容安全过滤, 阻止不当输出
+* `SimpleLoggerAdvisor` - 记录请求/响应的日志信息
+
+你也可以自定义 Advisor 实现 `CallAroundAdvisor` 或 `StreamAroundAdvisor` 接口, 实现自定义的拦截逻辑.
+
+=== 多模态支持
+
+Spring AI 支持多模态输入, 即在同一请求中同时发送文本和图像.
+
+[source,java]
+----
+var response = chatClient.prompt()
+    .user(u -> u
+        .text("这张图中有什么动物?")
+        .media(MediaType.IMAGE_PNG, new ClassPathResource("cat.png"))  // 附加图片
+    )
+    .call()
+    .content();
+----
+
+当前支持的多模态能力:
+
+* **图像理解** - 将图片发送给支持多模态的模型(如 GPT-4o, Claude 3.5), 进行视觉分析
+* **图像生成** - 通过 `ImageModel` 根据文本描述生成图片
+* **音频处理** - 语音转文字、文字转语音(取决于 Provider 支持)
+
+=== 配置与集成
+
+Spring AI 遵循 Spring Boot 的自动配置模式, 通过 `application.yml` 进行 Provider 配置:
+
+[source,yaml]
+----
+spring:
+  ai:
+    openai:                          # OpenAI 配置
+      api-key: ${OPENAI_API_KEY}
+      chat:
+        options:
+          model: gpt-4o
+          temperature: 0.7
+    vectorstore:
+      redis:                         # 向量数据库配置
+        host: localhost
+        port: 6379
+----
+
+支持的 Provider 列表: OpenAI, Azure OpenAI, Anthropic(Claude), Ollama(本地), Google Vertex AI, Amazon Bedrock, Mistral AI, Groq, DeepSeek 等十余家.
+
+[NOTE]
+====
+依赖引入遵循"按需添加"原则. 例如, 使用 OpenAI 只需添加 `spring-ai-openai-spring-boot-starter`, 无需引入其他 Provider 的依赖.
+====
+
+=== 总结
+
+Spring AI 的核心价值在于**统一抽象、降低切换成本、发挥 Spring 生态优势**.
+
+* **统一编程模型** - 无论底层是 OpenAI、Claude 还是本地 Ollama, 业务代码面对的都是相同的 `ChatClient` API
+* **Spring Native 集成** - 与 Spring Boot 的自动配置、AOP、事务等机制无缝配合
+* **生产级特性** - 流式响应、结构化输出、Tool Calling、Advisor 链等能力, 让 AI 集成直接达到生产可用级别
+* **活跃的社区生态** - 随着 AI 技术的快速发展, Spring AI 持续跟进最新模型和功能, 是目前 Java 生态中最主流的 AI 集成框架
+
+WARNING: Spring AI 是一个**快速演进的框架**. 不同版本之间的 API 可能存在较大差异, 建议在实际项目中固定版本, 并参考对应版本的官方文档. 当前内容基于 Spring AI 1.0+ 版本.

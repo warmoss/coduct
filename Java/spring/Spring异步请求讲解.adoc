@@ -1,0 +1,215 @@
+== Spring异步请求讲解
+
+=== Spring 异步处理的演进与核心抽象
+Spring 提供了两种主要的异步处理方式, 它们构建在 Servlet 3.0+ 的 *AsyncContext* 之上, 但开发者几乎不需要直接接触底层的 API.
+
+. *Callable*: 适用于相对简单的异步返回.
+
+. *DeferredResult*: 功能更强大, 适用于更复杂的异步场景, 尤其是跨线程的通信.
+
+此外, Spring 还提供了 *@Async* 注解, 但它通常用于异步方法调用, 而非直接处理 HTTP 请求.
+
+=== 使用 Callable 实现异步
+*Callable* 是 Java 并发包中的一个接口. 在 Spring MVC 中, 如果你的控制器方法返回一个 *Callable*, Spring 会自动将其处理为异步请求.
+
+工作流程::
+
+. Spring MVC 调用控制器方法, 发现返回值是 *Callable*.
+
+. Spring 立即 *释放 HTTP 线程(Tomcat 线程)*, 并将其返回给容器.
+
+. Spring 将 *Callable* 任务提交给其 *内置的 TaskExecutor*(任务执行器, 本质是一个线程池)执行.
+
+. 当 *Callable* 在执行器中计算完结果后, Spring 会重新派发请求, 使用计算结果继续处理流程(渲染视图等), *这个重新派发可能使用同一个 HTTP 线程, 也可能是另一个*.
+
+代码示例::
+
+[source, java, linenums]
+----
+import java.util.concurrent.Callable;
+
+@RestController
+public class AsyncController {
+
+    @GetMapping("/async/callable")
+    public Callable<String> getAsyncData() {
+        // 这个方法在主 HTTP 线程中执行, 并立即返回
+        System.out.println("Controller method called on thread: "
+            + Thread.currentThread().getName());
+
+        return new Callable<String>() {
+            @Override
+            public String call() throws Exception {
+                // 这部分逻辑在另一个线程中执行
+                System.out.println("Callable task executing on thread: "
+                    + Thread.currentThread().getName());
+
+                // 模拟耗时操作(如数据库查询、远程调用)
+                Thread.sleep(3000);
+
+                return "Async result after 3 seconds!";
+            }
+        };
+    }
+}
+----
+
+*访问 http://localhost:8080/async/callable, 观察控制台输出:*
+
+[source, plaintext, linenums]
+----
+Controller method called on thread: http-nio-8080-exec-1
+Callable task executing on thread: task-1
+----
+
+你会看到两个不同的线程名, 并且请求会在 3 秒后返回结果, 证明异步生效.
+
+=== 使用 DeferredResult 实现异步
+*DeferredResult* 是 Spring 提供的一个更灵活的类. 它与 *Callable* 的关键区别在于: *DeferredResult 的结果不是由它自己计算出来的, 而是由外部线程(甚至是另一个应用程序)设置进去的.*
+
+核心方法::
+
+* *DeferredResult.setResult(Object result)*: 在任何线程中调用此方法, 即可完成异步处理并向客户端返回结果.
+
+工作流程::
+
+. 控制器方法创建并返回一个 *DeferredResult* 对象.
+
+. Spring MVC 立即 *释放 HTTP 线程*.
+
+. 控制器方法将 *DeferredResult* 对象保存在某个地方(例如一个队列、一个映射表), 以便其他线程可以访问它.
+
+. *另一个线程*(可能是消息监听器、定时任务、或其他业务线程池的线程)在某个事件发生时(例如收到 MQ 消息、长时间任务完成), 从保存的地方取出 *DeferredResult* 对象并调用 *setResult()*.
+
+. Spring 接收到结果, 重新派发请求并完成响应.
+
+代码示例: 模拟一个订单处理场景::
+
+[source, java, linenums]
+----
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.context.request.async.DeferredResult;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@RestController
+public class OrderProcessingController {
+
+    // 模拟一个存储 DeferredResult 的缓存, 键为订单ID
+    private final Map<String, DeferredResult<String>> orderResultCache = new ConcurrentHashMap<>();
+
+    // 1. 客户端发起一个创建订单的请求, 并等待结果
+    @GetMapping("/placeOrder")
+    public DeferredResult<String> placeOrder(@RequestParam String orderId) {
+        // 设置超时时间(毫秒)和超时回调
+        DeferredResult<String> deferredResult = new DeferredResult<>(5000L, "Order processing timeout!");
+
+        // 将 DeferredResult 存起来, 以便后续处理线程能找到它
+        orderResultCache.put(orderId, deferredResult);
+
+        // 触发一个异步处理流程(这里只是模拟, 实际可能是发MQ消息)
+        System.out.println("Order [" + orderId + "] received, waiting for processing...");
+        // 在实际应用中, 这里会立即返回, 后续处理由其他系统或线程完成
+
+        // 注册完成回调(可选)
+        deferredResult.onCompletion(() -> {
+            System.out.println("Order [" + orderId + "] processing completed, removing from cache.");
+            orderResultCache.remove(orderId);
+        });
+
+        // 注册超时回调(可选)
+        deferredResult.onTimeout(() -> {
+            System.out.println("Order [" + orderId + "] processing timeout!");
+            orderResultCache.remove(orderId);
+        });
+
+        return deferredResult;
+    }
+
+    // 2. 模拟另一个端点(或MQ监听器)在处理完订单后, 调用此方法来设置结果
+    // 这个端点通常不会被客户端直接调用, 而是由内部系统调用
+    @GetMapping("/orderProcessed")
+    public String orderProcessed(@RequestParam String orderId, @RequestParam String status) {
+        DeferredResult<String> deferredResult = orderResultCache.get(orderId);
+        if (deferredResult != null) {
+            // 在另一个线程中设置结果, 完成异步响应
+            String resultMessage = "Order ID: " + orderId + " Status: " + status;
+            deferredResult.setResult(resultMessage);
+            return "Result set successfully";
+        }
+        return "Order ID not found or already processed";
+    }
+}
+----
+
+测试步骤::
+
+. 在浏览器快速访问: *http://localhost:8080/placeOrder?orderId=123*
+* 浏览器会转圈等待, 不会立即返回.
+
+. 在 *另一个浏览器* 标签页或使用 curl 快速访问: *http://localhost:8080/orderProcessed?orderId=123&status=SUCCESS*
+
+. 观察第一个标签页, 它会立即显示结果: *Order ID: 123 Status: SUCCESS*.
+
+这个例子完美展示了 *DeferredResult* 如何实现 *跨请求的异步通信*.
+
+=== Spring Boot 中的配置
+在 Spring Boot 中, 异步功能是自动配置的. 但你可能需要调整异步处理的线程池.
+
+配置示例 (application.yml)::
+
+[source, yaml, linenums]
+----
+spring:
+  mvc:
+    async: # 配置异步请求处理的超时时间(毫秒)
+      request-timeout: 15000 # 这个设置会对所有返回Callable和DeferredResult的控制器方法生效
+  task:
+    execution:
+      enabled: true # 开启异步支持(默认就是true, 通常不需要显式设置)
+      pool: # 配置用于执行Callable任务的线程池
+        core-size: 4
+        max-size: 8
+        queue-capacity: 20
+        thread-name-prefix: custom-http-async-exec-
+----
+
+=== 总结与最佳实践
+
+[cols="1,3,3"]
+|===
+|特性|Callable|DeferredResult
+
+|*适用场景*
+|简单的后台计算, 结果由自身产生
+|复杂事件驱动架构, 结果由外部事件触发
+
+|*灵活性*
+|较低
+|*极高*, 可与消息队列、其他服务、线程池集成
+
+|*线程管理*
+|使用 Spring 内置的 *TaskExecutor*
+|需要开发者自己管理结果设置线程
+
+|*本质*
+|我给你一个任务, 你做完告诉我
+|我先给你一张空白支票, 以后会有人来填写金额
+
+|===
+
+最佳实践::
+
+* *明确需求*: 如果不是处理 *耗时且阻塞* 的操作(如 IO 等待), 不要滥用异步, 因为它会引入额外的上下文切换开销.
+
+* *使用 DeferredResult*: 对于需要与外部系统(如消息中间件)集成的复杂场景, *DeferredResult* 是首选.
+
+* *合理配置线程池*: 务必根据实际负载调整异步任务执行器的线程池参数, 避免任务队列无限增长导致内存溢出.
+
+* *处理超时和错误*: 始终为 *DeferredResult* 设置超时时间和相应的回调函数, 确保系统资源的释放和客户端的体验.
+
+* *线程安全*: 保存 *DeferredResult* 的数据结构(如上面的 *Map*)必须是线程安全的(例如使用 *ConcurrentHashMap*).
+
+通过 Spring 的这些抽象, 你可以非常方便地构建出高性能、高响应性的异步 Web 应用程序, 而无需与复杂的底层 Servlet API 打交道.

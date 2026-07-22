@@ -1,0 +1,282 @@
+== crictl讲解
+
+=== 概述
+
+crictl 是 Kubernetes 提供的**命令行工具**, 用于与 **CRI (Container Runtime Interface)** 兼容的容器运行时(如 containerd, CRI-O) 进行交互. 它是诊断和排查 Kubernetes 节点问题的利器.
+
+在正常开发中, 我们使用 `kubectl` 管理 Pod; 但当节点级别的容器运行时出现问题(Kubelet 不可用, Pod 卡在 `ContainerCreating`, 容器异常退出)时, `kubectl` 无法提供运行时级别的信息. crictl 直接与容器运行时通信, 绕过 Kubelet, 让你能够:
+
+* 查看节点上所有 Pod 和容器的真实状态
+* 拉取, 列出和删除容器镜像
+* 执行容器内命令和查看日志
+* 收集运行时性能指标
+
+WARNING: crictl 是**调试工具**, 不是 kubectl 的替代品. 它直接操作容器运行时, 绕过 Kubelet 的声明式管理逻辑, 不当使用可能导致节点状态与集群期望状态不一致.
+
+=== 安装与配置
+
+==== 安装
+
+crictl 通常是随容器运行时一起安装的, 也可单独下载:
+
+[source,shell]
+----
+# 下载最新版本 (Linux amd64)
+VERSION=$(curl -s https://api.github.com/repos/kubernetes-sigs/cri-tools/releases/latest | grep tag_name | cut -d '"' -f 4)
+wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz
+tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
+rm -f crictl-$VERSION-linux-amd64.tar.gz
+----
+
+==== 配置
+
+crictl 默认连接 `unix:///var/run/dockershim.sock`. 在 containerd 环境下, 需要指定正确的 socket 路径:
+
+[source,shell]
+----
+# 方式一: 命令行参数
+crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps
+
+# 方式二: 配置文件 /etc/crictl.yaml
+cat > /etc/crictl.yaml <<EOF
+runtime-endpoint: "unix:///run/containerd/containerd.sock"
+image-endpoint: "unix:///run/containerd/containerd.sock"
+timeout: 10
+debug: false
+EOF
+----
+
+常见容器运行时的 socket 路径:
+
+[cols="2*"]
+|===
+| 容器运行时 | Socket 路径
+
+| containerd
+| `unix:///run/containerd/containerd.sock`
+
+| CRI-O
+| `unix:///var/run/crio/crio.sock`
+|===
+
+=== 核心命令
+
+crictl 的命令结构借鉴了 Docker CLI, 但操作的是**CRI 抽象层**的资源(如 PodSandbox, Container), 而非 Docker 容器. 理解以下映射关系很重要:
+
+* **PodSandbox:** 对应 Kubernetes 中的 Pod, 是一个隔离的网络和存储命名空间
+* **Container:** 对应 Pod 中的容器
+
+==== 查看 Pod
+
+[source,shell]
+----
+# 列出所有 Pod (PodSandbox)
+crictl pods
+
+# 列出特定状态的 Pod
+crictl pods --state Ready
+
+# 按名称过滤
+crictl pods --name nginx-*
+
+# 详细输出 (包含更多元数据)
+crictl pods --verbose
+----
+
+输出字段说明:
+
+[cols="3*"]
+|===
+| 字段 | 含义 | 示例值
+
+| POD ID | PodSandbox 的唯一标识 | `e1c8b9a0f2d3e`
+| NAME | Pod 名称 | `nginx-deploy-7c8b9-5xgk2`
+| NAMESPACE | Kubernetes 命名空间 | `default`
+| NETNS | 网络命名空间路径 | `/proc/1234/ns/net`
+| STATE | PodSandbox 状态 | `Ready` / `NotReady`
+| CREATED | 创建时间(相对) | `2 hours ago`
+| ATTEMPT | 重启次数 | `1`
+| RUNTIME | 容器运行时名称 | `io.containerd.runc.v2`
+|===
+
+==== 查看容器
+
+[source,shell]
+----
+# 列出所有容器
+crictl ps
+
+# 列出正在运行的容器
+crictl ps --state Running
+
+# 列出所有容器(含已退出)
+crictl ps -a
+
+# 按 Pod ID 过滤
+crictl ps --pod e1c8b9a0f2d3e
+----
+
+`crictl ps` vs `docker ps` 的关键区别: crictl 显示的是 CRI 层面的容器元数据, 包含 Kubernetes 标签(如 `io.kubernetes.pod.name`, `io.kubernetes.container.name`), 而非 Docker 原生元数据.
+
+==== 查看镜像
+
+[source,shell]
+----
+# 列出已拉取的镜像
+crictl images
+
+# 列出镜像摘要
+crictl images --digests
+
+# 拉取镜像
+crictl pull nginx:latest
+
+# 删除镜像
+crictl rmi nginx:latest
+
+# 清理未使用的镜像
+crictl rmi --prune
+----
+
+==== 执行命令与日志
+
+[source,shell]
+----
+# 进入容器执行命令 (类似 docker exec)
+crictl exec -it <container-id> /bin/sh
+
+# 查看容器日志
+crictl logs <container-id>
+
+# 查看最近 100 行日志
+crictl logs --tail=100 <container-id>
+
+# 实时跟踪日志
+crictl logs -f <container-id>
+----
+
+==== 系统信息与指标
+
+[source,shell]
+----
+# 查看容器运行时版本信息
+crictl version
+
+# 查看系统信息(运行时类型, 存储驱动等)
+crictl info
+
+# 查看容器资源使用统计 (CPU, 内存)
+crictl stats
+
+# 查看特定容器的资源使用
+crictl stats <container-id>
+
+# 清空统计缓存, 重新采集
+crictl stats --sync
+----
+
+=== 故障排查实战
+
+==== 场景一: Pod 卡在 ContainerCreating
+
+当通过 `kubectl get pods` 看到 Pod 一直处于 `ContainerCreating` 状态时:
+
+. 使用 crictl 查看对应 PodSandbox 状态:
++
+[source,shell]
+----
+crictl pods --name <pod-name> --state Ready
+----
++
+如果 Pod 不在 Ready 状态, 说明运行时层面就未就绪.
+
+. 查看 Pod 关联的容器:
++
+[source,shell]
+----
+crictl ps --pod <pod-sandbox-id>
+----
+
+. 如果容器未运行, 查看上一个尝试的容器日志:
++
+[source,shell]
+----
+crictl logs <container-id>
+----
+
+. 使用 `crictl inspect` 查看详细事件:
++
+[source,shell]
+----
+crictl inspectp <pod-sandbox-id>   # 检查 PodSandbox
+crictl inspect <container-id>      # 检查容器
+----
+
+==== 场景二: 节点磁盘空间不足
+
+镜像堆积是节点磁盘空间不足的常见原因:
+
+[source,shell]
+----
+# 查看镜像占用
+crictl images
+
+# 清理未被使用的镜像
+crictl rmi --prune
+----
+
+==== 场景三: 容器频繁重启
+
+[source,shell]
+----
+# 查看所有容器(含已退出), 关注 ATTEMPT 列
+crictl ps -a | grep <pod-name>
+
+# 如果 ATTEMPT 不断增大, 说明容器持续崩溃重启
+
+# 查看最后一个容器的退出日志
+crictl logs --tail=50 <container-id>
+
+# 查看容器详细信息(包括退出码)
+crictl inspect <container-id>
+----
+
+=== 调试模式与 Verbose 输出
+
+当需要排查 crictl 自身的问题时, 可以启用调试模式:
+
+[source,shell]
+----
+# 命令行启用
+crictl --debug ps
+
+# 或在配置文件中启用
+echo "debug: true" >> /etc/crictl.yaml
+----
+
+调试模式会输出与容器运行时交互的**完整 gRPC 请求和响应**, 对于理解 CRI 协议交互细节非常有帮助.
+
+=== 常用命令速查表
+
+[cols="3*"]
+|===
+| 命令 | 用途 | 类似 Docker 命令
+
+| `crictl pods` | 查看 PodSandbox 列表 | -
+| `crictl ps` | 查看容器列表 | `docker ps`
+| `crictl images` | 查看镜像列表 | `docker images`
+| `crictl pull <image>` | 拉取镜像 | `docker pull`
+| `crictl rmi <image>` | 删除镜像 | `docker rmi`
+| `crictl logs <id>` | 查看容器日志 | `docker logs`
+| `crictl exec -it <id> <cmd>` | 进入容器执行命令 | `docker exec`
+| `crictl stats` | 查看资源使用 | `docker stats`
+| `crictl inspect <id>` | 查看容器详情 | `docker inspect`
+| `crictl version` | 查看运行时版本 | `docker version`
+| `crictl info` | 查看运行时配置 | `docker info`
+|===
+
+=== 注意事项
+
+* **crictl 不适用于 Docker 引擎:** Docker 引擎默认不实现 CRI 接口, 需要 dockershim(已在 K8s v1.24 中移除)作为适配层. 在新版 Kubernetes 中, 应使用 `crictl` 而非 `docker` 命令调试节点.
+* **避免通过 crictl 修改运行中资源:** crictl 是只读调试工具偏好. 通过它删除容器或镜像可能导致 Kubelet 重新调度, 产生不必要的干扰. 优先使用 `kubectl delete pod` 等声明式操作.
+* **版本兼容:** crictl (cri-tools) 版本应与 Kubernetes 版本匹配, 不同版本的 CRI API 可能存在差异. 建议保持 cri-tools 与集群版本一致.

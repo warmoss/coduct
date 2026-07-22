@@ -1,0 +1,5 @@
+== 阿里云存储设备讲解
+
+* https://help.aliyun.com/zh/ecs/user-guide/elastic-block-storage-devices[块存储(云盘、本地盘和弹性临时盘)]
+
+* https://help.aliyun.com/zh/ecs/user-guide/encryption-overview[加密云盘]

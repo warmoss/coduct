@@ -1,0 +1,157 @@
+== Cookie原理讲解
+
+=== 为什么需要 Cookie?
+
+**HTTP** 是一种无状态协议. 这意味着每一次 HTTP 请求都是独立的, 服务器默认无法区分两个请求是否来自同一个用户. 这在早期静态网页时代没有问题, 但随着 Web 应用的发展, 出现了购物车、登录状态、个性化推荐等需要"记住"用户的需求.
+
+**Cookie** 就是为解决这个问题而诞生的. 它通过在客户端(浏览器)存储少量数据, 并在每次请求时自动携带这些数据, 让服务器能够识别并"记住"用户.
+
+=== 什么是 Cookie?
+
+**Cookie** 是服务器发送给浏览器并存储在客户端的一小段数据(通常不超过 4KB). 浏览器会在后续访问同一站点时, 自动将该数据携带在请求中发送给服务器.
+
+Cookie 以 **键值对** 的形式存储, 并附带一组控制其行为的属性:
+
+[source, text]
+----
+Set-Cookie: sessionId=abc123; Domain=.example.com; Path=/; Secure; HttpOnly; SameSite=Lax
+----
+
+上面这个例子中:
+
+* `sessionId=abc123` 是 Cookie 的名称和值
+* `Domain`, `Path`, `Secure`, `HttpOnly`, `SameSite` 是控制 Cookie 行为的属性
+
+Cookie 的两个核心作用:
+
+* **会话管理:** 登录状态、购物车、游戏分数等用户临时数据
+* **个性化:** 用户偏好设置、主题、语言选择等
+
+有关 Cookie 如何通过 HTTP 头在客户端和服务器之间传递的细节, 可参考 <<HTTP头讲解.adoc, HTTP 头讲解>>.
+
+=== Cookie 的核心属性
+
+Cookie 的行为由以下属性精确控制:
+
+Domain::
+指定哪些域名可以接收该 Cookie. 例如 `Domain=.example.com` 表示 `example.com` 及其所有子域名(如 `api.example.com`, `www.example.com`)均可访问.
+
+Path::
+指定哪些路径可以发送该 Cookie. 例如 `Path=/docs` 表示只在访问 `/docs` 及其子路径时发送. 默认为当前请求路径.
+
+Expires / Max-Age::
+控制 Cookie 的**持久性**.
+* `Expires=Date` 指定过期时间(具体日期)
+* `Max-Age=Seconds` 指定过期秒数(相对于当前时间, 优先级高于 `Expires`)
+* 两者均未设置时, Cookie 为**会话 Cookie**, 浏览器关闭即删除
+
+Secure::
+要求 Cookie **只能通过 HTTPS 协议传输**. 如果通过 HTTP 访问, 浏览器不会发送该 Cookie, 有效防止中间人攻击窃取 Cookie. 关于 HTTPS 的详细原理, 可参考 <<HTTPS讲解.adoc, HTTPS 讲解>>.
+
+HttpOnly::
+禁止 JavaScript 通过 `document.cookie` 访问该 Cookie. 这是**防御 XSS 攻击窃取 Cookie** 的关键手段. 关于 XSS 攻击的详细原理, 可参考 <<XSS攻击讲解.adoc, XSS 攻击讲解>>.
+
+SameSite::
+控制 Cookie 在**跨站请求**中是否携带, 用于防御 **CSRF(跨站请求伪造)** 攻击. 可选值如下:
+
+|===
+| 值 | 行为 | 适用场景
+
+| `Strict`
+| 完全不发送(仅限同站请求)
+| 安全性最高, 适用于银行转账等关键接口
+
+| `Lax`(默认)
+| 允许部分安全方法(GET)的顶级导航携带
+| 兼顾安全与体验, 适用于大多数场景
+
+| `None`
+| 任何跨站请求均携带
+| 必须同时设置 `Secure`; 适用于第三方嵌入场景
+|===
+
+=== Cookie 的工作流程
+
+Cookie 的完整生命周期包含设置、发送、更新和删除四个阶段:
+
+. **设置:** 服务器在 HTTP 响应头中通过 `Set-Cookie` 下发 Cookie, 浏览器接收到后将其存储在本地
+. **发送:** 浏览器在后续访问同一站点时, 自动在请求头中通过 `Cookie` 携带符合条件的所有 Cookie
+. **更新:** 服务器再次下发同名 `Set-Cookie` 会覆盖浏览器中已有的 Cookie
+. **删除:** 服务器设置 `Max-Age=0` 或 `Expires` 为过去时间, 浏览器收到后立即删除该 Cookie
+
+[plantuml, "Cookie 工作流程", format=png]
+----
+@startuml
+actor 浏览器
+participant 服务器
+
+== 首次请求 ==
+浏览器 -> 服务器: GET /index.html
+note right of 服务器: 生成 Session ID
+服务器 --> 浏览器: 200 OK\nSet-Cookie: sessionId=abc123; Path=/; HttpOnly
+
+== 后续请求 ==
+浏览器 -> 服务器: GET /profile\nCookie: sessionId=abc123
+note right of 服务器: 根据 Cookie 识别用户
+服务器 --> 浏览器: 200 OK\n用户信息页面
+
+== 修改 Cookie ==
+浏览器 -> 服务器: POST /login\nCookie: sessionId=abc123
+服务器 --> 浏览器: 302 Redirect\nSet-Cookie: sessionId=xyz789; Path=/; Max-Age=3600
+note right of 浏览器: 更新本地 Cookie
+
+== 清除 Cookie ==
+浏览器 -> 服务器: GET /logout\nCookie: sessionId=xyz789
+服务器 --> 浏览器: 200 OK\nSet-Cookie: sessionId=; Path=/; Max-Age=0
+note right of 浏览器: Cookie 过期, 被删除
+@enduml
+----
+
+=== Cookie 的分类
+
+根据生命周期, Cookie 分为两类:
+
+会话 Cookie (Session Cookie)::
+未设置 `Expires` 和 `Max-Age` 的 Cookie. 存储在内存中, 浏览器关闭即消失. 适用于登录状态等临时会话数据.
+
+持久化 Cookie (Persistent Cookie)::
+设置了 `Expires` 或 `Max-Age` 的 Cookie. 存储在硬盘中, 在设置的过期时间前持续有效, 即使关闭浏览器也不会丢失. 适用于"记住我"、偏好设置等场景.
+
+=== Cookie 的限制与注意事项
+
+==== 大小与数量限制
+
+每个 Cookie 大小限制约为 **4KB**, 每个域名下的 Cookie 总数限制约为 **50 条**(因浏览器而异). 超出限制的 Cookie 会被浏览器静默丢弃. 因此, Cookie 不适合存储大量数据, 更不应直接存储用户密码等敏感信息.
+
+==== 同源策略与 Cookie
+
+Cookie 的"源"判定与浏览器同源策略不同. Cookie 不受**端口**限制, 且 `Domain` 属性可以跨子域名共享. 这与 <<cors原理讲解.adoc, CORS>> 中的同源策略不完全一致.
+
+例如: `http://a.example.com` 可以访问 `Domain=.example.com` 下的 Cookie, 即使端口不同也可共享.
+
+==== 第三方 Cookie
+
+当页面加载来自其他域名的资源(如广告图片、第三方统计脚本)时, 该第三方返回的 `Set-Cookie` 称为**第三方 Cookie**. 现代浏览器已逐步限制或默认禁用第三方 Cookie, 以保护用户隐私.
+
+=== Cookie 的安全实践
+
+Cookie 的安全防护需要从以下维度综合考量:
+
+. **HttpOnly 标记:** 对携带会话凭据的 Cookie 始终设置 `HttpOnly`, 防止 XSS 攻击盗取. 更多 XSS 相关内容请参考 <<XSS攻击讲解.adoc, XSS 攻击讲解>>.
+. **Secure 标记:** 始终对涉及敏感信息的 Cookie 设置 `Secure`, 确保仅在 HTTPS 下传输.
+. **SameSite 策略:** 默认使用 `SameSite=Lax`, 关键接口使用 `SameSite=Strict`.
+. **合理设置过期时间:** 会话 Cookie 不要设置过长的 `Max-Age`, 减少泄露后的影响窗口.
+. **前缀保护:** 使用 `__Host-` 前缀的 Cookie 要求必须同时设置 `Secure`、`Path=/` 且不能设置 `Domain`, 提供更强的安全保障.
+. **加密与签名:** 敏感数据(如用户身份)在存入 Cookie 前应加密或签名, 防止篡改和泄露.
+
+=== 总结
+
+Cookie 是 Web 应用中实现状态管理的基础机制, 理解其原理对构建安全可靠的 Web 应用至关重要.
+
+**核心要点回顾:**
+
+* **作用:** 解决 HTTP 无状态问题, 实现会话管理、用户识别和个性化
+* **属性控制:** `Domain`, `Path` 控制范围, `Expires/Max-Age` 控制生命周期, `Secure`, `HttpOnly`, `SameSite` 控制安全策略
+* **工作流程:** 服务器通过 `Set-Cookie` 设置, 浏览器通过 `Cookie` 自动回传
+* **安全防护:** `HttpOnly` 防 XSS, `SameSite` 防 CSRF, `Secure` 防中间人攻击, 三者缺一不可
+* **容量限制:** 约 4KB 大小限制, 不适合存储大量数据

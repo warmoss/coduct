@@ -1,0 +1,126 @@
+== BigDecimal避免舍入误差原理
+
+**BigDecimal 之所以能避免舍入误差, 是因为它采用了与浮点数完全不同的存储和计算原理**
+
+=== 存储方式不同
+
+==== 浮点数(float/double)
+
+使用二进制科学计数法, 很多十进制小数无法精确表示为二进制
+
+[source, java]
+----
+// 经典精度问题
+System.out.println(0.1 + 0.2); // 0.30000000000000004
+----
+
+==== BigDecimal
+
+使用 十进制整数 + 小数点位置 的方式存储
+
+[source, java]
+----
+// BigDecimal内部表示示例
+// 对于 123.45, 实际存储为:
+// unscaledValue = 12345
+// scale = 2
+// 数值 = unscaledValue × 10^(-scale)
+----
+
+=== 精确计算原理
+
+==== 使用字符串构造
+
+[source, java]
+----
+// 正确做法: 使用字符串构造
+BigDecimal a = new BigDecimal("0.1");
+BigDecimal b = new BigDecimal("0.2");
+BigDecimal sum = a.add(b);  // 精确得到 0.3
+
+// 错误做法: 使用double构造(仍然会有精度问题)
+BigDecimal c = new BigDecimal(0.1);  // 传入的是近似值
+----
+
+==== 运算不损失精度
+
+[source, java]
+----
+BigDecimal num1 = new BigDecimal("1");
+BigDecimal num2 = new BigDecimal("3");
+
+// 除法时需要指定精度和舍入模式
+BigDecimal result = num1.divide(num2, 10, RoundingMode.HALF_UP);
+// 结果: 0.3333333333, 精度可控
+----
+
+=== 关键特性
+
+==== 任意精度
+
+[source, java]
+----
+// 可以表示极大或极小的数
+BigDecimal huge = new BigDecimal("123456789012345678901234567890.1234567890");
+BigDecimal tiny = new BigDecimal("0.000000000000000000001");
+----
+
+==== 可控制的舍入
+
+[source, java]
+----
+// 八种舍入模式
+BigDecimal value = new BigDecimal("1.2345");
+
+value.setScale(2, RoundingMode.HALF_UP);    // 1.23
+value.setScale(2, RoundingMode.HALF_EVEN);  // 1.23(银行家舍入法)
+value.setScale(2, RoundingMode.CEILING);    // 1.24
+----
+
+==== 精确的十进制运算
+
+[source, java]
+----
+// 财务计算示例
+BigDecimal price = new BigDecimal("19.99");
+BigDecimal quantity = new BigDecimal("3");
+BigDecimal total = price.multiply(quantity);  // 59.97(精确)
+----
+
+=== 注意事项
+
+[source, java]
+----
+// 1. 比较使用 compareTo(), 不是 equals()
+BigDecimal a = new BigDecimal("1.0");
+BigDecimal b = new BigDecimal("1.00");
+System.out.println(a.equals(b));     // false(scale不同)
+System.out.println(a.compareTo(b));  // 0(数值相等)
+
+// 2. 除法必须指定舍入模式
+BigDecimal one = new BigDecimal("1");
+BigDecimal three = new BigDecimal("3");
+// 错误做法: 会抛出 ArithmeticException
+// BigDecimal result = one.divide(three);
+// 正确做法:
+BigDecimal result = one.divide(three, 5, RoundingMode.HALF_UP);
+
+// 3. 注意构造方式
+BigDecimal good = new BigDecimal("0.1");      // 精确
+BigDecimal bad = new BigDecimal(0.1);         // 不精确
+BigDecimal better = BigDecimal.valueOf(0.1);  // 推荐
+----
+
+=== 性能考虑
+
+虽然 BigDecimal 精确, 但相比 double:
+
+* **内存占用更大**
+
+* **计算速度更慢**
+
+* **适用于财务、科学计算等对精度要求高的场景**
+
+=== 总结
+
+BigDecimal 通过 **十进制整数存储 + 小数点位置标记** 的方式, 完全避免了二进制浮点数的表示误差. 它不是魔法, 而是通过更精确(但更耗资源)的存储计算方式来实现无误差的十进制运算.

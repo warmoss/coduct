@@ -1,0 +1,325 @@
+== web应用时区最佳实践
+
+时区处理是 web 开发中最容易出错但常被忽视的问题之一. 一个国际化应用的用户可能分布在多个时区, 如果时间显示错误, 轻则造成困惑, 重则导致业务逻辑错误(如定时任务提前执行、订单超时计算错误). 本文从端到端视角, 梳理 web 应用中的时区最佳实践.
+
+关于时区的基本概念(UTC、时区偏移、夏令时等)已在 <<Java/jdk/时区讲解.adoc#_时区基本概念, 时区讲解>> 中详细介绍, 本文不再重复.
+
+=== 黄金原则: 存储用 UTC, 展示用本地时
+
+时区处理的核心只有一条原则:
+
+* **存储和传输统一使用 UTC:** 数据库、API 请求/响应、日志、缓存中全部使用 UTC 时间
+* **仅在展示层转换为用户本地时间:** 前端根据用户浏览器时区或配置时区做渲染
+
+这条原则消除了系统内部各模块之间的时区歧义. 任何偏离都会引入隐式时区依赖性, 导致难以排查的 Bug.
+
+=== 前端时区处理
+
+==== 获取用户时区
+
+浏览器提供了两种获取用户时区的方式:
+
+**`Intl.DateTimeFormat().resolvedOptions().timeZone`**:: 返回 IANA 时区名(如 `Asia/Shanghai`), 是最可靠的获取方式
+
+**`Date.getTimezoneOffset()`**:: 返回当前时间与 UTC 的偏移分钟数(如东八区返回 -480), 但无法区分标准时间和夏令时
+
+[source,javascript]
+----
+// 推荐: 使用 Intl API 获取用户时区
+const userTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+console.log(userTimeZone); // "Asia/Shanghai"
+
+// 备用: 获取偏移量(分钟)
+const offset = new Date().getTimezoneOffset();
+// offset = -480 表示 UTC+8
+----
+
+==== 前端时间格式化
+
+**服务端下发的 UTC 时间转换为本地时间时, 推荐使用 `Intl.DateTimeFormat` 或 `dayjs` 等库.**
+
+[source,javascript]
+----
+// 服务端返回的 UTC 时间字符串
+const utcTime = "2024-06-15T08:00:00Z";
+
+// 方式一: 使用 Intl.DateTimeFormat
+const date = new Date(utcTime);
+const formatter = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  timeZoneName: "short"
+});
+console.log(formatter.format(date)); // "2024/06/15 16:00:00 CST"
+
+// 方式二: 使用 dayjs(更简洁)
+// dayjs(utcTime).format("YYYY-MM-DD HH:mm:ss")
+----
+
+==== 时间输入组件
+
+涉及用户输入时间时(如选择生日、预约时间), 前端应发送 UTC 时间给服务端:
+
+[source,javascript]
+----
+// 用户选择本地时间 2024-06-15 10:00
+const localDate = new Date("2024-06-15T10:00:00");
+// 转换为 UTC ISO 字符串发送给服务端
+const utcISO = localDate.toISOString();
+// "2024-06-15T02:00:00.000Z" (假设东八区)
+----
+
+[WARNING]
+====
+`<input type="datetime-local">` 返回的是**不含时区信息**的本地时间字符串, 如 `"2024-06-15T10:00"`. 发送给服务端前需手动附加时区信息.
+====
+
+=== 后端时区处理
+
+==== API 设计
+
+API 中所有时间字段统一使用 **ISO 8601 格式 + UTC 后缀 Z**, 例如 `2024-06-15T08:00:00Z`.
+
+[source,json]
+----
+// 请求体
+{
+  "startTime": "2024-06-15T08:00:00Z",
+  "endTime": "2024-06-15T10:00:00Z"
+}
+
+// 响应体
+{
+  "createdAt": "2024-06-15T08:00:00Z",
+  "updatedAt": "2024-06-15T09:30:00Z"
+}
+----
+
+[WARNING]
+====
+避免在 API 中使用时间戳(如 `1718438400000`), 可读性差且不利于调试. 除非是 IoT 或高并发场景, 优先使用 ISO 8601 字符串.
+====
+
+==== Java 后端配置
+
+Java 后端推荐使用 `java.time` 包, 并统一 JVM 时区和序列化配置:
+
+[source,java]
+----
+// 1. 应用启动时设置 JVM 时区为 UTC
+// Spring Boot 中可在 application.yml 配置:
+// spring.jackson.time-zone=UTC
+
+// 2. Jackson 全局时区配置
+@Configuration
+public class JacksonConfig {
+    @Bean
+    public Jackson2ObjectMapperBuilderCustomizer jsonCustomizer() {
+        return builder -> {
+            builder.timeZone(TimeZone.getTimeZone("UTC"));
+            builder.serializationInclusion(JsonInclude.Include.NON_NULL);
+        };
+    }
+}
+
+// 3. 实体类使用 Instant 或 OffsetDateTime
+@Entity
+public class Order {
+    // 推荐: 使用 Instant 表示时间点
+    private Instant createdAt;
+
+    // 或使用 OffsetDateTime 明确时区
+    private OffsetDateTime updatedAt;
+}
+----
+
+==== .NET 后端配置
+
+[source,csharp]
+----
+// Program.cs 中配置
+builder.Services.Configure<JsonOptions>(options =>
+{
+    options.SerializerOptions.Converters.Add(
+        new JsonStringEnumConverter());
+});
+
+// 推荐使用 DateTimeOffset 而非 DateTime
+public record Order(
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt
+);
+----
+
+==== Node.js 后端配置
+
+[source,javascript]
+----
+// 将 Moment.js 替换为 dayjs + utc 插件
+const dayjs = require("dayjs");
+const utc = require("dayjs/plugin/utc");
+dayjs.extend(utc);
+
+// 统一使用 UTC 模式
+const now = dayjs.utc();
+console.log(now.format()); // "2024-06-15T08:00:00Z"
+----
+
+=== 数据库时区处理
+
+==== MySQL
+
+[source,sql]
+----
+-- 连接 URL 中指定时区
+-- jdbc:mysql://localhost:3306/db?serverTimezone=UTC
+
+-- 查看当前数据库时区
+SELECT @@global.time_zone, @@session.time_zone;
+
+-- 设置为 UTC(需要 SUPER 权限)
+SET GLOBAL time_zone = '+00:00';
+SET SESSION time_zone = '+00:00';
+----
+
+[NOTE]
+====
+* `TIMESTAMP` 类型底层存储为 UTC, 查询时按 session 时区转换, 适合存时间点
+* `DATETIME` 类型不涉及时区转换, 存什么就返回什么, 适合存未来时间或固定时间
+* 跨时区场景推荐使用 `TIMESTAMP`, 并在连接层设置 UTC 时区
+====
+
+==== PostgreSQL
+
+[source,sql]
+----
+-- 查看时区
+SHOW TIMEZONE;
+
+-- 设置当前会话时区
+SET TIMEZONE = 'UTC';
+
+-- 数据类型建议
+-- TIMESTAMPTZ(带时区): 存储为 UTC, 查询时自动转换
+-- TIMESTAMP(不带时区): 存什么返回什么
+----
+
+=== 定时任务与调度
+
+定时任务是最容易踩坑的场景. 核心原则:
+
+. **任务触发时间统一基于 UTC 存储和计算**
+. **如果业务需要在用户本地时间的特定时刻执行(如每天早 9 点发送报告), 存储用户时区 + 本地时间, 调度系统自行计算下一次执行的 UTC 时间**
+. **避免依赖系统默认时区**
+
+[source,java]
+----
+// 以用户时区计算下次执行时间
+public Instant calculateNextExecution(
+        LocalTime userLocalTime,
+        ZoneId userZone,
+        Instant lastExecution) {
+    // 将用户的本地时间转换为其时区下的 ZonedDateTime
+    ZonedDateTime todayInUserZone = lastExecution.atZone(userZone);
+    ZonedDateTime nextRun = todayInUserZone
+            .with(userLocalTime)
+            .withEarlierOffsetAtOverlap(); // 处理夏令时重叠
+
+    // 如果计算出的时间已过, 推到下一天
+    if (nextRun.toInstant().isBefore(Instant.now())) {
+        nextRun = nextRun.plusDays(1);
+    }
+
+    return nextRun.toInstant(); // 返回 UTC 时间给调度器
+}
+----
+
+=== 常见陷阱与解决方案
+
+==== 陷阱 1: LocalDateTime 直接序列化为字符串
+
+*问题:* `LocalDateTime` 不含时区信息, 直接序列化会导致接收方无法确定时区.
+
+*解决方案:* 在 API DTO 中使用 `Instant` 或 `OffsetDateTime`, 确保序列化结果包含时区信息.
+
+[source,java]
+----
+// 错误: 无时区信息
+record BadResponse(LocalDateTime createdAt) { }
+// 序列化结果: {"createdAt": "2024-06-15T16:00:00"}
+
+// 正确: 带时区
+record GoodResponse(Instant createdAt) { }
+// 序列化结果: {"createdAt": "2024-06-15T08:00:00Z"}
+----
+
+==== 陷阱 2: 前端传递无时区的时间字符串
+
+*问题:* `<input type="date">` 返回 `"2024-06-15"`, `<input type="datetime-local">` 返回 `"2024-06-15T10:00"`, 均不含时区.
+
+*解决方案:* 后端约定此类字段按特定时区(如用户的配置时区或 UTC)处理, 并在文档中明确标注.
+
+[source,java]
+----
+// 明确声明: 此字段按 UTC 解析
+public record CreateEventRequest(
+    @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'", timezone = "UTC")
+    LocalDateTime scheduledTime
+) { }
+----
+
+==== 陷阱 3: 夏令时转换导致的时间不存在或重复
+
+某些时区在夏令时切换时, 某个小时可能不存在(春季拨快)或重复出现(秋季拨回). 使用 `ZonedDateTime` 的 `withEarlierOffsetAtOverlap()` 或 `withLaterOffsetAtOverlap()` 明确处理.
+
+[source,java]
+----
+// 美国东部时区 2024-03-10 凌晨 2:00 不存在(拨到 3:00)
+LocalDateTime ambiguous = LocalDateTime.of(2024, 3, 10, 2, 30);
+try {
+    ZonedDateTime zdt = ZonedDateTime.of(ambiguous, ZoneId.of("America/New_York"));
+} catch (DateTimeException e) {
+    // 抛出异常, 需特殊处理
+}
+
+// 秋季回拨时 1:00-2:00 出现两次
+LocalDateTime overlap = LocalDateTime.of(2024, 11, 3, 1, 30);
+ZonedDateTime before = overlap.atZone(ZoneId.of("America/New_York"))
+        .withEarlierOffsetAtOverlap(); // 选择第一个
+ZonedDateTime after = overlap.atZone(ZoneId.of("America/New_York"))
+        .withLaterOffsetAtOverlap();   // 选择第二个
+----
+
+==== 陷阱 4: 测试环境与生产环境时区不同
+
+*问题:* 开发机器可能是东八区, 但生产服务器是 UTC, 导致本地测试通过的代码上线后时间计算错误.
+
+*解决方案:* 容器化应用统一指定时区, CI/CD 环境也保持一致.
+
+[source,dockerfile]
+----
+FROM eclipse-temurin:21-jre
+# 设置容器时区为 UTC
+ENV TZ=UTC
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+----
+
+=== 总结
+
+核心要点回顾::
+
+* **全线 UTC:** 存储、传输、计算统一使用 UTC, 仅在展示层转换
+
+* **明确 API 契约:** API 时间字段使用 ISO 8601 + Z 后缀, 避免模糊
+
+* **前端获取用户时区:** 使用 `Intl.DateTimeFormat().resolvedOptions().timeZone`
+
+* **数据类型选择:** 数据库使用 `TIMESTAMP`(MySQL) 或 `TIMESTAMPTZ`(PostgreSQL); Java 后端使用 `Instant` 或 `OffsetDateTime`
+
+* **关注夏令时:** 使用 `ZonedDateTime` 处理夏令时切换, 明确重叠时段的行为
+
+* **统一测试环境时区:** 容器化应用在 Dockerfile 中指定时区, 消除环境差异
