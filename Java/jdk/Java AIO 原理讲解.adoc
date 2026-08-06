@@ -1,1 +1,439 @@
-== Java NIO 原理讲解
+== Java AIO 原理讲解
+
+=== 引言
+
+Java AIO(Asynchronous I/O)是 Java 7(NIO.2)引入的**异步非阻塞 I/O 模型**, 与传统的 BIO(阻塞 I/O)和 NIO(非阻塞 I/O)不同, AIO 在发起 I/O 操作后**立即返回**, 由操作系统在后台完成实际 I/O 操作, 完成后通过**回调**或 **Future** 通知应用程序. 这种模型将"发起操作"与"等待完成"解耦, 大幅降低了线程资源的消耗, 特别适合**高并发、长连接**场景.
+
+=== 核心概念
+
+AIO(异步 I/O):: 应用程序发起 I/O 操作后, 不等待操作完成而是立即返回继续执行, 操作系统内核在 I/O 操作完成后通知应用程序进行后续处理. 整个过程主线程**不会被阻塞**.
+
+关键术语:
+
+* **AsynchronousChannel**: AIO 的通道接口, 与 NIO 中同步非阻塞的 `Channel` 不同, 它支持异步读写
+* **CompletionHandler**: 回调接口, 包含 `completed()` 和 `failed()` 两个方法, I/O 操作完成或失败时被调用
+* **Future**: 与 `java.util.concurrent.Future` 类似, 通过 `Future.get()` 阻塞等待结果, 也可以在轮询检查
+* **IOCP(I/O 完成端口)**: Windows 平台底层实现的异步 I/O 机制, AIO 在 Windows 上基于 IOCP 实现
+* **epoll**: Linux 平台底层实现, AIO 在 Linux 上基于 epoll 模拟异步 I/O
+
+=== BIO、NIO、AIO 模型对比
+
+理解 Java I/O 进化的关键是区分**同步/异步**与**阻塞/非阻塞**两个维度:
+
+[cols="4*"]
+|===
+| 模型 | 发起读操作后 | 数据就绪后 | 线程使用
+
+| BIO
+| 阻塞等待, 直到数据就绪并拷贝完成
+| 拷贝数据后才返回
+| 一个连接一个线程
+
+| NIO
+| 立即返回(若数据未就绪返回 0)
+| 需要主动轮询或 Selector 通知后, 线程调用 `read()` 拷贝数据
+| 一个线程管理多个连接
+
+| AIO
+| 立即返回, 内核在后台完成读取
+| 内核自动将数据拷贝到用户缓冲区后回调通知
+| 几乎零线程等待
+|===
+
+核心区别:
+
+* **BIO**: 同步阻塞, `read()` 调用阻塞线程直到数据到达(`同步 = 线程主动拷贝数据`, `阻塞 = 线程等待数据就绪`)
+* **NIO**: 同步非阻塞, 线程通过 Selector 感知就绪事件后, 主动调用 `read()` 拷贝数据(`同步 = 线程主动拷贝数据`, `非阻塞 = 线程不等待, 立即返回`)
+* **AIO**: 异步非阻塞, 线程发起读操作后直接返回, 操作系统在后台将数据拷贝到用户缓冲区后通知(`异步 = 操作系统拷贝数据`, `非阻塞 = 线程不等待`)
+
+[plantuml, "BIO vs NIO vs AIO 模型对比", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title Java I/O 模型演进
+
+rectangle "BIO (同步阻塞)" as BIO #FFB6C1 {
+    (线程: read&#40;&#41; => 阻塞等待 => 数据就绪 => 拷贝数据 => 返回)
+}
+
+rectangle "NIO (同步非阻塞)" as NIO #87CEEB {
+    (线程: read&#40;&#41; => 立即返回 => Selector通知 => 线程拷贝数据)
+}
+
+rectangle "AIO (异步非阻塞)" as AIO #90EE90 {
+    (线程: read&#40;&#41; => 立即返回 => OS后台拷贝 => 回调通知线程)
+}
+
+BIO -[#red]-> NIO : 多路复用
+NIO -[#blue]-> AIO : 异步化
+@enduml
+----
+
+=== 核心原理
+
+==== 底层实现机制
+
+AIO 在不同操作系统上的底层实现不同:
+
+* **Windows**: 基于原生 **IOCP(I/O Completion Port)** 实现, 这是真正的操作系统级异步 I/O, 性能最优
+* **Linux**: Java 使用 **epoll + 线程池**模拟异步, 底层仍然是同步非阻塞调用, 但对外呈现异步回调语义
+* **macOS**: 基于 **kqueue** 模拟实现
+
+TIP: 在生产环境中, AIO 在 Windows 上表现最优, 在 Linux 上由于需要线程池模拟, 实际性能提升有限, 因此 Linux 服务端更常用 NIO + Reactor 模型.
+
+==== 两种回调模式
+
+AIO 提供了两种获取 I/O 结果的方式:
+
+* **Future 模式**: I/O 操作返回 `Future<V>` 对象, 通过 `get()` 阻塞获取结果, 或通过 `isDone()` 轮询
+* **CompletionHandler 回调模式**: 注册一个 `CompletionHandler<V,A>` 回调, I/O 完成时自动调用 `completed()` 或 `failed()`
+
+两种模式对比如下:
+
+[cols="3*"]
+|===
+| 特性 | Future 模式 | CompletionHandler 模式
+
+| 获取结果
+| `Future.get()` 阻塞等待
+| 回调方法自动接收结果
+
+| 调用线程
+| 调用 `get()` 的线程
+| 内核 I/O 线程池中的线程
+
+| 适用场景
+| 简单场景, 顺序依赖
+| 高并发, 事件驱动
+
+| 异常处理
+| `get()` 抛出 `ExecutionException`
+| `failed()` 方法接收异常
+|===
+
+==== 内部线程模型
+
+Java AIO 依赖内部线程池来完成 I/O 回调:
+
+* **系统默认线程组**: `AsynchronousChannelGroup` 管理一组线程, 负责接收 I/O 完成通知并回调 `CompletionHandler`
+* **自定义线程组**: 可通过 `AsynchronousChannelGroup.withFixedThreadPool()` 或 `withCachedThreadPool()` 自定义
+
+[source,java]
+----
+// 自定义线程池的 AIO 通道组
+AsynchronousChannelGroup group = AsynchronousChannelGroup
+    .withFixedThreadPool(4, Executors.defaultThreadFactory());
+AsynchronousServerSocketChannel serverChannel =
+    AsynchronousServerSocketChannel.open(group).bind(new InetSocketAddress(8080));
+----
+
+=== 核心 API
+
+==== AsynchronousSocketChannel
+
+客户端异步通道, 支持异步连接、读取和写入:
+
+[source,java]
+----
+// 创建异步 Socket 通道
+AsynchronousSocketChannel client = AsynchronousSocketChannel.open();
+
+// 异步连接
+client.connect(new InetSocketAddress("localhost", 8080), null,
+    new CompletionHandler<Void, Object>() {
+        @Override
+        public void completed(Void result, Object attachment) {
+            // 连接成功, 开始读取数据
+        }
+        @Override
+        public void failed(Throwable exc, Object attachment) {
+            exc.printStackTrace();
+        }
+    });
+
+// 异步读取 - Future 模式
+ByteBuffer buffer = ByteBuffer.allocate(1024);
+Future<Integer> future = client.read(buffer);
+// 可以继续做其他事情...
+Integer bytesRead = future.get();  // 阻塞等待结果
+
+// 异步写入 - CompletionHandler 模式
+ByteBuffer writeBuffer = ByteBuffer.wrap("Hello".getBytes());
+client.write(writeBuffer, null, new CompletionHandler<Integer, Object>() {
+    @Override
+    public void completed(Integer result, Object attachment) {
+        System.out.println("写入 " + result + " 字节");
+    }
+    @Override
+    public void failed(Throwable exc, Object attachment) {
+        exc.printStackTrace();
+    }
+});
+----
+
+==== AsynchronousServerSocketChannel
+
+服务端异步通道, 用于异步接受客户端连接:
+
+[source,java]
+----
+AsynchronousServerSocketChannel server = AsynchronousServerSocketChannel
+    .open()
+    .bind(new InetSocketAddress(8080));
+
+// 异步接受连接
+server.accept(null, new CompletionHandler<AsynchronousSocketChannel, Object>() {
+    @Override
+    public void completed(AsynchronousSocketChannel clientChannel, Object attachment) {
+        // 处理新连接的客户端
+        handleClient(clientChannel);
+        // 继续接受下一个连接(重要!)
+        server.accept(null, this);  // <1>
+    }
+    @Override
+    public void failed(Throwable exc, Object attachment) {
+        exc.printStackTrace();
+    }
+});
+----
+<1> 每次回调完成后必须重新调用 `accept()`, 否则无法接受后续连接
+
+==== AsynchronousFileChannel
+
+异步文件通道, 支持文件的异步读取和写入:
+
+[source,java]
+----
+Path path = Paths.get("/data/large_file.txt");
+
+// 异步读取文件 - Future 模式
+try (AsynchronousFileChannel fileChannel = AsynchronousFileChannel
+        .open(path, StandardOpenOption.READ)) {
+    ByteBuffer buffer = ByteBuffer.allocate(4096);
+    long position = 0;
+
+    Future<Integer> future = fileChannel.read(buffer, position);
+    while (!future.isDone()) {
+        // 可以做其他工作
+    }
+    int bytesRead = future.get();
+    System.out.println("读取 " + bytesRead + " 字节");
+}
+
+// 异步写入文件 - CompletionHandler 模式
+try (AsynchronousFileChannel fileChannel = AsynchronousFileChannel
+        .open(Paths.get("/data/output.txt"),
+              StandardOpenOption.WRITE, StandardOpenOption.CREATE)) {
+    ByteBuffer buffer = ByteBuffer.wrap("异步写入数据".getBytes());
+    fileChannel.write(buffer, 0, buffer, new CompletionHandler<Integer, ByteBuffer>() {
+        @Override
+        public void completed(Integer result, ByteBuffer attachment) {
+            System.out.println("写入完成, 共 " + result + " 字节");
+        }
+        @Override
+        public void failed(Throwable exc, ByteBuffer attachment) {
+            exc.printStackTrace();
+        }
+    });
+}
+----
+
+=== 工作流程
+
+==== AIO 服务端完整示例
+
+以下示例展示了一个完整的 AIO 服务端, 包括接受连接、读取数据和响应:
+
+[source,java]
+----
+public class AIOServer {
+    public static void main(String[] args) throws Exception {
+        AsynchronousServerSocketChannel serverChannel =
+            AsynchronousServerSocketChannel.open()
+                .bind(new InetSocketAddress(8080));
+
+        System.out.println("AIO 服务端启动, 监听端口 8080");
+
+        serverChannel.accept(null,
+            new CompletionHandler<AsynchronousSocketChannel, Object>() {
+                @Override
+                public void completed(AsynchronousSocketChannel client, Object att) {
+                    // 立即继续接受下一个连接
+                    serverChannel.accept(null, this);
+
+                    // 处理当前客户端
+                    handleClient(client);
+                }
+
+                @Override
+                public void failed(Throwable exc, Object att) {
+                    System.err.println("接受连接失败: " + exc.getMessage());
+                }
+            });
+
+        // 阻止主线程退出
+        Thread.currentThread().join();
+    }
+
+    private static void handleClient(AsynchronousSocketChannel client) {
+        ByteBuffer buffer = ByteBuffer.allocate(1024);
+        client.read(buffer, null,
+            new CompletionHandler<Integer, Object>() {
+                @Override
+                public void completed(Integer bytesRead, Object att) {
+                    if (bytesRead == -1) {
+                        closeQuietly(client);
+                        return;
+                    }
+                    buffer.flip();
+                    String received = StandardCharsets.UTF_8.decode(buffer).toString();
+                    System.out.println("收到: " + received);
+
+                    // 异步回写响应
+                    ByteBuffer response = ByteBuffer.wrap(
+                        ("Echo: " + received).getBytes());
+                    client.write(response, null,
+                        new CompletionHandler<Integer, Object>() {
+                            @Override
+                            public void completed(Integer result, Object att) {
+                                System.out.println("响应已发送");
+                            }
+                            @Override
+                            public void failed(Throwable exc, Object att) {
+                                exc.printStackTrace();
+                            }
+                        });
+                }
+
+                @Override
+                public void failed(Throwable exc, Object att) {
+                    System.err.println("读取失败: " + exc.getMessage());
+                    closeQuietly(client);
+                }
+            });
+    }
+
+    private static void closeQuietly(AsynchronousSocketChannel channel) {
+        try { channel.close(); } catch (IOException ignored) { }
+    }
+}
+----
+
+[plantuml, "AIO 服务端工作流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title AIO 服务端工作流程
+
+participant "主线程" as Main
+participant "I/O 线程池" as IO
+participant "操作系统" as OS
+participant "客户端" as Client
+
+Main -> OS: open() + bind(8080)
+activate Main
+Main -> OS: accept(null, handler)
+note right: 立即返回, 注册回调
+deactivate Main
+
+...回调等待中...
+
+Client -> OS: 发起 TCP 连接请求
+OS -> IO: 连接就绪, 回调 completed()
+activate IO
+IO -> IO: handler.completed(client)
+IO -> OS: serverChannel.accept(null, handler)
+note right: 重新注册, 继续接受下一个连接
+IO -> OS: client.read(buffer, handler)
+note right: 发起异步读
+deactivate IO
+
+Client -> OS: 发送数据 "Hello"
+OS -> IO: 数据就绪, 回调 completed()
+activate IO
+IO -> IO: handler.completed(bytesRead)
+IO -> OS: client.write(response, handler)
+note right: 异步写回响应
+deactivate IO
+
+OS -> Client: Echo: Hello
+@enduml
+----
+
+==== 数据流转时序
+
+AIO 的异步读写操作都遵循统一模式:
+
+. 调用异步方法(如 `read()`, `write()`, `accept()`, `connect()`), 传入 buffer 和 handler
+. 方法**立即返回**, 操作系统接管实际 I/O 操作
+. 操作系统在后台完成 I/O 后, 通知 `AsynchronousChannelGroup` 管理的线程池
+. 线程池中的线程调用 `CompletionHandler.completed()` 或 `failed()`
+. 在 `completed()` 回调中执行后续业务逻辑
+
+IMPORTANT: 在 `CompletionHandler` 回调方法中, 不要执行耗时操作, 否则会阻塞 I/O 线程池中的线程, 影响其他通道的响应.
+
+=== AIO 三大模型对比总结
+
+[cols="4*"]
+|===
+| 对比维度 | BIO | NIO | AIO
+
+| 线程模型
+| 1连接 : 1线程
+| 1线程 : N连接(Selector)
+| 回调驱动, 线程复用
+
+| 同步/异步
+| 同步
+| 同步
+| 异步
+
+| 阻塞/非阻塞
+| 阻塞
+| 非阻塞
+| 非阻塞
+
+| 最大连接数
+| 数百
+| 数万
+| 数十万(理论)
+
+| 编程复杂度
+| 简单
+| 复杂
+| 中等
+
+| 生态成熟度
+| 早期项目广泛使用
+| **Netty 为首选**, 生态成熟
+| 使用较少, 生态一般
+
+| 底层实现
+| `read()`/`write()` 系统调用
+| Selector + Channel + Buffer
+| IOCP(Windows) / epoll 模拟(Linux)
+
+| 适用场景
+| 低并发、简单项目
+| 高并发网络服务(主流)
+| 高并发文件 I/O, Windows 服务
+|===
+
+=== 注意事项与最佳实践
+
+* **回调中勿阻塞**: `CompletionHandler` 的回调方法由 I/O 线程池执行, 耗时操作应交由业务线程池处理
+* **持续注册 accept**: 每次 `accept()` 回调完成后必须重新调用 `accept()`, 否则服务端不再接受新连接
+* **缓冲区管理**: 每次 I/O 操作需分配独立的 `ByteBuffer`, 避免多线程共享同一缓冲区导致数据混乱
+* **异常处理**: `failed()` 方法会接收 I/O 异常, 务必在此关闭通道释放资源; callback 内部的业务异常不会触发 `failed()`
+* **Linux 性能考量**: Linux 上 AIO 基于 epoll 模拟, 高并发场景下不优于 NIO + Reactor, Netty 等框架未全面采用 AIO 即是此原因
+* **适用场景选择**: AIO 最适合**文件 I/O** 和 **Windows 平台**的高并发网络服务; Linux 网络服务仍推荐 **NIO + Netty** 方案
+* **优雅关闭**: 使用 `AsynchronousChannelGroup.shutdown()` 或 `shutdownNow()` 关闭线程池, 需先关闭所有通道防止新的回调产生
+* **超时设置**: AIO 自身不提供超时机制, 可结合 `Future.get(timeout, unit)` 实现读取超时, 或使用 `ScheduledExecutorService` 实现连接超时
+
+=== 参考资料
+
+* *Java NIO.2 文档*: 官方 `java.nio.channels` 包文档
+* *<<Java NIO 原理讲解.adoc#, Java NIO 原理讲解>>*: 本指南中 NIO 相关文章
+* *IOCP 文档*: Microsoft I/O Completion Ports 官方文档

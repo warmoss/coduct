@@ -363,6 +363,7 @@ OAuth2.1 仅提供**授权能力**, 其 `access_token` 仅表示"某用户授权
 * **标准化发现机制:** Discovery 和 JWKS 实现了配置自动化和公钥分发
 
 技术关系:
+
 * OIDC **完全建立在** OAuth2.1 的授权码流程之上, 继承了 PKCE、令牌轮换等安全机制
 * OIDC 的 `access_token` 本质就是 OAuth2.1 的访问令牌, 用于访问 UserInfo 端点
 * OAuth2.1 的安全最佳实践(<<业务/OAuth2.1原理讲解.adoc#安全最佳实践, HTTPS 传输、重定向 URI 校验、令牌防泄露>>) 对 OIDC 同样适用

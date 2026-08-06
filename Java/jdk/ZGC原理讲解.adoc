@@ -1,1 +1,272 @@
 == ZGC原理讲解
+
+=== 引言
+
+ZGC (Z Garbage Collector) 是 JDK 11 引入的一款**可扩展低延迟垃圾收集器**, 由 Oracle 开发, 旨在解决传统 GC 在大堆内存场景下停顿时间过长的问题. ZGC 的最大特点是: **暂停时间与堆大小无关**, 无论堆是 8MB, 8GB 还是 8TB, 其 STW (Stop-The-World) 暂停时间都能控制在 **亚毫秒级别** (通常 < 1ms).
+
+与 G1, CMS 等并发收集器不同, ZGC 的核心设计理念是: 将所有耗时的 GC 工作(标记, 整理, 重定位)都放在**并发阶段**完成, 只留极少量的 STW 操作.
+
+=== 核心概念
+
+在深入 ZGC 原理前, 需要先理解两个核心概念: **着色指针 (Colored Pointer)** 和 **读屏障 (Load Barrier)**.
+
+==== 着色指针
+
+着色指针是 ZGC 的基石. ZGC 在 64 位指针中嵌入额外的元数据位, 用来存储对象的状态信息.
+
+在 Linux/x64 平台上, 虚拟地址的高 18 位目前未使用 (仅支持 48 位寻址). ZGC 利用指针中的 4 位来存储元数据:
+
+[plantuml, "ZGC 64位指针结构", format=png]
+----
+@startuml
+rectangle "64-bit Pointer Layout" {
+  (Unused: 18 bits) as unused
+  (Reserved: 42 bits) as addr
+  (Meta: 4 bits) as meta
+}
+note bottom of meta
+  Marked (bit 0)
+  Remapped (bit 1)
+  Finalizable (bit 2)
+  未使用 (bit 3)
+end note
+@enduml
+----
+
+这 4 个元数据位的含义:
+
+Marked0 / Marked1 (第 0 位)::
+  交替使用, 表示对象是否已被标记. ZGC 使用双标记位交替机制, 每次 GC 周期切换使用 Marked0 或 Marked1, 避免清除标记位的开销.
+
+Remapped (第 1 位)::
+  表示该引用是否已指向对象的最新位置. 如果为 0, 表示需要通过转发表找到新位置.
+
+Finalizable (第 2 位)::
+  表示该对象是否只能通过 finalizer 访问, 用于处理 finalize 逻辑.
+
+WARNING: 着色指针意味着 ZGC 只能运行在 **64 位系统**上, 且指针压缩必须关闭. 在 JDK 21+ 中, ZGC 已支持压缩类指针 (Compressed Class Pointers), 但压缩对象指针仍不支持.
+
+==== 读屏障
+
+着色的指针需要"解释器"来理解这些元数据位, 这个解释器就是**读屏障**.
+
+读屏障:: 当从堆中**加载引用**时触发的一段自愈逻辑. 它检查指针的着色位, 如果发现对象已被移动 (Remapped 位为 0), 则自动修正该引用, 指向对象的新位置, 同时可能帮助完成一些 GC 工作.
+
+与传统 GC 的写屏障不同, ZGC 使用的是**读屏障**:
+
+* 写屏障: 在引用**写入**时触发, 由应用线程执行
+* 读屏障: 在引用**读取**时触发, 由应用线程执行
+
+读屏障的核心代码逻辑:
+
+[source,java]
+----
+// ZGC 读屏障伪代码
+Object loadReference(Object* p) {
+    Object ref = *p;  // 读取引用
+    if (isBadColor(ref)) {  // <1>
+        ref = fixColor(ref);  // <2>
+        *p = ref;  // <3>
+    }
+    return ref;
+}
+----
+<1> 检查指针的着色位, 判断是否需要修复
+<2> 修复指针, 使其指向对象的最新位置
+<3> 自愈: 将修复后的指针写回, 后续读取无需再次修复
+
+=== 核心特性
+
+==== 并发处理
+
+ZGC 的几乎所有阶段都是**并发**的, 与应用线程同时运行. 只有以下极短的操作需要 STW:
+
+[cols="3,2,5"]
+|===
+| STW 阶段 | 典型耗时 | 说明
+
+| 初始标记 (STW 1) | < 1ms | 扫描 GC Roots 直达
+| 最终标记 (STW 2) | < 1ms | 处理并发标记遗漏
+| 初始转移 (STW 3) | < 1ms | 扫描 GC Roots 直达, 确定需转移对象
+
+|===
+
+这三个 STW 阶段的总耗时与堆大小和对象数量**无关**, 只与 GC Roots 数量相关, 保证了暂停时间的可预测性.
+
+==== 基于 Region 的内存布局
+
+与 G1 类似, ZGC 也使用 Region 划分堆内存, 但设计更灵活:
+
+[cols="2,3"]
+|===
+| Region 类型 | 说明
+
+| Small Region | 2MB, 存放 < 2MB 的对象
+| Medium Region | 32MB, 存放 >= 2MB 且 < N MB 的对象
+| Large Region | N x 2MB, 存放大对象, 大小动态调整
+|===
+
+每个 Region 独立管理, 不同类型的 Region 可以动态创建和销毁, 避免了 G1 中大对象可能引发的碎片问题.
+
+==== 多映射内存
+
+ZGC 使用多映射 (Multi-Mapping) 技术, 将同一块物理内存映射到多个虚拟地址. 结合着色指针, ZGC 为每种标记状态维护一个虚拟地址映射:
+
+* Marked0 视图
+* Marked1 视图
+* Remapped 视图
+
+这样, ZGC 可以通过简单的地址位操作 (移位) 在不同视图间切换, 无需修改物理内存.
+
+==== NUMA 感知
+
+ZGC 支持 NUMA (Non-Uniform Memory Access) 架构, 优先在本地 NUMA 节点上分配对象内存, 减少跨节点访问延迟. 通过 `-XX:+UseNUMA` 启用.
+
+=== 工作流程
+
+ZGC 的一次 GC 周期包含以下阶段, 除 STW 阶段外全部并发执行:
+
+[plantuml, "ZGC GC周期流程", format=png]
+----
+@startuml
+(*) --> "初始标记\n(STW 1)" as STW1
+STW1 --> "并发标记/重映射\n(Concurrent)" as CM
+CM --> "最终标记\n(STW 2)" as STW2
+STW2 --> "并发准备转移\n(Concurrent)" as CP
+CP --> "初始转移\n(STW 3)" as STW3
+STW3 --> "并发转移\n(Concurrent)" as CR
+CR --> (*)
+@enduml
+----
+
+==== 阶段 1: 初始标记 (STW 1)
+
+. 暂停所有应用线程
+. 从 GC Roots 出发, 标记直接可达的对象
+. 暂停时间极短, 与 GC Roots 数量成正比
+
+==== 阶段 2: 并发标记/重映射
+
+这是最复杂的并发阶段, 包含三个子任务:
+
+===== 并发标记 (Concurrent Mark)
+
+从 GC Roots 出发, 遍历整个对象图, 标记所有存活对象. 标记信息存储在着色指针的 Marked 位中.
+
+===== 并发重映射 (Concurrent Remap)
+
+在标记过程中, 如果遇到 Remapped 位为 0 的引用, 说明该对象在上一轮 GC 中被移动了. 读屏障会自动修正该引用, 这一步是自愈式的.
+
+===== 处理引用 (Reference Processing)
+
+处理 SoftReference, WeakReference, PhantomReference, finalizer 等特殊引用.
+
+==== 阶段 3: 最终标记 (STW 2)
+
+. 暂停所有应用线程
+. 处理并发标记阶段遗漏的少量标记工作
+. 计算每个 Region 的存活对象数据
+
+==== 阶段 4: 并发准备转移
+
+根据各 Region 的存活对象统计, 选择需要转移的 Region:
+
+* 优先转移存活对象少的 Region (性价比高)
+* 计算转移集 (Relocation Set)
+
+==== 阶段 5: 初始转移 (STW 3)
+
+. 暂停所有应用线程
+. 从 GC Roots 出发, 扫描转移集中的对象
+. 确定这些对象的新位置
+
+==== 阶段 6: 并发转移
+
+这是 ZGC 的精华所在:
+
+. 将转移集中的存活对象复制到新的 Region
+. 在旧位置保留**转发表 (Forwarding Table)**, 记录旧地址到新地址的映射
+. 更新引用由**读屏障**自愈完成
+
+当应用线程访问已被移动的对象时:
+
+. 读屏障检测到 Remapped 位为 0
+. 查找转发表, 找到对象的新位置
+. 自愈: 将引用更新为新地址, 设置 Remapped 位为 1
+
+这样, ZGC 不需要像 G1 那样进行全局引用更新, 而是将工作**分摊**到每次读屏障触发中.
+
+=== 分代 ZGC (JDK 21+)
+
+JDK 21 引入了**分代 ZGC (Generational ZGC)**, 进一步提升了吞吐量.
+
+==== 分代设计动机
+
+传统单代 ZGC 将所有对象一视同仁, 每次 GC 周期都要扫描整个堆的存活对象. 但实际应用中:
+
+* 大多数对象是朝生夕死的 (弱分代假说)
+* 少数老对象倾向于长期存活 (强分代假说)
+
+分代 ZGC 将堆分为:
+
+Young Generation (年轻代)::
+  新分配的对象, 使用频繁但生命周期短. GC 频率高, 但单次扫描量少.
+
+Old Generation (老年代)::
+  经过多次 GC 仍存活的对象, 生命周期长. GC 频率低.
+
+==== 跨代引用处理
+
+分代 GC 的难点在于: 老年代对象可能引用年轻代对象, 但只扫描年轻代时无法发现.
+
+ZGC 使用**记忆集 (Remembered Set)** 和 SATB (Snapshot-At-The-Beginning) 写屏障来追踪跨代引用, 确保年轻代 GC 不会遗漏存活对象.
+
+IMPORTANT: 分代 ZGC 在 JDK 21 默认开启, 且不支持关闭. 如需使用传统单代 ZGC, 请使用 JDK 17/20 或更早版本.
+
+=== 配置与调优
+
+==== JVM 参数
+
+[cols="2,3"]
+|===
+| 参数 | 说明
+
+| `-XX:+UseZGC` | 启用 ZGC (JDK 11-14 需加 `-XX:+UnlockExperimentalVMOptions`)
+| `-XX:+ZGenerational` | 启用分代 ZGC (JDK 21+ 默认开启, 不可关闭)
+| `-Xmx` | 设置最大堆大小, ZGC 推荐预留足够的堆空间
+| `-XX:ConcGCThreads` | 并发 GC 线程数, 默认约为 CPU 核数的 12.5%
+| `-XX:ZCollectionInterval` | 设置两次 GC 之间的最短间隔 (秒), 0 表示不限制
+| `-XX:ZAllocationSpikeTolerance` | 分配尖峰容忍度, 默认 2.0
+|===
+
+==== 推荐配置
+
+. **大内存场景 ( > 16GB):** ZGC 的天然优势. 堆越大, ZGC 相对其他 GC 的优势越明显
+
+. **低延迟要求 ( < 1ms pause):** ZGC 是首选, 适合金融交易, 实时系统等
+
+. **NUMA 环境:** 配合 `-XX:+UseNUMA` 获得更好的局部性
+
+. **避免过高分配速率:** ZGC 虽然暂停时间短, 但高分配速率可能导致频繁 GC, 影响吞吐量
+
+==== 常见误区
+
+不要与指针压缩混用::
+  ZGC 不支持压缩普通对象指针 (Compressed OOPs), 因为着色指针需要使用指针高位. JDK 21+ 支持压缩类指针.
+
+不要在小堆上使用::
+  堆 < 4GB 时, G1 或 Parallel GC 可能提供更好的综合性能.
+
+不要禁分代 ZGC (JDK 21+)::
+  JDK 21 起分代 ZGC 是唯一模式, 且性能优于单代版本.
+
+=== 总结
+
+ZGC 通过**着色指针 + 读屏障**的巧妙设计, 实现了亚毫秒级的 GC 暂停时间:
+
+* 着色指针将元数据嵌入指针中, 避免了额外的元数据存储开销
+* 读屏障以自愈方式分摊引用更新的成本, 避免了全局 STW 引用更新
+* 并发转移 + 转发表机制实现了无 STW 的对象移动
+* 分代设计 (JDK 21+) 进一步提升了吞吐量
+
+ZGC 代表了现代 GC 的发展方向: 以极低的暂停时间为目标, 让 GC 不再成为 Java 应用延迟的瓶颈. 对于追求低延迟的大内存应用, ZGC 是当前最优选择.

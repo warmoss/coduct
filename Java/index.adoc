@@ -21,4 +21,3 @@ include::PageToken讲解.adoc[]
 include::银行家舍入法讲解.adoc[]
 
 include::Apache Commons Math 讲解.adoc[]
-

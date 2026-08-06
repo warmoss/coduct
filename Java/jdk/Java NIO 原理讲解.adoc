@@ -1,1 +1,556 @@
 == Java NIO 原理讲解
+
+=== 引言
+
+在传统的 Java BIO(Blocking I/O)模型中, 每个网络连接都需要独占一个线程, 当连接数增长到数千甚至数万时, 线程的上下文切换和内存开销会成为系统瓶颈. Java NIO(New I/O, 也称 Non-blocking I/O)从 JDK 1.4 开始引入, 提供了**面向缓冲区的、非阻塞的 I/O 操作**, 通过少量线程即可管理海量连接, 是高并发网络编程的基石.
+
+与 BIO 的流式模型不同, NIO 引入了三个核心组件: **Buffer**(缓冲区)、**Channel**(通道)和 **Selector**(选择器), 三者协同实现了 I/O 多路复用. 本文逐一剖析各组件的原理、内部实现和使用要点.
+
+=== 核心概念
+
+在深入原理之前, 先明确 NIO 中最重要的三个概念:
+
+Buffer(缓冲区):: NIO 中数据读写的载体, 本质上是一块可以写入和读取数据的内存区域. 与 BIO 的 `Stream` 单向流动不同, Buffer 可以**双向读写**, 并且提供了一组指针(position/limit/capacity)精确控制数据的存取位置.
+
+Channel(通道):: 代表与 I/O 设备(文件、Socket)之间的**双向连接**, 数据通过 Channel 在 Buffer 和 I/O 设备之间传输. Channel 本身不存储数据, 只负责传输.
+
+Selector(选择器):: NIO 实现**多路复用**的核心, 允许单个线程监听多个 Channel 的 I/O 事件(连接、读就绪、写就绪), 实现一个线程管理多个连接.
+
+[plantuml, "NIO 核心组件关系", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title NIO 核心组件关系
+
+rectangle "应用程序线程" as Thread #F5F5DC
+rectangle "Selector" as Selector #87CEEB
+rectangle "Channel A" as ChA #90EE90
+rectangle "Channel B" as ChB #90EE90
+rectangle "Channel C" as ChC #90EE90
+rectangle "Buffer" as Buf #FFDAB9
+
+Thread -down-> Selector : select()
+Selector -down-> ChA : 就绪事件
+Selector -down-> ChB : 就绪事件
+Selector -down-> ChC : 就绪事件
+ChA -right-> Buf : read/write
+ChB -right-> Buf : read/write
+ChC -right-> Buf : read/write
+Buf -up-> Thread : 处理数据
+@enduml
+----
+
+=== 核心原理
+
+==== Buffer 原理
+
+===== 内部结构
+
+Buffer 是 NIO 中最基础的数据容器, 所有数据都需要先写入 Buffer 再通过 Channel 发送, 或从 Channel 读取到 Buffer 再处理. Buffer 内部维护了三个核心指针:
+
+* **capacity**: Buffer 的总容量, 创建时确定, 不可变
+* **position**: 当前读写位置, 初始为 0, 读/写一个元素后向后移动
+* **limit**: 可读/可写的上限位置, 写模式下等于 capacity, 读模式下等于之前写入的数据量
+
+[plantuml, "Buffer 内部指针变化", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title Buffer 的 position/limit/capacity 变化
+
+rectangle "写模式 (初始)" as W1 {
+    (pos=0, lim=8, cap=8)
+}
+
+rectangle "写入 3 字节后" as W2 {
+    (pos=3, lim=8, cap=8)
+}
+
+rectangle "flip() 切换到读模式" as R1 {
+    (pos=0, lim=3, cap=8)
+}
+
+rectangle "读取 2 字节后" as R2 {
+    (pos=2, lim=3, cap=8)
+}
+
+rectangle "compact() 压缩后" as C1 {
+    (pos=1, lim=8, cap=8)
+}
+
+W1 --> W2 : write
+W2 --> R1 : flip()
+R1 --> R2 : read
+R2 --> C1 : compact()
+@enduml
+----
+
+===== 关键操作
+
+[cols="1,1"]
+|===
+| 方法 | 作用
+
+| `flip()`
+| 从**写模式切换到读模式**, limit 设为当前 position, position 归零
+
+| `clear()`
+| 从读模式切换到写模式, position 归零, limit 设为 capacity(数据并未清除, 只是标记可覆盖)
+
+| `rewind()`
+| 在读模式下重置 position 为 0, limit 不变, 允许**重复读取**
+
+| `compact()`
+| 将未读数据移到 Buffer 头部, position 指向未读数据末尾, limit 设为 capacity, 准备继续写入(未读数据不会丢失)
+
+| `mark()` + `reset()`
+| mark 记录当前 position, reset 恢复到标记位置
+|===
+
+===== DirectBuffer 与 HeapBuffer
+
+Java NIO 提供了两种内存分配方式, 这是理解 NIO 性能的关键:
+
+[cols="1,1,1"]
+|===
+| 特性 | HeapByteBuffer | DirectByteBuffer
+
+| 内存位置
+| JVM 堆内存
+| 堆外内存(直接内存)
+
+| 分配效率
+| 高(直接分配到堆)
+| 较低(需调用 `Unsafe.allocateMemory()` 系统调用)
+
+| 读写效率
+| 较低(需要经过堆内存和堆外内存的拷贝才能进行 I/O)
+| 高(I/O 操作时可直接传递给操作系统, 零拷贝)
+
+| GC 影响
+| 受 GC 管理, 可能因 GC 停顿受到影响
+| 不受 GC 直接管理, 但通过 `Cleaner` 回收, 大量分配可能触发 OOM
+|===
+
+DirectByteBuffer 的高效来源于: 进行 I/O 操作时, 操作系统可以直接访问堆外内存中的数据进行 DMA(Direct Memory Access)传输, 无需 JVM 层面的额外拷贝. 但对于小数据量的频繁操作, HeapByteBuffer 的分配效率更高.
+
+WARNING: DirectByteBuffer 不受 JVM 堆大小限制, 但受**操作系统物理内存和 `-XX:MaxDirectMemorySize` 参数**约束. 频繁分配和释放 DirectByteBuffer 可能导致堆外内存泄漏, 建议使用**池化**复用.
+
+===== 核心 Buffer 实现类
+
+每个基本类型(除 boolean)都有对应的 Buffer 实现, 最常用的是 `ByteBuffer`:
+
+[cols="1,1"]
+|===
+| 类型 | 说明
+
+| `ByteBuffer`
+| 字节缓冲区, 最常用, 所有 I/O 操作底层都基于字节
+
+| `CharBuffer`
+| 字符缓冲区, 常用于文本处理
+
+| `ShortBuffer` / `IntBuffer` / `LongBuffer`
+| 短整型/整型/长整型缓冲区
+
+| `FloatBuffer` / `DoubleBuffer`
+| 浮点/双精度浮点缓冲区
+|===
+
+特别注意: `ByteBuffer` 支持通过 `asCharBuffer()`、`asIntBuffer()` 等方法转换为视图缓冲区, 转换后的缓冲区与原缓冲区**共享同一块内存**, 适合处理二进制协议中不同数据类型的混合读写.
+
+==== Channel 原理
+
+===== Channel 体系
+
+Channel 是 NIO 中连接 I/O 服务的管道, 所有 I/O 操作都通过 Channel 进行. Java NIO 的 Channel 体系如下:
+
+[plantuml, "Channel 继承体系", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title Channel 继承体系
+
+interface Channel {
+    + close()
+    + isOpen()
+}
+
+interface ReadableByteChannel {
+    + read(ByteBuffer)
+}
+
+interface WritableByteChannel {
+    + write(ByteBuffer)
+}
+
+interface ByteChannel
+
+interface InterruptibleChannel
+
+abstract AbstractInterruptibleChannel
+
+Channel <|-- InterruptibleChannel
+Channel <|-- ReadableByteChannel
+Channel <|-- WritableByteChannel
+ReadableByteChannel <|-- ByteChannel
+WritableByteChannel <|-- ByteChannel
+InterruptibleChannel <|-- AbstractInterruptibleChannel
+ByteChannel <|-- FileChannel : extends
+ByteChannel <|-- SocketChannel : extends
+ByteChannel <|-- ServerSocketChannel : "通过 accept() 创建"
+ByteChannel <|-- DatagramChannel : extends
+AbstractInterruptibleChannel <|-- FileChannel
+AbstractInterruptibleChannel <|-- SelectableChannel
+SelectableChannel <|-- SocketChannel
+SelectableChannel <|-- ServerSocketChannel
+SelectableChannel <|-- DatagramChannel
+@enduml
+----
+
+===== 核心 Channel 实现
+
+[cols="1,1"]
+|===
+| Channel 类型 | 用途
+
+| `FileChannel`
+| 文件 I/O, 支持文件的随机访问、截断、映射, 支持 `transferTo`/`transferFrom` 零拷贝
+
+| `SocketChannel`
+| TCP 客户端, 可配置为非阻塞模式, 通过 Selector 管理
+
+| `ServerSocketChannel`
+| TCP 服务端, 监听端口, `accept()` 返回 `SocketChannel`
+
+| `DatagramChannel`
+| UDP 通信, 可配置为非阻塞模式
+|===
+
+===== 非阻塞模式的本质
+
+Channel 的非阻塞行为通过 `configureBlocking(false)` 开启. 非阻塞模式下:
+
+* `ServerSocketChannel.accept()`: 无新连接时立即返回 `null`, 不会阻塞
+* `SocketChannel.read()`: 无数据可读时立即返回 0, 不会阻塞
+* `SocketChannel.write()`: 写入部分数据后返回实际写入字节数, 不会等待网络传输完成
+
+[BIO 与 NIO 的阻塞行为对比以及模型演进, 请参见 <<../Java/jdk/Java AIO 原理讲解.adoc#, Java AIO 原理讲解>>中的对比分析. ]
+
+==== Selector 原理
+
+===== 多路复用核心
+
+Selector 是 NIO 多路复用的核心, 允许单个线程同时监听多个 Channel 的事件. 其本质是对操作系统 I/O 多路复用机制(select/poll/epoll/kqueue)的封装.
+
+Selector 的工作流程:
+
+. 向 Selector **注册** Channel 及感兴趣的 I/O 事件类型
+. 调用 `select()` **阻塞等待**, 直到至少一个注册的 Channel 有就绪事件
+. 获取**就绪的 SelectionKey 集合**, 遍历处理
+
+[source,java]
+----
+Selector selector = Selector.open();                          // <1>
+ServerSocketChannel serverChannel = ServerSocketChannel.open();
+serverChannel.configureBlocking(false);                      // <2>
+serverChannel.register(selector, SelectionKey.OP_ACCEPT);    // <3>
+
+while (true) {
+    int readyChannels = selector.select();                   // <4>
+    if (readyChannels == 0) continue;
+
+    Set<SelectionKey> keys = selector.selectedKeys();        // <5>
+    Iterator<SelectionKey> iter = keys.iterator();
+    while (iter.hasNext()) {
+        SelectionKey key = iter.next();
+        if (key.isAcceptable()) {                            // <6>
+            // 处理新连接
+        } else if (key.isReadable()) {
+            // 处理读事件
+        } else if (key.isWritable()) {
+            // 处理写事件
+        }
+        iter.remove();                                       // <7>
+    }
+}
+----
+<1> 打开 Selector
+<2> 设置为非阻塞模式(必须)
+<3> 注册到 Selector, 监听 OP_ACCEPT 事件
+<4> 阻塞等待至少一个 Channel 就绪
+<5> 获取就绪的 SelectionKey 集合
+<6> 检测事件类型并处理
+<7> 处理完毕后必须手动从集合中移除, 避免重复处理
+
+===== SelectionKey 与事件类型
+
+`SelectionKey` 表示一个 Channel 在 Selector 上的注册关系, 包含四个核心属性:
+
+[cols="1,1,1"]
+|===
+| 事件常量 | 含义 | 触发条件
+
+| `OP_ACCEPT`
+| 接受连接就绪
+| `ServerSocketChannel` 有新连接到达
+
+| `OP_CONNECT`
+| 连接建立就绪
+| `SocketChannel` 连接到服务端完成
+
+| `OP_READ`
+| 读就绪
+| Channel 缓冲区中有数据可读
+
+| `OP_WRITE`
+| 写就绪
+| Channel 的发送缓冲区有空间可写
+|===
+
+[WARNING]
+====
+`OP_WRITE` 的触发机制容易引发问题. 只要发送缓冲区有空间, `OP_WRITE` 就会**持续就绪**, 导致 `select()` 几乎不阻塞, CPU 空转.
+
+最佳实践:
+* 默认不注册 `OP_WRITE`, 只在需要写时临时注册
+* 数据写完立即取消 `OP_WRITE` 监听
+====
+
+===== 底层多路复用实现
+
+Java NIO 的 Selector 在不同操作系统上的底层实现不同:
+
+* **Linux (2.6+)**: 使用 **epoll**, 基于事件驱动, 时间复杂度 O(1), 支持成千上万的并发连接
+* **macOS / FreeBSD**: 使用 **kqueue**, 与 epoll 类似的事件通知机制
+* **Windows**: 使用 **select** 简单封装, 性能较差
+* **Linux (旧版本)**: 使用 **poll**, 轮询方式, 时间复杂度 O(n)
+
+[plantuml, "Selector 与 epoll 交互流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title Selector 与 epoll 交互流程
+
+participant "应用程序" as App
+participant "Selector" as Sel
+participant "EPollSelectorImpl" as EPoll
+participant "操作系统 epoll" as OS
+
+App -> Sel: select()
+Sel -> EPoll: doSelect()
+EPoll -> OS: epoll_wait()
+OS --> EPoll: 返回就绪事件列表
+EPoll -> EPoll: 更新 selectedKeys
+EPoll --> Sel: 就绪数量
+Sel --> App: 返回就绪 Channel 数
+App -> Sel: selectedKeys()
+loop 遍历就绪事件
+    App -> App: 处理 isAcceptable/isReadable/isWritable
+end
+@enduml
+----
+
+==== 零拷贝原理
+
+NIO 最重要的性能特性之一是**零拷贝(Zero Copy)**, 通过 `FileChannel.transferTo()` 和 `FileChannel.transferFrom()` 方法实现.
+
+===== 传统文件传输 vs 零拷贝
+
+传统方式传输文件需要经过 **4 次拷贝**和 **4 次上下文切换**:
+
+[plantuml, "传统文件传输路径", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title 传统文件传输(read + write)
+
+rectangle "磁盘" as Disk
+rectangle "内核缓冲区" as KBuf #FFB6C1
+rectangle "用户缓冲区" as UBuf #87CEEB
+rectangle "Socket 缓冲区" as SBuf #90EE90
+
+Disk -> KBuf : DMA 拷贝(1)
+KBuf -> UBuf : CPU 拷贝(2)
+UBuf -> SBuf : CPU 拷贝(3)
+SBuf -> KBuf : DMA 拷贝(4) 发送
+
+note right of UBuf
+  共: 4 次拷贝
+  2 次 CPU 拷贝
+  2 次 DMA 拷贝
+  4 次上下文切换
+end note
+@enduml
+----
+
+使用 `transferTo()` 零拷贝后, 仅需 **2 次 DMA 拷贝**和 **2 次上下文切换**:
+
+[plantuml, "零拷贝传输路径", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title 零拷贝(transferTo)
+
+rectangle "磁盘" as Disk
+rectangle "内核缓冲区" as KBuf #FFB6C1
+rectangle "Socket 缓冲区" as SBuf #90EE90
+
+Disk -> KBuf : DMA 拷贝(1)
+KBuf -> SBuf : DMA 拷贝(2, 零拷贝)
+note right of SBuf
+  Linux 2.4+ 支持
+  sendfile 系统调用
+  数据不经过用户空间
+end note
+@enduml
+----
+
+核心原理: `transferTo()` 底层调用 Linux 的 `sendfile()` 系统调用, 数据直接从内核缓冲区传输到 Socket 缓冲区, **不经过用户空间**, 避免了用户态和内核态之间的数据拷贝和模式切换.
+
+===== MappedByteBuffer 内存映射
+
+`FileChannel.map()` 返回的 `MappedByteBuffer` 将文件的一部分直接**映射到虚拟内存**, 对 `MappedByteBuffer` 的读写直接作用于文件, 无需显式的 read/write 调用. 适用于大文件的随机访问场景.
+
+[source,java]
+----
+try (RandomAccessFile file = new RandomAccessFile("data.bin", "rw");
+     FileChannel channel = file.getChannel()) {
+
+    // 映射文件的前 1MB 到内存
+    MappedByteBuffer mappedBuf = channel.map(
+        FileChannel.MapMode.READ_WRITE, 0, 1024 * 1024);
+    mappedBuf.putInt(42);  // 直接写入映射区域, 无需 channel.write()
+}
+----
+
+IMPORTANT: `MappedByteBuffer` 的释放不受 GC 控制, 需要依赖 `Cleaner` 或手动调用 `((DirectBuffer) buf).cleaner().clean()` 来释放映射.
+
+=== 完整示例: NIO Echo 服务器
+
+以下示例展示了一个完整的单线程 NIO Echo 服务器:
+
+[source,java]
+----
+public class NioEchoServer {
+    public static void main(String[] args) throws Exception {
+        Selector selector = Selector.open();
+        ServerSocketChannel serverChannel = ServerSocketChannel.open();
+        serverChannel.bind(new InetSocketAddress(8080));
+        serverChannel.configureBlocking(false);
+        serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+
+        ByteBuffer buffer = ByteBuffer.allocate(1024);
+
+        while (true) {
+            selector.select();
+            Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
+            while (iter.hasNext()) {
+                SelectionKey key = iter.next();
+                iter.remove();
+
+                if (key.isAcceptable()) {
+                    // 接受新连接
+                    ServerSocketChannel ssc = (ServerSocketChannel) key.channel();
+                    SocketChannel clientChannel = ssc.accept();
+                    clientChannel.configureBlocking(false);
+                    clientChannel.register(selector, SelectionKey.OP_READ);
+                    System.out.println("新连接: " + clientChannel.getRemoteAddress());
+                } else if (key.isReadable()) {
+                    // 读取数据并回写
+                    SocketChannel clientChannel = (SocketChannel) key.channel();
+                    buffer.clear();
+                    int read = clientChannel.read(buffer);
+                    if (read == -1) {
+                        // 连接关闭
+                        clientChannel.close();
+                        continue;
+                    }
+                    buffer.flip();
+                    clientChannel.write(buffer);  // Echo 回写
+                }
+            }
+        }
+    }
+}
+----
+
+关键要点:
+
+* 所有 Channel 必须设置为**非阻塞模式**才能注册到 Selector
+* `iter.remove()` 必须调用, 否则已处理的事件会重复触发
+* `read() == -1` 表示对方关闭连接, 需要关闭本地 Channel
+* 生产环境建议使用 **线程池**处理业务逻辑, 避免单个耗时操作阻塞整个 Selector 循环
+
+=== Reactor 模式与 Netty
+
+NIO 的直接 API 使用复杂且容易出错, Netty 在 NIO 之上封装了 **Reactor 模式**, 将事件分发和业务处理解耦:
+
+[cols="1,1,1,1"]
+|===
+| 模式 | 说明 | Reactor 线程数 | 工作线程数
+
+| 单 Reactor 单线程
+| Reactor 线程同时负责 accept、read、write、业务处理
+| 1
+| 0(同一线程)
+
+| 单 Reactor 多线程
+| Reactor 线程负责 I/O 事件分发, 业务处理交给线程池
+| 1
+| N
+
+| 主从 Reactor 多线程
+| MainReactor 处理 accept, SubReactor 处理 read/write, 业务交给线程池(Netty 默认)
+| 1 + N
+| M
+|===
+
+[plantuml, "主从 Reactor 模式", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+title 主从 Reactor 模式 (Netty 默认)
+
+rectangle "MainReactor\n(处理连接)" as Main #FFB6C1
+rectangle "SubReactor-1\n(处理 I/O)" as Sub1 #87CEEB
+rectangle "SubReactor-2\n(处理 I/O)" as Sub2 #87CEEB
+rectangle "线程池\n(业务处理)" as Pool #90EE90
+
+Main -> Sub1 : 分配连接
+Main -> Sub2 : 分配连接
+Sub1 -> Pool : 提交业务任务
+Sub2 -> Pool : 提交业务任务
+@enduml
+----
+
+Netty 对 NIO 的关键优化还包括:
+
+* **对象池化**: Buffer、Channel 等通过池化减少 GC 压力
+* **零拷贝**: 内部使用 `CompositeByteBuf` 合并多个 Buffer, 文件和网络传输使用 `FileRegion` 零拷贝
+* **Pipeline**: 责任链模式处理 I/O 事件, 支持灵活的编解码器组合
+
+=== 总结
+
+NIO 的核心价值在于**用少量线程管理大量连接**, 其关键设计要点:
+
+* **Buffer**: 面向缓冲区的双向数据容器, DirectBuffer 适合 I/O 频繁场景, HeapBuffer 适合小数据处理
+* **Channel**: 双向 I/O 通道, 非阻塞模式下读写立即返回
+* **Selector**: 基于操作系统多路复用(epoll/kqueue)的事件分发器, 一个线程监听多个 Channel
+* **零拷贝**: `transferTo`/`transferFrom` 避免用户态数据拷贝, 大幅提升文件传输性能
+
+常见误区:
+
+* `OP_WRITE` 默认不应注册, 避免 CPU 空转
+* `selectedKeys` 集合中的 Key 处理完必须手动 `remove()`
+* DirectByteBuffer 虽高效, 但分配和回收成本高, 大量使用需配合池化
+* 非阻塞模式下 `read()` 可能一次读不完完整消息, 需要处理**半包/粘包**问题(通常由 Netty 等框架解决)
+
+CAUTION: 在生产环境中, 直接使用 NIO API 开发建议使用 **Netty**. 它解决了 NIO 实际应用中的 epoll 空轮询 bug、半包粘包、连接管理、资源释放等诸多复杂问题, 是业界标准的高性能网络通信框架.
