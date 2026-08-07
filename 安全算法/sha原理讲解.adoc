@@ -1,0 +1,254 @@
+[[sha-overview]]
+== SHA原理讲解
+
+=== 什么是SHA
+
+定义::
+SHA(Secure Hash Algorithm, 安全哈希算法)是由美国国家安全局(NSA)设计、NIST发布的一系列**密码学哈希函数**. 它用于将任意长度的输入数据转换为固定长度的**哈希值(hash value)**, 也称为**消息摘要(message digest)**.
+
+本质::
+SHA 是一种**单向函数**, 从哈希值几乎不可能逆向推导出原始数据. 即使输入仅改动一个比特, 输出的哈希值也会产生天翻地覆的变化, 这一特性称为**雪崩效应(avalanche effect)**.
+
+核心用途::
+* **完整性校验**: 验证文件或消息在传输/存储过程中是否被篡改
+* **数字签名**: 作为签名算法的输入, 先生成摘要再签名
+* **密码存储**: 结合 salt 存储用户密码的哈希值(通常使用专用算法如 bcrypt, 但 SHA 是底层基础)
+* **区块链**: 比特币使用 SHA-256 作为工作量证明和交易链的核心算法
+* **证书与 TLS**: X.509 证书签名、TLS 握手过程中的 HMAC 均依赖 SHA
+
+=== SHA 算法家族
+
+SHA 算法经历了三代演进:
+
+[cols="1,1,1,3"]
+|===
+| 算法 | 输出长度(bit) | 状态 | 说明
+
+| SHA-0 | 160 | 已废弃 | 1993年发布, 很快因安全缺陷被撤回
+| SHA-1 | 160 | 不推荐 | 1995年发布, 2017年首次实现碰撞攻击(SHAttered), 已不被信任
+| SHA-2 | 224/256/384/512 | 推荐 | 目前主流, 包含 SHA-224、SHA-256、SHA-384、SHA-512
+| SHA-3 | 任意(224/256/384/512) | 推荐 | 2015年发布, 基于 Keccak 算法, 结构与 SHA-2 完全不同
+|===
+
+[IMPORTANT]
+====
+**SHA-1 已不安全**, 自 2017 年起所有主流浏览器和 CA 已停止信任 SHA-1 证书. 新项目应使用 SHA-2(至少 SHA-256) 或 SHA-3.
+====
+
+=== 密码学哈希的核心特性
+
+抗碰撞性::
+**碰撞(collision)** 指两个不同的输入产生相同的哈希值. SHA 的设计确保在计算上不可能**有意**找到碰撞.
+
+抗原像性(Pre-image Resistance)::
+给定一个哈希值 stem:[h], 在计算上不可能找到满足 stem:[H(m) = h] 的原始消息 stem:[m]. 这就是"单向"的含义.
+
+抗第二原像性(Second Pre-image Resistance)::
+给定一个消息 stem:[m_1] 及其哈希值 stem:[H(m_1)], 在计算上不可能找到另一个不同的消息 stem:[m_2] 使得 stem:[H(m_1) = H(m_2)].
+
+[NOTE]
+这三个特性是密码学哈希函数的**安全基石**. MD5 和 SHA-1 的抗碰撞性已被攻破, 因此不再被视为安全.
+
+雪崩效应::
+输入中的任意一位变化, 都会导致输出中约 **50% 的位**发生变化. 这意味着输出与输入之间没有可预测的关联性.
+
+=== SHA-256 工作原理
+
+SHA-2 系列中最常用的是 **SHA-256**(输出 256 位), 以下以其为例说明工作流程.
+
+==== 整体流程
+
+[plantuml, "SHA-256 处理流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam ActivityBackgroundColor #E8F0FE
+skinparam ActivityBorderColor #1B4F72
+
+start
+:输入消息 M;
+:填充(Padding);
+note right: 使消息长度 = 448 (mod 512)
+:附加原始长度;
+note right: 64 位大端序整数
+:分割为 512 位消息块;
+
+partition "对每个 512 位块" {
+  :初始化 8 个工作变量;
+  :消息调度\n(扩展为 64 个 32 位字);
+  :64 轮压缩函数;
+  :更新哈希值;
+}
+
+:输出 256 位摘要;
+stop
+@enduml
+----
+
+==== 消息预处理
+
+. **填充(Padding)**: 在原始消息后追加 1 个 `1` 位, 然后补 `0` 直至 `(消息长度 + 64) ≡ 0 (mod 512)`. 换言之, 填充后总长度 ≡ 448 (mod 512).
+
+. **附加长度**: 在填充末尾追加原始消息的 64 位长度值(大端序). 最终消息长度是 512 位的整数倍.
+
+[source,plaintext]
+----
+原始消息: "abc" (24 bits)
+填充: 1 bit "1" + 423 bits "0" = 448 bits
+附加长度: 64 bits (值为 24)
+总长度: 512 bits (1 个消息块)
+----
+
+==== 初始化哈希值
+
+SHA-256 使用 8 个 32 位初始哈希值 stem:[H_0^{(0)}] 到 stem:[H_7^{(0)}], 这些值取自前 8 个素数(2, 3, 5, 7, 11, 13, 17, 19)平方根小数部分的前 32 位:
+
+[source,plaintext]
+----
+H0 = 0x6a09e667
+H1 = 0xbb67ae85
+H2 = 0x3c6ef372
+H3 = 0xa54ff53a
+H4 = 0x510e527f
+H5 = 0x9b05688c
+H6 = 0x1f83d9ab
+H7 = 0x5be0cd19
+----
+
+==== 消息调度(Message Schedule)
+
+将 512 位(16 个 32 位字)的消息块 stem:[M] 扩展为 64 个 32 位字 stem:[W_0, W_1, ..., W_{63}]:
+
+* 前 16 个字 stem:[W_0, ..., W_{15}] 直接取自消息块
+* 后续 48 个字 stem:[W_{16}, ..., W_{63}] 通过以下公式递推:
+
+stem:[W_t = \sigma_1(W_{t-2}) + W_{t-7} + \sigma_0(W_{t-15}) + W_{t-16}]
+
+其中 stem:[\sigma_0] 和 stem:[\sigma_1] 是涉及循环右移和异或的混合函数.
+
+==== 压缩函数(64 轮迭代)
+
+每一轮使用 8 个 32 位工作变量 `a, b, c, d, e, f, g, h`, 初始化为上一轮的哈希值(或初始哈希值).
+
+每轮执行:
+
+[source,plaintext]
+----
+T1 = h + Σ1(e) + Ch(e, f, g) + K[t] + W[t]
+T2 = Σ0(a) + Maj(a, b, c)
+h = g
+g = f
+f = e
+e = d + T1
+d = c
+c = b
+b = a
+a = T1 + T2
+----
+
+其中涉及的函数:
+
+* stem:[Ch(x, y, z) = (x \land y) \oplus (\lnot x \land z)] — 选择函数
+* stem:[Maj(x, y, z) = (x \land y) \oplus (x \land z) \oplus (y \land z)] — 多数函数
+* stem:[\Sigma_0(x)] 和 stem:[\Sigma_1(x)] — 循环右移组合
+* stem:[K_t] — 64 个轮常量, 取自前 64 个素数立方根小数部分的前 32 位
+
+.64 轮之后
+64 轮结束后, 将 8 个工作变量与当前哈希值相加, 得到新的中间哈希值. 所有消息块处理完毕后, 将 8 个哈希值拼接即为最终的 256 位摘要.
+
+==== Java 代码示例
+
+[source,java]
+----
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+
+public class SHA256Example {
+    public static String sha256(String input) throws NoSuchAlgorithmException {
+        MessageDigest md = MessageDigest.getInstance("SHA-256"); // <1>
+        byte[] hashBytes = md.digest(input.getBytes());           // <2>
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : hashBytes) {
+            hexString.append(String.format("%02x", b));           // <3>
+        }
+        return hexString.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println(sha256("hello"));  // <4>
+    }
+}
+----
+<1> 获取 SHA-256 消息摘要实例
+<2> 计算哈希值, 返回 32 字节数组
+<3> 将每个字节转换为两位十六进制字符串
+<4> 输出: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+
+=== SHA-3 简介
+
+SHA-3 基于 **Keccak** 算法, 采用完全不同于 SHA-2 的 **海绵结构(sponge construction)**:
+
+[plantuml, "海绵结构示意", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+
+rectangle "消息块 M_i" as msg
+rectangle "内部状态" as state
+rectangle "输出 Z_j" as out
+
+msg -> state : 吸收(Absorb)
+state -> out : 挤压(Squeeze)
+@enduml
+----
+
+海绵结构分为两个阶段:
+
+. **吸收阶段(Absorbing)**: 将填充后的消息分成固定大小的块, 每块与内部状态的速率部分(r)进行 XOR, 然后对整个状态应用置换函数 stem:[f].
+
+. **挤压阶段(Squeezing)**: 反复应用置换函数 stem:[f], 每次从速率部分提取输出块, 直到获得所需长度的摘要.
+
+SHA-3 的优势::
+* 结构与 SHA-2 完全不同, 即使 SHA-2 被发现弱点也不影响 SHA-3
+* 可输出任意长度哈希值, 灵活适应不同场景
+* 海绵结构提供了可证明的安全边界
+
+=== SHA 系列对比
+
+[cols="1,2,2,2,2"]
+|===
+| 特性 | SHA-1 | SHA-256 | SHA-512 | SHA-3-256
+
+| 输出长度(bit) | 160 | 256 | 512 | 256
+| 内部状态(bit) | 160 | 256 | 512 | 1600
+| 消息块大小(bit) | 512 | 512 | 1024 | 1088(r)
+| 轮数 | 80 | 64 | 80 | 24
+| 安全性(bit) | < 80(已攻破) | 128 | 256 | 128
+| 速度 | 快 | 中等 | 慢(64位优化) | 中等
+| 推荐使用 | 否 | 是 | 是 | 是
+|===
+
+=== 最佳实践
+
+. **新项目使用 SHA-256 或 SHA-3**: 默认选择 SHA-256, 如需额外安全冗余或 64 位平台高性能, 可选 SHA-512.
+
+. **密码哈希不要直接用 SHA**: 使用 bcrypt、Argon2 或 PBKDF2, 这些算法内置 salt 和迭代成本因子, 专门应对暴力破解.
+
+. **HMAC 用于消息认证**: SHA 本身只保证完整性, 不保证来源真实性. 结合密钥使用 HMAC-SHA256 可实现消息认证.
+
+. **避免截断哈希值**: 即使需要短哈希, 也不要手动截断(如取 SHA-256 前 128 位), 应使用 SHA-224 等标准变体.
+
+. **校验和场景可用非密码学哈希**: 若仅需检测偶然错误(非恶意篡改), 使用 CRC32 或 xxHash 性能更优.
+
+[WARNING]
+====
+SHA-1 和 MD5 已被攻破, **禁止**用于任何安全敏感的场景. 如果维护遗留系统使用了这些算法, 应尽快迁移至 SHA-256 或更高版本.
+====
+
+=== 总结
+
+* SHA 是密码学哈希算法的工业标准, 提供数据完整性的数学保证
+* SHA-2(尤其是 SHA-256) 是当前最广泛使用的安全哈希算法
+* SHA-3 基于全新的海绵结构, 作为 SHA-2 的备选方案
+* 哈希算法是数字签名、证书、区块链和安全通信的基石
+* 选择哈希算法时需区分**密码学安全**(防篡改)和**非密码学用途**(仅防偶然错误)

@@ -6,7 +6,7 @@ include::rsa讲解.adoc[]
 
 include::hmac讲解.adoc[]
 
-include::SHA算法原理讲解.adoc[]
+include::sha原理讲解.adoc[]
 
 include::bcrypt原理讲解.adoc[]
 
