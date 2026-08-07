@@ -1,0 +1,529 @@
+[[mybatis-cache]]
+== MyBatis多级缓存原理讲解
+
+MyBatis 提供了两级缓存机制来减少数据库访问压力, 提升查询性能. 本文从源码层面深入解析一级缓存和二级缓存的工作原理、生命周期、失效策略以及如何整合第三方缓存.
+
+[[mybatis-cache-overview]]
+=== 缓存体系概述
+
+MyBatis 的缓存体系分为两层:
+
+Local Cache (一级缓存):: SqlSession 级别, 默认开启, 无法关闭, 生命周期与 SqlSession 一致.
+Second Level Cache (二级缓存):: Mapper 命名空间级别, 默认关闭, 需显式配置开启, 可跨 SqlSession 共享.
+
+两级缓存的工作顺序为: **二级缓存 → 一级缓存 → 数据库**. 查询时优先查找二级缓存, 未命中则查一级缓存, 仍未命中才访问数据库.
+
+[[mybatis-cache-interface]]
+=== 缓存接口设计
+
+MyBatis 通过 `org.apache.ibatis.cache.Cache` 接口抽象所有缓存实现. 该接口定义了缓存的基本操作:
+
+[source,java]
+----
+public interface Cache {
+    String getId();                          // <1>
+    void putObject(Object key, Object value); // <2>
+    Object getObject(Object key);            // <3>
+    Object removeObject(Object key);         // <4>
+    void clear();                            // <5>
+    int getSize();                           // <6>
+}
+----
+<1> 获取缓存唯一标识(通常为 Mapper 命名空间)
+<2> 存入缓存
+<3> 从缓存获取
+<4> 移除指定缓存项
+<5> 清空全部缓存
+<6> 获取缓存项数量
+
+MyBatis 内置了多种 `Cache` 接口实现, 通过装饰器模式组合使用:
+
+[cols="1,3"]
+|===
+| 实现类 | 说明
+
+| `PerpetualCache`
+| 基础缓存实现, 内部使用 `HashMap` 存储, 永不过期
+
+| `LruCache`
+| LRU (最近最少使用) 淘汰策略, 基于 `LinkedHashMap`
+
+| `FifoCache`
+| FIFO (先进先出) 淘汰策略, 基于 `Deque`
+
+| `SoftCache`
+| 软引用缓存, JVM 内存不足时由 GC 回收
+
+| `WeakCache`
+| 弱引用缓存, 每次 GC 时回收
+
+| `BlockingCache`
+| 阻塞缓存, 防止缓存击穿(同一 Key 并发查询时阻塞等待)
+
+| `ScheduledCache`
+| 定时清空缓存
+
+| `SerializedCache`
+| 序列化缓存, 读取时反序列化(强制要求值实现 `Serializable`)
+
+| `TransactionalCache`
+| 事务缓存, 用于二级缓存的事务支持(提交时刷新, 回滚时丢弃)
+
+| `SynchronizedCache`
+| 同步缓存, 对读写操作加 `synchronized` 锁
+
+| `LoggingCache`
+| 日志缓存, 记录缓存命中率统计
+|===
+
+这些实现类通过层层装饰组合: 例如二级缓存的典型装饰链路为 `SynchronizedCache → LoggingCache → SerializedCache → LruCache → PerpetualCache`.
+
+[[mybatis-level1-cache]]
+=== 一级缓存原理
+
+[[what-is-l1-cache]]
+==== 是什么
+
+一级缓存是 SqlSession 级别的本地缓存. 在同一个 SqlSession 中, 对相同 SQL 和参数的重复查询, 只有第一次会访问数据库, 后续直接从缓存返回.
+
+其核心实现类是 `org.apache.ibatis.executor.BaseExecutor`, 内部维护一个 `PerpetualCache` 实例 `localCache`:
+
+[source,java]
+----
+public abstract class BaseExecutor implements Executor {
+    protected PerpetualCache localCache;       // <1>
+    protected PerpetualCache localOutputParameterCache; // <2>
+    protected Configuration configuration;
+    // ...
+}
+----
+<1> 一级缓存, 存储查询结果
+<2> 存储过程的 OUT 参数缓存
+
+[[how-l1-cache-works]]
+==== 工作流程
+
+一级缓存的查询流程如下:
+
+[plantuml, "一级缓存查询流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #E8F0FE
+skinparam activityBorderColor #1A73E8
+
+start
+:执行查询 query(ms, parameter, rowBounds);
+:生成 CacheKey;
+:从 localCache 获取缓存;
+
+if (缓存命中?) then (是)
+    :直接返回缓存结果;
+    stop
+else (否)
+    :调用 queryFromDatabase();
+    :执行 JDBC 查询;
+    :将结果存入 localCache;
+    :返回查询结果;
+    stop
+endif
+@enduml
+----
+
+[[cache-key-generation]]
+==== CacheKey 的生成机制
+
+CacheKey 是一级和二级缓存的共同基础. MyBatis 通过 `BaseExecutor.createCacheKey()` 生成唯一标识, 组成要素包括:
+
+. MappedStatement 的 ID (即 XML 中 `<select>` 的 `id`)
+. 分页参数 `RowBounds` 的 offset 和 limit
+. 绑定的 SQL 语句(含占位符)
+. 传入的参数值
+. 环境 `Environment` 的 ID
+
+[source,java]
+----
+public CacheKey createCacheKey(MappedStatement ms, Object parameterObject,
+                                RowBounds rowBounds, BoundSql boundSql) {
+    CacheKey cacheKey = new CacheKey();
+    cacheKey.update(ms.getId());                // <1>
+    cacheKey.update(rowBounds.getOffset());     // <2>
+    cacheKey.update(rowBounds.getLimit());      // <2>
+    cacheKey.update(boundSql.getSql());         // <3>
+    // 逐个更新参数值
+    for (ParameterMapping pm : boundSql.getParameterMappings()) {
+        Object value = getValue(parameterObject, pm);
+        cacheKey.update(value);                 // <4>
+    }
+    cacheKey.update(configuration.getEnvironment().getId()); // <5>
+    return cacheKey;
+}
+----
+<1> Statement ID, 如 `com.example.UserMapper.selectById`
+<2> 分页参数
+<3> 完整 SQL 语句
+<4> 每个参数的实际值
+<5> 环境标识(区分多数据源)
+
+`CacheKey` 的 `update()` 方法通过 `hashcode * 乘数 + 对象hash` 的累乘方式计算哈希, 同时通过 `equals()` 进行严格比对, 确保同一 SQL 不同参数生成不同的 Key.
+
+[[l1-cache-lifecycle]]
+==== 生命周期与失效策略
+
+一级缓存的生命周期与 SqlSession 绑定. 以下操作会清空一级缓存:
+
+* 执行 `INSERT`, `UPDATE`, `DELETE` 操作(调用 `update()` 方法)
+* 手动调用 `SqlSession.clearCache()`
+* SqlSession 提交 (`commit()`) —— 默认行为
+* SqlSession 关闭 (`close()`)
+
+核心清空逻辑位于 `BaseExecutor.update()`:
+
+[source,java]
+----
+public int update(MappedStatement ms, Object parameter) throws SQLException {
+    ErrorContext.instance().resource(ms.getResource())
+        .activity("executing an update").object(ms.getId());
+    if (closed) throw new ExecutorException("Executor was closed.");
+    clearLocalCache();  // <1>
+    return doUpdate(ms, parameter);
+}
+----
+<1> 任何写操作前先清空一级缓存, 防止脏读
+
+WARNING: 在同一个 SqlSession 中, 如果先查询再执行更新, 然后再次执行**相同条件**的查询, 会返回缓存中的旧数据(因为更新已清空缓存, 第二次查询会走数据库). 但若查询条件不同, 缓存中对应 Key 的数据可能仍是旧值.
+
+[[l1-cache-pitfalls]]
+==== 常见问题
+
+**跨 SqlSession 脏读:** 一级缓存作用域仅限于当前 SqlSession. Session-A 查询后, Session-B 修改了同一数据, Session-A 再次查询仍返回缓存的旧值. 解决方式: 合理控制 SqlSession 生命周期, 避免长时间持有.
+
+**与 Spring 整合时的行为:** Spring 整合 MyBatis 时, 默认每个 Mapper 方法调用后 SqlSession 即关闭, 因此一级缓存几乎不生效. 若需在同一个事务内利用一级缓存, 需确保多次查询在同一 SqlSession 中进行.
+
+[[mybatis-level2-cache]]
+=== 二级缓存原理
+
+[[what-is-l2-cache]]
+==== 是什么
+
+二级缓存是 Mapper 命名空间级别的缓存, 可跨 SqlSession 共享. 一个命名空间下的所有 SqlSession 共享同一份二级缓存数据.
+
+二级缓存默认关闭, 需通过以下方式显式开启:
+
+. 在 MyBatis 全局配置中开启:
++
+[source,xml]
+----
+<settings>
+    <setting name="cacheEnabled" value="true"/>
+</settings>
+----
+
+. 在 Mapper XML 中添加 `<cache/>` 标签:
++
+[source,xml]
+----
+<mapper namespace="com.example.UserMapper">
+    <cache/>  <!-- 开启二级缓存, 使用默认配置 -->
+    <!-- ... -->
+</mapper>
+----
+
+[[l2-cache-config]]
+==== 配置参数
+
+`<cache/>` 标签支持以下属性:
+
+[cols="1,1,2"]
+|===
+| 属性 | 默认值 | 说明
+
+| `eviction`
+| `LRU`
+| 淘汰策略: `LRU`, `FIFO`, `SOFT`, `WEAK`
+
+| `flushInterval`
+| `null` (不清空)
+| 刷新间隔, 单位毫秒. 到期后清空缓存
+
+| `size`
+| `1024`
+| 最大缓存对象数量
+
+| `readOnly`
+| `false`
+| `true` 时返回缓存对象本身(不安全但快); `false` 时返回序列化副本(安全)
+
+| `blocking`
+| `false`
+| `true` 时启用 `BlockingCache`, 防止缓存击穿
+
+| `type`
+| `PerpetualCache`
+| 自定义缓存实现类的全限定名
+|===
+
+配置示例:
+
+[source,xml]
+----
+<cache
+    eviction="LRU"
+    flushInterval="60000"
+    size="512"
+    readOnly="false"
+    blocking="true"/>
+----
+
+[[how-l2-cache-works]]
+==== 工作流程
+
+二级缓存由 `CachingExecutor` 实现, 它是一个装饰器, 包装了真正的 `Executor`:
+
+[plantuml, "二级缓存查询流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #E8F0FE
+skinparam activityBorderColor #1A73E8
+
+start
+:CachingExecutor.query();
+:生成 CacheKey;
+:从 MappedStatement 获取二级缓存;
+
+if (缓存命中?) then (是)
+    :返回缓存结果;
+    stop
+else (否)
+    :委托给 BaseExecutor (一级缓存);
+    if (一级缓存命中?) then (是)
+        :返回结果;
+        stop
+    else (否)
+        :执行 JDBC 查询;
+        :结果存入一级缓存;
+        :结果存入二级缓存(事务提交后);
+        :返回结果;
+        stop
+    endif
+endif
+@enduml
+----
+
+[[l2-cache-key-classes]]
+==== 核心类: TransactionalCache
+
+二级缓存的事务特性由 `TransactionalCache` 实现:
+
+[source,java]
+----
+public class TransactionalCache implements Cache {
+    private final Cache delegate;                       // <1>
+    private boolean clearOnCommit;                      // <2>
+    private final Map<Object, Object> entriesToAddOnCommit; // <3>
+    private final Set<Object> entriesMissedInCache;     // <4>
+
+    public Object getObject(Object key) {
+        Object object = delegate.getObject(key);
+        if (object == null) {
+            entriesMissedInCache.add(key);              // <5>
+        }
+        return object;
+    }
+
+    public void putObject(Object key, Object object) {
+        entriesToAddOnCommit.put(key, object);          // <6>
+    }
+
+    public void commit() {
+        if (clearOnCommit) { delegate.clear(); }
+        flushPendingEntries();
+        reset();
+    }
+
+    public void rollback() {
+        unlockMissedEntries();
+        reset();
+    }
+}
+----
+<1> 被装饰的真实缓存(如 LruCache)
+<2> 提交时是否清空缓存
+<3> 待提交时刷入的条目(暂存区)
+<4> 缓存未命中的 Key 集合
+<5> 记录未命中的 Key, 回滚时据此清理
+<6> `putObject` 并不立即写入, 而是暂存到 `entriesToAddOnCommit`
+
+关键设计: **二级缓存的写入不是立即的**. 查询结果先暂存在 `entriesToAddOnCommit` 中, 只有事务提交时(`sqlSession.commit()`)才会真正刷入二级缓存. 如果事务回滚, 暂存数据被丢弃, 不会污染缓存.
+
+[[l2-cache-clear-policy]]
+==== 失效与清空策略
+
+二级缓存在以下情况失效:
+
+* 命名空间内执行了 `INSERT`, `UPDATE`, `DELETE` —— 对应的 MappedStatement 会在 `update()` 时清空该命名空间的二级缓存
+* 定时清空 (`flushInterval` 到期)
+* 手动调用 `<select>` 的 `flushCache="true"` 属性
+* 缓存达到最大容量(`size`)触发淘汰
+
+[[l2-cache-requirements]]
+==== 使用要求
+
+WARNING: 启用二级缓存时, 所有被缓存的 POJO 类必须实现 `java.io.Serializable` 接口. 因为默认配置下(`readOnly="false"`), MyBatis 会通过序列化/反序列化创建对象副本, 避免并发修改问题.
+
+关联查询的缓存一致性:: 当 Mapper A 的查询关联了 Mapper B 的表, 而 Mapper B 执行了更新操作, 只有 Mapper B 的缓存会被清空, Mapper A 的缓存不会自动清空, 可能导致脏读. 解决方式: 使用 `<cache-ref namespace="..."/>` 让多个 Mapper 共享同一缓存.
+
+[[mybatis-cache-ref]]
+==== 缓存引用
+
+通过 `<cache-ref>` 可以让多个 Mapper 共享同一份二级缓存:
+
+[source,xml]
+----
+<mapper namespace="com.example.OrderMapper">
+    <cache-ref namespace="com.example.UserMapper"/>
+</mapper>
+----
+
+这解决了关联查询导致的缓存不一致问题. `OrderMapper` 的缓存操作会直接作用于 `UserMapper` 的缓存实例.
+
+[[mybatis-custom-cache]]
+=== 自定义缓存整合
+
+[[custom-cache-interface]]
+==== 实现自定义缓存
+
+通过实现 `org.apache.ibatis.cache.Cache` 接口, 可以将 MyBatis 的二级缓存对接至外部缓存系统:
+
+[source,java]
+----
+public class RedisCache implements Cache {
+    private final String id;
+    private final RedisClient redisClient;
+
+    public RedisCache(String id) {
+        this.id = id;
+        this.redisClient = RedisClient.getInstance();
+    }
+
+    @Override
+    public String getId() { return id; }
+
+    @Override
+    public void putObject(Object key, Object value) {
+        redisClient.set(serializeKey(key), serialize(value));
+    }
+
+    @Override
+    public Object getObject(Object key) {
+        byte[] data = redisClient.get(serializeKey(key));
+        return data != null ? deserialize(data) : null;
+    }
+
+    @Override
+    public Object removeObject(Object key) {
+        return redisClient.del(serializeKey(key));
+    }
+
+    @Override
+    public void clear() {
+        redisClient.flushByPattern(id + ":*"); // <1>
+    }
+
+    @Override
+    public int getSize() { return 0; } // <2>
+}
+----
+<1> 通过 Key 模式匹配批量清空, 避免 `KEYS *` 阻塞 Redis
+<2> 远程缓存大小难以精确获取, 返回 0 即可
+
+然后在 Mapper XML 中指定:
+
+[source,xml]
+----
+<cache type="com.example.cache.RedisCache"/>
+----
+
+[[integrate-ehcache]]
+==== 整合 Ehcache
+
+MyBatis 官方提供了 `mybatis-ehcache` 适配模块, 引入依赖后即可使用:
+
+[source,xml]
+----
+<cache type="org.mybatis.caches.ehcache.EhcacheCache">
+    <property name="timeToIdleSeconds" value="3600"/>
+    <property name="timeToLiveSeconds" value="7200"/>
+    <property name="maxEntriesLocalHeap" value="1000"/>
+</cache>
+----
+
+[[integrate-redis]]
+==== 整合 Redis
+
+通过 `mybatis-redis` 适配模块或自行实现 `Cache` 接口, 将二级缓存存储到 Redis, 适用于分布式部署场景:
+
+[source,xml]
+----
+<cache type="org.mybatis.caches.redis.RedisCache">
+    <property name="host" value="localhost"/>
+    <property name="port" value="6379"/>
+    <property name="database" value="0"/>
+    <property name="timeout" value="2000"/>
+</cache>
+----
+
+[[mybatis-cache-summary]]
+=== 总结与最佳实践
+
+[[cache-comparison]]
+==== 两级缓存对比
+
+[cols="1,2,2"]
+|===
+| 维度 | 一级缓存 | 二级缓存
+
+| 作用域
+| SqlSession
+| Mapper 命名空间
+
+| 默认状态
+| 开启, 不可关闭
+| 关闭, 需显式开启
+
+| 数据共享
+| 不跨 SqlSession
+| 跨 SqlSession 共享
+
+| 存储介质
+| JVM 堆内存 (HashMap)
+| 可对接 Ehcache, Redis 等
+
+| 事务支持
+| 无需(随 SqlSession 生命周期)
+| 通过 TransactionalCache 支持
+
+| 序列化要求
+| 无
+| 默认需要(可配置 readOnly=true 避免)
+|===
+
+[[best-practices]]
+==== 最佳实践
+
+* **优先控制 SqlSession 生命周期**, 而非依赖一级缓存. 一级缓存是"临时本地缓存", 不要将其当作可靠的缓存层.
+* **慎用二级缓存**, 它适用于读多写少、对一致性要求不高的场景. 高并发写场景下二级缓存的频繁清空反而降低性能.
+* **关联查询时使用 `<cache-ref>`**, 确保关联表的缓存一致性.
+* **生产环境优先使用 `readOnly="true"`** 配合不可变对象(查询结果不会被修改), 避免序列化开销.
+* **分布式部署必须使用外部缓存**(Redis 等), 不要使用默认的 JVM 内存缓存, 否则各节点缓存数据不一致.
+* **使用 `BlockingCache` 防止缓存击穿**: 设置 `blocking="true"`, 同一 Key 的并发查询只会有一个线程访问数据库, 其他线程阻塞等待.
+* **合理设置 `flushInterval`**, 作为兜底的缓存刷新机制, 避免永久持有过期数据.
+
+[[common-mistakes]]
+==== 常见误区
+
+. 认为一级缓存可以替代业务缓存 —— 一级缓存仅在同一 SqlSession 内生效, 且写操作立即清空, 不可作为业务缓存使用.
+. 开启二级缓存后忽视序列化 —— 未实现 `Serializable` 的 POJO 在 `readOnly="false"` 时直接抛异常.
+. 忘记处理关联表的缓存一致性问题 —— 更新了用户表, 但订单表的缓存中仍持有旧的用户数据.
+. 在分布式环境下使用默认的本地二级缓存 —— 节点 A 更新了数据, 节点 B 的缓存不会感知, 导致数据不一致.

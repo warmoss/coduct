@@ -1,5 +1,9 @@
 = 运维
 
+include::阿里云SAE原理讲解.adoc[]
+
+include::阿里云ACK原理讲解.adoc[]
+
 include::Ansible讲解.adoc[]
 
 include::阿里云存储设备讲解.adoc[]
@@ -9,3 +13,5 @@ include::Kubernetes原理讲解.adoc[]
 include::crictl讲解.adoc[]
 
 include::socat讲解.adoc[]
+
+include::pipx原理讲解.adoc[]

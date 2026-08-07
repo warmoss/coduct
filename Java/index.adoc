@@ -4,6 +4,8 @@ include::jdk/index.adoc[]
 
 include::spring/index.adoc[]
 
+include::MyBatis多级缓存原理讲解.adoc[]
+
 include::Quarkus框架讲解.adoc[]
 
 include::阿里云RAM系统原理讲解.adoc[]

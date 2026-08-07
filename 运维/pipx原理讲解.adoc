@@ -1,0 +1,154 @@
+== pipx 原理讲解
+
+pipx 是一个用于**在隔离环境中安装和运行 Python 应用程序**的命令行工具。它解决了 Python 应用安装中的依赖冲突问题, 让你可以像使用系统包管理器一样安全、便捷地使用 Python 编写的 CLI 工具。
+
+=== 概念定义
+
+pipx 的核心思想是: 每个 Python 应用都应拥有自己独立的虚拟环境, 只向系统暴露可执行入口。
+
+* **隔离环境 (Isolated Environment)**:: pipx 为每个安装的应用创建一个独立的 venv, 应用的依赖完全封闭在该环境中, 不同应用之间的依赖不会互相干扰
+* **全局可执行入口**:: 虽然依赖被隔离, 但应用的可执行脚本会暴露到系统 PATH 中, 用户可以像调用原生系统命令一样直接调用
+* **临时运行 (Run)**:: pipx 支持不安装而直接运行 Python 包, 执行完毕后自动清理临时环境, 不留痕迹
+
+[TIP]
+====
+pipx 的理念可以总结为: **"隔离安装, 全局调用"**。
+
+它本质上是在 Python 虚拟环境之上封装了一层应用生命周期管理, 让你同时获得隔离的安全性和全局调用的便利性。
+====
+
+=== 为什么需要 pipx
+
+在没有 pipx 之前, 安装 Python CLI 工具有两种方式:
+
+* **全局 pip install** -- 所有依赖混在同一 Python 环境中, 极易冲突, `pip install` 后面的包可能覆盖前面包的依赖版本
+* **手动创建 venv + 添加脚本到 PATH** -- 解决了隔离问题, 但操作繁琐, 每个应用都需要手动创建环境、激活、创建可执行脚本
+
+pipx 自动完成了第二种方式的所有步骤, 同时提供了统一的应用管理接口。
+
+=== 核心原理
+
+==== 隔离机制
+
+当你执行 `pipx install <package>` 时, pipx 在后台完成以下操作:
+
+. 在 `~/.local/pipx/venvs/<package>/` 下创建独立的 venv
+. 在该 venv 中安装指定的包及其所有依赖
+. 将包声明的可执行入口脚本符号链接到 `~/.local/bin/` 目录
+. 用户只需确保 `~/.local/bin/` 在 PATH 中, 即可直接调用
+
+[source,shell]
+----
+# 安装后目录结构示意
+~/.local/
+├── bin/
+│   └── black -> ../pipx/venvs/black/bin/black   # <1>
+└── pipx/
+    └── venvs/
+        ├── black/                                 # <2>
+        │   └── lib/python3.x/site-packages/
+        └── ruff/
+            └── lib/python3.x/site-packages/
+----
+<1> 全局可执行入口, 直接指向隔离环境的真实脚本
+<2> 每个应用独立的 venv, 互不干扰
+
+==== 依赖解析策略
+
+pipx 本身依赖 pip 进行包的下载和安装, 但它额外引入了**应用级隔离**的概念:
+
+* 每个应用拥有独立的 `site-packages`, 版本冲突不会跨应用传播
+* 更新某个应用只会影响该应用自身的环境, 其他应用不受影响
+* 卸载应用时, 可以干净地移除整个 venv, 不留残留文件
+
+==== 临时运行 (pipx run)
+
+`pipx run` 是最具特色的功能之一: 它创建一个临时 venv, 执行指定命令, 然后自动销毁整个环境。
+
+[source,shell]
+----
+# 不安装, 临时运行
+pipx run pycowsay "Hello, pipx!"
+
+# 指定版本临时运行
+pipx run --spec cowsay==4.0 pycowsay "Moo!"
+----
+
+临时运行的工作流程:
+
+[plantuml, "pipx run 工作流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam defaultFontSize 12
+
+actor 用户
+participant "pipx" as P
+participant "临时 venv" as T
+participant "PyPI" as R
+
+用户 -> P: pipx run <package>
+P -> R: 下载包及依赖
+P -> T: 创建临时 venv 并安装
+P -> T: 执行入口命令
+T --> P: 返回执行结果
+P --> 用户: 显示输出
+P -> T: 销毁临时 venv
+@enduml
+----
+
+临时 venv 会被缓存一段时间(默认 14 天), 下次运行同一包时可以直接复用, 提升速度。
+
+=== 常用操作
+
+[cols="1,1"]
+|===
+| 命令 | 说明
+
+| `pipx install <package>` | 安装 Python 应用到隔离环境
+| `pipx run <package>` | 临时运行 Python 应用, 不安装
+| `pipx uninstall <package>` | 卸载指定应用并清理其 venv
+| `pipx upgrade <package>` | 升级指定应用到最新版本
+| `pipx upgrade-all` | 升级所有已安装的应用
+| `pipx list` | 列出所有已安装应用及其版本
+| `pipx ensurepath` | 确保 `~/.local/bin/` 在 PATH 中
+| `pipx inject <package> <dep>` | 向应用的 venv 中注入额外依赖包
+|===
+
+==== 注入依赖
+
+`pipx inject` 是一个实用的高级功能: 向已有应用的隔离环境中安装额外的包, 扩展其功能。
+
+[source,shell]
+----
+# 向 black 的环境中注入 black-jupyter, 使其支持 Jupyter 格式化
+pipx inject black black-jupyter
+
+# 查看注入的包
+pipx list --include-injected
+----
+
+=== 与传统方式的对比
+
+[cols="1,1,1,1"]
+|===
+| 维度 | pip install (全局) | 手动 venv | pipx
+
+| 依赖隔离 | 无, 所有包共享环境 | 有, 需手动管理 | 自动隔离
+| 使用便捷性 | 高 | 低, 需激活环境 | 高, 全局直接调用
+| 卸载清理 | 可能残留依赖 | 需手动删除目录 | 一键干净卸载
+| 适用场景 | 开发项目依赖 | 开发项目依赖 | Python CLI 工具
+|===
+
+IMPORTANT: pipx 是为 **Python 应用 (CLI 工具)** 设计的, 不是 `pip` 的替代品。开发项目时仍应使用 venv/virtualenv/poetry 等工具管理项目依赖。
+
+=== 工作原理小结
+
+pipx 的设计哲学是**关注点分离**: 将 Python 应用的运行环境与开发环境、系统环境彻底分开。它的核心机制可以概括为:
+
+* 底层依托 Python 标准库的 `venv` 模块实现环境隔离
+* 通过符号链接将隔离环境中的可执行脚本暴露到用户 PATH
+* 提供统一的生命周期管理命令(install, upgrade, uninstall, list)
+* 临时运行 (`run`) 机制让你可以在不污染本地环境的前提下尝鲜各种 Python 工具
+
+在现代 Python 工具链中, pipx 已经成为安装 black, ruff, mypy, poetry 等 CLI 工具的推荐方式, 也被 Python 官方文档推荐为安装 Python 应用的标准方法。
