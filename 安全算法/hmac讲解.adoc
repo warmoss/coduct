@@ -19,7 +19,7 @@ HMAC 的核心思想是**将密钥与消息混合, 然后进行哈希运算**. �
 
 [source, plaintext, linenums]
 ----
-HMAC(K, m) = H( (K' ⊕ opad) || H( (K' ⊕ ipad) || m ) )
+HMAC(K, m) = H((K' ⊕ opad) || H((K' ⊕ ipad) || m))
 ----
 
 看起来很复杂? 让我们一步步分解:

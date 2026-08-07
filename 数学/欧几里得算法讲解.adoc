@@ -1,58 +1,88 @@
 == 欧几里得算法讲解
 
-**欧几里得算法**(又称**辗转相除法**)是计算两个正整数最大公约数(GCD)的高效方法, 由古希腊数学家欧几里得在其著作《几何原本》中首次系统阐述.
+**欧几里得算法(Euclidean Algorithm)** 是计算两个整数 **最大公约数(GCD, Greatest Common Divisor)** 的高效算法, 也是人类有记载以来最古老的算法之一, 至今仍在密码学、计算机代数、数论等领域广泛使用.
 
-=== 核心思想
+=== 概念定义
 
-* **基本原理:** 两个整数的最大公约数等于其中较小的数和两数相除余数的最大公约数.
+最大公约数(GCD):: 给定两个不全为零的整数 stem:[a] 和 stem:[b], 能同时整除 stem:[a] 和 stem:[b] 的最大正整数, 记作 stem:[gcd(a, b)]. 特别地, stem:[gcd(a, 0) = |a|].
 
-* **用公式表示:**
+欧几里得算法:: 基于"辗转相除"思想, 反复利用等式 stem:[gcd(a, b) = gcd(b, a mod b)] 将问题规模逐步缩小, 直到余数为零时得到结果.
 
-[stem]
-++++
-gcd(a, b) = {
-    (|a|, if b = 0 and a in ZZ),
-    (gcd(b, a mod b), if b != 0 and a >= b and a in ZZ and b in ZZ)
-:}
-++++
+* 如果 stem:[b = 0], 则 stem:[gcd(a, b) = a]
+* 如果 stem:[b != 0], 则 stem:[gcd(a, b) = gcd(b, a mod b)]
 
-=== 数学证明
+TIP: 算法名称来源于古希腊数学家欧几里得的著作《几何原本》, 但该算法可能早在欧几里得之前就已为人所知.
 
-==== 定理
+=== 核心原理
 
-两个整数的最大公约数等于其中较小的那个数和两数相除余数的最大公约数
+算法的数学基础是以下关键定理:
 
-==== 证明
+**定理:** 设 stem:[a = bq + r], 其中 stem:[q] 为商, stem:[r] 为余数(即 stem:[r = a mod b]), 则 stem:[gcd(a, b) = gcd(b, r)].
 
-stem:[gcd(a, b) = gcd(b, a mod b), a >= b, a in ZZ, b in ZZ, b != 0]
+**证明:**
 
-. stem:[a >= b, a in ZZ, b in ZZ, b != 0]
-. => stem:[a // b = k ... r, r = a mod b]
-. => stem:[a = kb + r]
-. => stem:[r = a - kb]
-. 设 stem:[d = gcd(a, b)]
-. => stem:[d|a, d|b]
-. => 因为 stem:[r = a - kb] 所以 stem:[d|r]
-. => stem:[gcd(b, r) = d]
-. => stem:[gcd(b, r) = gcd(b, a mod b) = d = gcd(a, b)]
-. => stem:[gcd(a, b) = gcd(b, a mod b)]
+. 设 stem:[d = gcd(a, b)], 则 stem:[d] 整除 stem:[a] 且 stem:[d] 整除 stem:[b]
+. 由 stem:[r = a - bq] 知, stem:[d] 也整除 stem:[r], 故 stem:[d] 是 stem:[b] 和 stem:[r] 的公因数
+. 同理, 若 stem:[d' = gcd(b, r)], 则 stem:[d'] 整除 stem:[b] 且 stem:[d'] 整除 stem:[r]
+. 由 stem:[a = bq + r] 知, stem:[d'] 也整除 stem:[a], 故 stem:[d'] 是 stem:[a] 和 stem:[b] 的公因数
+. 因此 stem:[d] 和 stem:[d'] 互相整除, 即 stem:[d = d']
 
-=== 算法实现
+这个定理保证了每一步"辗转"后, 最大公约数不变, 而参与运算的数越来越小, 直到余数为零.
 
-==== 递归
+=== 算法过程
 
-[source, python]
+以计算 stem:[gcd(252, 105)] 为例:
+
+[cols="1,1,1,1", options="header"]
+|===
+| 步骤 | a | b | a mod b
+
+| 初始 | 252 | 105 | 42
+| 第1步 | 105 | 42 | 21
+| 第2步 | 42 | 21 | 0
+| 第3步(终止) | 21 | 0 | -
+|===
+
+余数为 0 时, 当前除数 21 即为答案: stem:[gcd(252, 105) = 21].
+
+流程可归纳为:
+
+. 输入两个非负整数 stem:[a] 和 stem:[b](设 stem:[a >= b])
+. 若 stem:[b = 0], 返回 stem:[a] 作为结果
+. 否则, 计算 stem:[r = a mod b], 然后以 stem:[(b, r)] 作为新输入, 重复步骤 2
+
+[plantuml, "欧几里得算法流程图", format=png]
 ----
-def gcd(a, b):
-    if b == 0:
-        return a
-    else:
-        return gcd(b, a % b)
+@startuml
+start
+:输入 a, b;
+repeat
+  :r = a mod b;
+  :a = b;
+  :b = r;
+repeat while (b != 0)
+:返回 a;
+stop
+@enduml
 ----
 
-==== 迭代
+=== 代码实现
 
-[source, python]
+**递归实现:**
+
+[source,java]
+----
+public static int gcd(int a, int b) {
+    if (b == 0) {
+        return a;
+    }
+    return gcd(b, a % b);
+}
+----
+
+**迭代实现:**
+
+[source,python]
 ----
 def gcd(a, b):
     while b != 0:
@@ -60,26 +90,59 @@ def gcd(a, b):
     return a
 ----
 
-=== 扩展应用
+两种实现等价, 迭代版本避免了递归调用栈开销, 在实际工程中更为常用.
 
-* **求解线性丢番图方程:** 扩展欧几里得算法可求解 stem:[ax + by = gcd(a, b)] 的整数解.
-
-* **约简分数:** 用最大公约数化简分子分母.
-
-* **模运算中的逆元:** 若 stem:[gcd(a, m) = 1], 则 stem:[a] 在模 stem:[m] 下有乘法逆元.
+NOTE: Java 标准库提供 `java.math.BigInteger#gcd` 和 `java.util.Arrays#gcd`(Java 23+)；Python 标准库提供 `math.gcd`.
 
 === 时间复杂度
 
-算法的时间复杂度为 stem:[O(log min(a, b))] 因为余数至少每两步减半, 效率极高.
+每次迭代中, 余数 stem:[r = a mod b] 满足 stem:[r < b], 且可以证明: **每两次迭代, 较大数至少减半**.
 
-=== 注意事项
+更精确的分析基于 **Lamé 定理**: 若 stem:[a >= b > 0], 欧几里得算法的迭代次数不超过较小数位数的 5 倍.
 
-. 输入应为**非负整数**, 负数的GCD可取其绝对值
+因此时间复杂度为 stem:[O(log min(a, b))], 这是非常高效的.
 
-. stem:[gcd(0, 0)] 通常定义为0(有些定义未定义)
+=== 扩展欧几里得算法
 
-. stem:[gcd(a, 0) = |a|](任何数与0的最大公约数是其绝对值)
+欧几里得算法只计算 GCD, 而 **扩展欧几里得算法(Extended Euclidean Algorithm)** 同时求出 <<数学/贝祖等式讲解.adoc, 贝祖等式>> 中的系数 stem:[x] 和 stem:[y], 满足:
+
+stem:[ax + by = gcd(a, b)]
+
+**原理:** 在辗转相除的回溯过程中, 通过逆向代入恢复出系数.
+
+[source,java]
+----
+// 返回数组 [gcd, x, y], 满足 a*x + b*y = gcd
+public static int[] extendedGcd(int a, int b) {
+    if (b == 0) {
+        return new int[]{a, 1, 0};       // <1>
+    }
+    int[] result = extendedGcd(b, a % b); // <2>
+    int gcd = result[0];
+    int x = result[2];                    // <3>
+    int y = result[1] - (a / b) * result[2];
+    return new int[]{gcd, x, y};
+}
+----
+<1> 递归基: stem:[b = 0], 此时 stem:[gcd = a], 方程 stem:[a * 1 + 0 * 0 = a]
+<2> 递归调用, 计算 stem:[gcd(b, a mod b)]
+<3> 逆推: 由子问题解 stem:[(gcd, x', y')] 反推当前解 stem:[(gcd, y', x' - (a/b)y')]
+
+=== 应用场景
+
+欧几里得算法及其扩展是许多现代密码学算法的基础模块:
+
+* **RSA 密钥生成** — 通过扩展欧几里得算法计算私钥指数 stem:[d](即 <<数学/模反元素讲解.adoc, 模反元素>>)
+* **中国剩余定理** — 求解同余方程组时需要计算模反元素, 参考 <<数学/中国剩余定理讲解.adoc, 中国剩余定理>>
+* **分数约分** — 分子分母同除以其 GCD, 化为最简分数
+* **密码学中的模逆运算** — ECDSA、ElGamal 等算法均依赖快速模逆计算
+* **丢番图方程** — 求解形如 stem:[ax + by = c] 的整数方程
 
 === 总结
 
-欧几里得算法利用"余数替换"的递归性质, 将求解最大公约数问题简化为更小规模的相同问题, 是数论和计算数学的基础算法之一.
+* 欧几里得算法基于 stem:[gcd(a, b) = gcd(b, a mod b)] 这一核心等式, 通过反复取余缩小问题规模
+* 时间复杂度为 stem:[O(log min(a, b))], 效率极高
+* 扩展欧几里得算法可同时求出贝祖系数, 是求解 <<数学/模反元素讲解.adoc, 模反元素>> 的标准方法
+* 该算法是 RSA、ECC 等现代密码系统的底层原语之一
+
+WARNING: 实现时注意处理负数输入 — stem:[a % b] 在不同语言中符号行为不同. Java 的 `%` 结果符号与被除数一致; Python 的 `%` 结果符号与除数一致. 若需严格非负余数, 使用 `Math.floorMod(a, b)`(Java) 或确保最终结果取绝对值.

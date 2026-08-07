@@ -1,0 +1,407 @@
+== RSA原理讲解
+
+=== 什么是RSA
+
+定义::
+RSA 是由 Ron Rivest, Adi Shamir 和 Leonard Adleman 于 1977 年提出的**非对称加密算法**, 其名称来源于三位发明者姓氏的首字母. 它是世界上第一个既能用于**加密**又能用于**数字签名**的实用公钥密码体制.
+
+本质::
+RSA 的安全性建立在**大整数质因数分解的困难性**之上. 两个大质数相乘非常容易, 但要从乘积中还原出原始的质数却极其困难——正是这种**单向陷门函数(trapdoor function)**的不对称性, 构成了 RSA 安全的数学根基.
+
+核心用途::
+* **数据加密**: 公钥加密, 私钥解密, 确保只有私钥持有者能够阅读
+* **数字签名**: 私钥签名, 公钥验签, 确保消息来源的真实性和完整性
+* **密钥交换**: 在 TLS/SSL 握手中安全协商对称加密的会话密钥
+* **证书体系**: X.509 证书和 PKI 的核心算法之一
+
+历史地位::
+RSA 是密码学史上最重要的发明之一, 1977年发表至今近50年, 仍然是互联网安全的基石. 尽管面临 <<../大模型/Shor算法讲解.adoc#,Shor算法>> 等量子计算威胁, RSA 在当前经典计算环境下依然被广泛信赖.
+
+=== 核心概念
+
+在深入 RSA 数学原理之前, 先理清几个核心概念:
+
+对称加密 vs 非对称加密::
+**对称加密**(如 AES)使用同一个密钥加密和解密, 通信双方必须先安全共享密钥. **非对称加密**(如 RSA)使用一对密钥——公钥和私钥, 公钥可公开发布, 私钥仅持有者保管. 如同一个公开的邮箱: 任何人可以向邮箱投递信件(公钥加密), 但只有持有钥匙的人才能取出信件(私钥解密).
+
+公钥(Public Key)::
+可以公开分发的密钥, 由模数 stem:[n] 和加密指数 stem:[e] 组成, 表示为 stem:[(n, e)]. 用于加密数据或验证签名.
+
+私钥(Private Key)::
+必须严格保密的密钥, 由模数 stem:[n] 和解密指数 stem:[d] 组成, 表示为 stem:[(n, d)]. 用于解密数据或生成签名.
+
+模运算(Modular Arithmetic)::
+RSA 的所有运算均在模 stem:[n] 的意义下进行. 形象地说, 就是在"时钟"上做算术——超过 stem:[n-1] 就绕回 0. 这种"循环"特性使得逆向计算变得困难.
+
+[NOTE]
+RSA 因其计算开销较大, 通常不直接加密大量数据. 实际应用中常采用**混合加密**: 用 RSA 加密一个临时的 AES 会话密钥, 再用该 AES 密钥加密实际数据.
+
+=== 数学基础
+
+RSA 依赖三个核心数学概念, 它们共同构建了算法的安全基础.
+
+[[math-foundation]]
+==== 所需数学知识
+
+欧拉函数 stem:[\phi(n)]::
+表示小于等于 stem:[n] 的正整数中, 与 stem:[n] 互质的数的个数. 对于两个不同质数 stem:[p] 和 stem:[q], 有 stem:[\phi(pq) = (p-1)(q-1)].
+
++
+详细讲解请参阅: <<../数学/欧拉函数讲解.adoc#,欧拉函数原理讲解>>
+
+欧拉定理::
+如果 stem:[a] 与 stem:[n] 互质, 则 stem:[a^{\phi(n)} \equiv 1 \pmod{n}]. 这一定理是 RSA 解密正确性的根本保证.
+
++
+详细讲解请参阅: <<../数学/欧拉定理讲解.adoc#,欧拉定理原理讲解>>
+
+模反元素(Modular Multiplicative Inverse)::
+对于整数 stem:[e] 和模数 stem:[\phi(n)], 若 stem:[\gcd(e, \phi(n)) = 1], 则存在唯一的 stem:[d] 使得 stem:[e \cdot d \equiv 1 \pmod{\phi(n)}]. 这个 stem:[d] 就是 stem:[e] 关于模 stem:[\phi(n)] 的模反元素.
+
++
+详细讲解请参阅: <<../数学/模反元素讲解.adoc#,模反元素原理讲解>>
+
+扩展欧几里得算法::
+用于高效计算模反元素的算法, 是 RSA 密钥生成中最关键的运算.
+
++
+详细讲解请参阅: <<../数学/欧几里得算法讲解.adoc#,欧几里得算法讲解>> 和 <<../数学/贝祖等式讲解.adoc#,贝祖等式讲解>>
+
+==== 数学关系总览
+
+RSA 涉及的五个核心数值及其关系如下:
+
+[cols="1,2,3"]
+|===
+| 符号 | 含义 | 说明
+
+| stem:[p, q] | 两个大质数 | 随机生成, 须严格保密(或销毁)
+| stem:[n = p \times q] | 模数 | 公钥和私钥的共同部分
+| stem:[\phi(n) = (p-1)(q-1)] | 欧拉函数值 | 须严格保密, 私钥生成后即可销毁
+| stem:[e] | 公钥指数 | 通常选 65537, 须满足 stem:[\gcd(e, \phi(n)) = 1]
+| stem:[d] | 私钥指数 | stem:[e] 关于模 stem:[\phi(n)] 的模反元素
+|===
+
+=== 密钥生成过程
+
+RSA 密钥对的生成遵循严格的步骤, 每一步都关系到最终的安全性.
+
+[[key-generation]]
+==== 生成步骤
+
+. **选择两个大质数 stem:[p] 和 stem:[q]**
++
+在现代应用中, stem:[p] 和 stem:[q] 各约 1024-2048 位, 且应满足:
+** stem:[p] 和 stem:[q] 差值足够大, 避免被费马分解法攻击
+** stem:[p-1] 和 stem:[q-1] 都应有大质因子, 抵抗 Pollard's p-1 算法
+** 使用密码学安全的随机数生成器(CSPRNG)
+
+. **计算模数 stem:[n = p \times q]**
++
+stem:[n] 的位宽决定了 RSA 密钥的强度. 例如 p, q 各 1024 位, 则 n 为 2048 位.
+
+. **计算欧拉函数值 stem:[\phi(n) = (p-1)(q-1)]**
++
+这一步利用了欧拉函数的乘法性质: 当 p, q 为不同质数时, stem:[\phi(pq) = \phi(p) \cdot \phi(q) = (p-1)(q-1)].
+
+. **选择公钥指数 stem:[e]**
++
+stem:[e] 需满足: stem:[1 < e < \phi(n)] 且 stem:[\gcd(e, \phi(n)) = 1].
++
+实际应用中, stem:[e] 几乎总是固定为 **65537**(即 stem:[2^{16}+1]). 原因是:
+** 它是质数, 容易满足 gcd 条件
+** 二进制表示仅含两个 1(`10000000000000001`), 使加密和验签运算极快
+** 足够大, 可抵抗低指数攻击
+
+. **计算私钥指数 stem:[d]**
++
+stem:[d] 是 stem:[e] 关于模 stem:[\phi(n)] 的模反元素:
++
+stem:[d \equiv e^{-1} \pmod{\phi(n)}], 即 stem:[e \cdot d \equiv 1 \pmod{\phi(n)}]
++
+使用**扩展欧几里得算法**高效求解.
+
+. **销毁 stem:[p], stem:[q], stem:[\phi(n)]**
++
+这些中间值一旦泄露, 攻击者可立即推导出私钥 stem:[d].
+
+[IMPORTANT]
+====
+密钥生成是 RSA 安全性的第一道防线. 使用弱随机数生成器(如 `java.util.Random`)生成的质数可能被预测, 导致整个密钥对形同虚设. 务必使用 `SecureRandom` 或等价的密码学安全随机源.
+====
+
+==== 密钥生成流程图
+
+[plantuml, "RSA密钥生成流程", format=png]
+----
+@startuml
+start
+:生成两个大质数 p, q;
+:计算模数 n = p × q;
+:计算 φ(n) = (p-1)(q-1);
+:选择公钥指数 e (通常为 65537);
+:计算私钥指数 d ≡ e⁻¹ (mod φ(n));
+:销毁 p, q, φ(n);
+:输出公钥 (n, e) 和 私钥 (n, d);
+stop
+@enduml
+----
+
+=== 加密与解密
+
+[[encryption-decryption]]
+==== 加密过程
+
+发送方使用接收方的**公钥** stem:[(n, e)] 对明文 stem:[M] 加密:
+
+stem:[C \equiv M^{e} \pmod{n}]
+
+其中:
+* stem:[M] 是明文对应的数值(需满足 stem:[0 \le M < n])
+* stem:[C] 是密文
+* stem:[e] 和 stem:[n] 来自接收方的公钥
+
+==== 解密过程
+
+接收方使用自己的**私钥** stem:[(n, d)] 对密文 stem:[C] 解密:
+
+stem:[M \equiv C^{d} \pmod{n}]
+
+其中:
+* stem:[C] 是收到的密文
+* stem:[M] 是还原的明文
+* stem:[d] 和 stem:[n] 来自接收方的私钥
+
+==== 加密解密流程
+
+[plantuml, "RSA加密解密流程", format=png]
+----
+@startuml
+actor 发送方 as Sender
+actor 接收方 as Receiver
+
+== 密钥准备 ==
+Receiver -> Receiver: 生成密钥对\n公钥 (n, e), 私钥 (n, d)
+Receiver -> Sender: 发送公钥 (n, e)
+
+== 加密 ==
+Sender -> Sender: 明文 M → C = M^e mod n
+Sender -> Receiver: 发送密文 C
+
+== 解密 ==
+Receiver -> Receiver: 密文 C → M = C^d mod n
+Receiver -> Receiver: 得到明文 M
+
+@enduml
+----
+
+数字签名中的顺序则相反: **私钥加密(签名)**, **公钥解密(验签)**.
+
+=== 解密正确性证明
+
+RSA 解密能还原明文的数学依据, 源自欧拉定理. 以下给出严谨证明.
+
+[[proof]]
+==== 证明
+
+已知 stem:[e \cdot d \equiv 1 \pmod{\phi(n)}], 即存在整数 stem:[k] 使得:
+
+stem:[e \cdot d = 1 + k \cdot \phi(n)]
+
+解密运算为:
+
+stem:[C^{d} \equiv (M^{e})^{d} \equiv M^{ed} \equiv M^{1 + k \cdot \phi(n)} \equiv M \cdot (M^{\phi(n)})^{k} \pmod{n}]
+
+根据**欧拉定理**: 若 stem:[\gcd(M, n) = 1], 则 stem:[M^{\phi(n)} \equiv 1 \pmod{n}]. 代入上式:
+
+stem:[M \cdot (M^{\phi(n)})^{k} \equiv M \cdot 1^{k} \equiv M \pmod{n}]
+
+若 stem:[\gcd(M, n) \neq 1](即 M 恰好被 p 或 q 整除, 概率极低), 可借助**中国剩余定理**同样证明解密正确性, 因此 RSA 对所有 stem:[0 \le M < n] 均有效.
+
++
+详细推导请参阅: <<../数学/中国剩余定理讲解.adoc#,中国剩余定理讲解>>
+
+=== 安全性分析
+
+[[security]]
+==== 安全基础
+
+RSA 的安全性依赖于以下核心假设:
+
+分解大整数的困难性::
+给定 stem:[n = p \times q], 在不知道 stem:[p] 和 stem:[q] 的情况下, 无法高效计算出 stem:[\phi(n)] 和私钥 stem:[d]. 目前已知最快的经典算法——**数域筛法(Number Field Sieve)**, 对 2048 位 RSA 需要约 stem:[2^{112}] 次运算, 在可预见的未来无法实现.
+
+RSA 问题::
+即使不分解 stem:[n], 直接从 stem:[C \equiv M^{e} \pmod{n}] 中求 stem:[M] 的难度等价于分解 stem:[n]. 这保证了加密本身的安全性.
+
+==== 常见攻击与防御
+
+[cols="1,3,3"]
+|===
+| 攻击类型 | 原理 | 防御措施
+
+| 小指数攻击
+| 若明文 stem:[M] 很小且 stem:[e=3], 可能 stem:[M^3 < n], 直接开立方根即可获得明文
+| 使用 stem:[e = 65537]; 加密前对明文填充随机字节
+
+| 共模攻击
+| 同一明文用相同模数 stem:[n] 但不同 stem:[e] 加密, 攻击者可恢复明文
+| 每个用户使用独立的模数 stem:[n]; 切勿为不同用户共享同一个 stem:[n]
+
+| 计时攻击
+| 通过测量解密/签名运算的耗时差异, 推断私钥 stem:[d] 的比特位
+| 使用**恒定时间算法**; 对解密结果进行**盲化(blinding)**
+
+| 选择密文攻击
+| 攻击者构造特殊密文让私钥持有者解密, 从解密结果中获取信息
+| 使用 **OAEP** 填充方案; 切勿直接解密未经认证的密文
+
+| 量子计算威胁
+| <<../大模型/Shor算法讲解.adoc#,Shor算法>> 可在多项式时间内分解大整数
+| 迁移至 <<../安全算法/index.adoc#,后量子密码学(PQC)>> 算法
+|===
+
+==== 密钥长度建议
+
+[cols="1,2,2"]
+|===
+| 密钥长度 | 安全强度(等效对称密钥) | 建议
+
+| 1024 位 | ~80 位 | 已不安全, 禁止使用
+| 2048 位 | ~112 位 | 当前标准, 2030年前安全
+| 3072 位 | ~128 位 | 高安全场景推荐
+| 4096 位 | ~140 位 | 长期安全需求
+|===
+
+NIST 等权威机构均建议新系统至少使用 **2048 位** RSA 密钥.
+
+=== 填充方案
+
+[[padding]]
+==== 为什么需要填充
+
+原始 RSA(教科书式 RSA)存在严重安全问题:
+
+* **确定性加密**: 相同的明文总是产生相同的密文, 易受统计分析
+* **可塑(Malleable)**: 攻击者可在不知道明文的情况下, 对密文做乘法变换, 产生相关的另一有效密文
+* **小明文攻击**: 短明文容易遭受暴力枚举
+
+==== 常用填充标准
+
+PKCS#1 v1.5::
+最古老的填充方案, 在明文前添加随机字节. **仍广泛使用**, 但存在选择密文攻击(Bleichenbacher 攻击)的风险, 在新系统中不推荐.
+
+OAEP (Optimal Asymmetric Encryption Padding)::
+目前推荐的填充方案, 采用 Feistel 网络结构, 结合哈希函数和随机种子. 在随机预言机模型下可证明安全.
+
++
+Java 中对应: `RSA/ECB/OAEPWithSHA-256AndMGF1Padding`
+
+PSS (Probabilistic Signature Scheme)::
+签名场景的推荐填充方案, 同样基于随机化, 可证明安全.
+
++
+Java 中对应: `RSASSA-PSS`
+
+[TIP]
+**新系统一律使用 OAEP 进行加密, 使用 PSS 进行签名.** PKCS#1 v1.5 仅在兼容旧系统时考虑使用.
+
+=== 代码示例
+
+[[code-example]]
+==== Java 实现
+
+以下使用 Java 标准库(无需第三方依赖)演示 RSA 加解密:
+
+[source,java]
+----
+import javax.crypto.Cipher;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
+import java.security.PublicKey;
+import java.util.HexFormat;
+
+public class RSAHexExample {
+    private static final String ALGORITHM = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding"; // <1>
+
+    public static void main(String[] args) throws Exception {
+        // 1. 生成RSA密钥对(4096位)
+        KeyPair keyPair = generateRSAKeyPair();
+        PublicKey publicKey = keyPair.getPublic();
+        PrivateKey privateKey = keyPair.getPrivate();
+
+        String originalText = "Hello, RSA Encryption!";
+
+        // 2. 使用公钥加密
+        byte[] encryptedBytes = encrypt(publicKey, originalText.getBytes());
+        String hexEncrypted = bytesToHex(encryptedBytes);
+
+        // 3. 使用私钥解密
+        byte[] decryptedBytes = decrypt(privateKey, hexToBytes(hexEncrypted));
+        String decryptedText = new String(decryptedBytes);
+
+        System.out.println("解密结果: " + decryptedText);
+    }
+
+    static KeyPair generateRSAKeyPair() throws Exception {
+        KeyPairGenerator keyGen = KeyPairGenerator.getInstance("RSA");
+        keyGen.initialize(4096); // <2>
+        return keyGen.generateKeyPair();
+    }
+
+    static byte[] encrypt(PublicKey publicKey, byte[] data) throws Exception {
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey);
+        return cipher.doFinal(data);
+    }
+
+    static byte[] decrypt(PrivateKey privateKey, byte[] encryptedData) throws Exception {
+        Cipher cipher = Cipher.getInstance(ALGORITHM);
+        cipher.init(Cipher.DECRYPT_MODE, privateKey);
+        return cipher.doFinal(encryptedData); // <3>
+    }
+
+    static String bytesToHex(byte[] bytes) {
+        return HexFormat.of().formatHex(bytes);
+    }
+
+    static byte[] hexToBytes(String hexString) {
+        return HexFormat.of().parseHex(hexString);
+    }
+}
+----
+<1> 使用 OAEP 填充方案, 结合 SHA-256 哈希函数
+<2> 指定 4096 位密钥长度, 生产环境一般用 2048 或 3072
+<3> RSA 单次加密的明文长度受限于密钥长度(减去填充开销), 大文件需采用混合加密
+
+[IMPORTANT]
+====
+上述代码演示 RSA 的基本用法. 生产环境中还应考虑:
+* 使用 `KeyStore` 安全存储私钥
+* 通过证书(如 X.509)分发公钥
+* 对大数据采用混合加密方案
+====
+
+=== 总结
+
+核心要点::
+* RSA 是首个实用的公钥密码体制, 安全性基于大整数分解的困难性
+* 密钥由五个核心数值构成: stem:[p, q, n, e, d], 其中 stem:[(n, e)] 公开, stem:[(n, d)] 保密
+* 加密: stem:[C \equiv M^{e} \pmod{n}]; 解密: stem:[M \equiv C^{d} \pmod{n}]
+* 解密正确性由欧拉定理保证
+* 实际使用必须配合安全填充方案(OAEP / PSS)
+* 当前推荐密钥长度为至少 2048 位
+
+常见误区::
+* **RSA 不能替代 AES 加密大量数据** — 应当混合加密
+* **不可直接使用"教科书式 RSA"** — 必须使用 OAEP 或 PSS 填充
+* **e=3 不安全** — 应使用 65537
+* **1024 位密钥已不安全** — 至少 2048 位
+* **Shor 算法给 RSA 设定了"保质期"** — 关注后量子密码学的迁移规划
+
+最佳实践::
+* 使用密码学库(如 Java JCA, OpenSSL, libsodium)而非自行实现
+* 密钥生成使用 `SecureRandom` 或操作系统熵源
+* 私钥永不离开持有者的安全边界, 必要时使用 HSM(Hardware Security Module)
+* 定期轮换密钥, 旧密钥用于解密历史数据, 新密钥用于新加密
