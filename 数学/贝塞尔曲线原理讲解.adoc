@@ -28,7 +28,7 @@ stem:[B(t) = (1-t) P_0 + t P_1]
 
 这本质上就是两点间的线性插值(lerp).
 
-[plantuml, "一阶贝塞尔曲线: 两个控制点连成直线", format=png]
+[plantuml, "一阶贝塞尔曲线 两个控制点连成直线", format=png]
 ----
 @startuml
 left to right direction

@@ -2,3 +2,5 @@
 *.pdf
 stem-*.png
 reveal.js/
+.asciidoctor
+assets/*.png

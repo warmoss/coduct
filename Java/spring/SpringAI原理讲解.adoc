@@ -50,11 +50,11 @@ package "核心抽象层" as Core {
 }
 
 package "Provider 适配层" as Adapter {
-  class "OpenAiChatModel" as OA
-  class "AzureOpenAiChatModel" as AO
-  class "AnthropicChatModel" as AN
-  class "OllamaChatModel" as OL
-  class "…更多 Provider…" as MORE
+  component "OpenAiChatModel" as OA
+  component "AzureOpenAiChatModel" as AO
+  component "AnthropicChatModel" as AN
+  component "OllamaChatModel" as OL
+  component "…更多 Provider…" as MORE
 }
 
 package "AI 提供商" as Provider {

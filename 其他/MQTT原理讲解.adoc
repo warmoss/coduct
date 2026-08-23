@@ -96,7 +96,7 @@ CONNECT 报文包含以下关键字段:
 
 ==== 发布与订阅
 
-[plantuml, "MQTT 发布/订阅流程", format=png]
+[plantuml, "MQTT发布和订阅流程", format=png]
 ----
 @startuml
 Publisher -> Broker: PUBLISH(topic, payload, QoS)

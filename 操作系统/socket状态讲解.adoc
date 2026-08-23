@@ -1,173 +1,243 @@
 == socket状态讲解
 
-我们将以最经典的 **TCP/IP 协议栈** 和 **基于连接的 Socket** 为例, 按照 Socket 的"生命周期"来讲解各个状态.
+TCP socket 是网络通信的核心抽象. 一次 TCP 连接从建立到关闭, 会经历一系列可观测的中间状态, 这些状态统称为 **socket 状态**. 理解这些状态, 是排查网络故障、定位连接泄漏和优化服务器性能的基础.
 
-=== 核心: TCP 三次握手与四次挥手
+=== 为什么需要理解 socket 状态
 
-Socket 的状态变迁与 TCP 的连接建立(三次握手)和连接断开(四次挥手)过程紧密相连. 下图是整个生命周期的状态流转图, 你可以结合下文的状态讲解来对照查看.
+* **定位连接异常:** 当连接无法建立或无法关闭时, socket 状态直接揭示流程卡在哪一步.
 
-[mermaid]
+* **发现资源泄漏:** `CLOSE_WAIT` 大量堆积通常意味着应用没有正确关闭连接, `TIME_WAIT` 过多则反映存在大量短连接.
+
+* **防御攻击:** `SYN_RECV` 状态堆积往往是 SYN Flood 攻击的典型特征.
+
+=== 核心概念
+
+socket::
+  操作系统提供的网络编程端点, 由 IP 地址和端口号标识. 一条 TCP 连接由四元组 (源 IP, 源端口, 目的 IP, 目的端口) 唯一确定.
+
+TCP 状态机::
+  描述 TCP 连接在生命周期内各阶段之间转换规则的有限状态机. 状态转换由协议事件 (报文到达) 和应用调用共同驱动.
+
+MSL::
+  Maximum Segment Lifetime, 报文段在网络中存活的最长时间. Linux 默认 30 秒, 2MSL 即 60 秒.
+
+=== TCP 连接状态总览
+
+TCP 共定义 11 种连接状态, 汇总如下:
+
+[cols="2,5,3"]
+|===
+| 状态 | 含义 | 典型位置
+
+| LISTEN | 监听端口, 等待连接请求 | 服务端
+| SYN_SENT | 已发送 SYN, 等待对端确认 | 客户端
+| SYN_RECV | 已收到 SYN 并回复 SYN+ACK, 等待对端 ACK | 服务端
+| ESTABLISHED | 连接建立, 可双向传输数据 | 双方
+| FIN_WAIT_1 | 主动关闭方已发送 FIN, 等待 ACK 或对方 FIN | 主动关闭方
+| FIN_WAIT_2 | 已收到对端 ACK, 等待对端发送 FIN | 主动关闭方
+| CLOSE_WAIT | 已收到对端 FIN 并回复 ACK, 等待本地应用关闭 | 被动关闭方
+| CLOSING | 双方同时关闭, 收到对端 FIN 但 ACK 未被确认 | 双方 (罕见)
+| LAST_ACK | 被动关闭方已发送 FIN, 等待最后 ACK | 被动关闭方
+| TIME_WAIT | 主动关闭方已回复最后 ACK, 等待 2MSL | 主动关闭方
+| CLOSED | 连接完全关闭 | 不可见
+|===
+
+=== 三次握手与状态流转
+
+客户端与服务端通过三次握手建立连接, 双方状态依次变化:
+
+[plantuml,"TCP 三次握手与状态流转",format=png]
 ----
-%%{init: {'theme': 'neutral'}}%%
-flowchart TD
-    CLOSED --> LISTEN
-    CLOSED --> SYN_SENT
+@startuml
+participant "客户端" as C
+participant "服务端" as S
 
-    subgraph 三次握手
-        LISTEN -- 收SYN, 发SYN+ACK --> SYN_RCVD
-        SYN_SENT -- 收SYN+ACK, 发ACK --> ESTABLISHED
-        SYN_RCVD -- 收ACK --> ESTABLISHED
-    end
-
-    subgraph 数据传输
-        ESTABLISHED -- 收FIN, 发ACK --> CLOSE_WAIT
-        CLOSE_WAIT -- 发FIN --> LAST_ACK
-        ESTABLISHED -- 发FIN --> FIN_WAIT_1
-    end
-
-    subgraph 四次挥手
-        FIN_WAIT_1 -- 收ACK --> FIN_WAIT_2
-        FIN_WAIT_1 -- 收FIN+ACK, 发ACK --> CLOSING
-        FIN_WAIT_2 -- 收FIN, 发ACK --> TIME_WAIT
-        CLOSING -- 收ACK --> TIME_WAIT
-        LAST_ACK -- 收ACK --> CLOSED
-    end
-
-    TIME_WAIT -- 等待2MSL超时 --> CLOSED
-----
-
-=== 连接建立阶段的状态(对应三次握手)
-
-==== LISTEN (监听状态)
-
-* **描述:** 服务器端的 Socket 调用 listen() 函数后进入此状态. 它像一个打开了大门的仓库, 等待客户端的"连接请求"(SYN 包).
-
-* **角色:** 仅服务器端.
-
-* **类比:** 客服人员就位, 电话插好, 等待客户来电.
-
-==== SYN_SENT (同步已发送)
-
-* **描述:** 客户端的 Socket 调用 connect() 函数后, 会向服务器发送一个 SYN (Synchronize) 包, 然后进入此状态. 它表示客户端已经发出了连接请求, 正在等待服务器的确认.
-
-* **角色:** 仅客户端.
-
-* **常见问题:** 如果一直卡在这个状态, 通常意味着客户端发出的 SYN 包服务器没有回应(可能是网络不通、防火墙阻止、服务器未监听端口等).
-
-* **类比:** 客户拨打了客服电话, 正在等待对方接听(听筒里的"嘟...嘟..."声).
-
-==== SYN_RCVD (同步已接收)
-
-* **描述:** 服务器端收到客户端的 SYN 包后, 会回复一个 SYN-ACK 包, 然后进入此状态. 它表示服务器已经确认了客户端的连接请求, 并发出了自己的请求, 正在等待客户端的最终确认.
-
-* **角色:** 仅服务器端.
-
-* **常见问题:** 这个状态通常持续时间极短. 如果服务器上看到大量 SYN_RCVD 状态, 很可能遭受了 **SYN Flood 攻击**(一种拒绝服务攻击), 即客户端只发送第一个 SYN 包, 但不回复最后的 ACK, 耗尽服务器的连接队列资源.
-
-* **类比:** 客服人员接起电话, 说"您好, 请问需要什么帮助? ", 然后等待客户回应.
-
-==== ESTABLISHED (连接已建立)
-
-* **描述:** 这是连接建立成功的状态. 客户端收到服务器的 SYN-ACK 后, 发送最终的 ACK 包, 双方随后都进入此状态. 此时, 双向通信通道已经打通, 可以开始通过 send() 和 recv() 进行数据传输了.
-
-* **角色:** 客户端和服务器端.
-
-* **类比:** 客户和客服人员已经成功通话, 可以开始正常交流业务了.
-
-=== 连接断开阶段的状态(对应四次挥手)
-TCP 连接是全双工的, 可以看作是两个独立的单向通道. 断开时需要分别关闭这两个通道.
-
-**假设客户端主动发起关闭:**
-
-=== FIN_WAIT_1 (终止等待1)
-
-* **描述:** 主动关闭的一方(本例中的客户端)调用 close() 函数后, 会发送一个 FIN (Finish) 包, 然后进入此状态. 它表示客户端已经没有数据要发送了, 请求关闭从客户端到服务器的通道.
-
-* **角色:** 主动关闭方.
-
-* **类比:** 客户说: "我说完了, 要挂电话了".
-
-=== FIN_WAIT_2 (终止等待2)
-
-* **描述:** 主动关闭方(客户端)在 FIN_WAIT_1 状态下, 收到了被动关闭方(服务器)对它的 FIN 包的 ACK 确认后, 进入此状态. 此时, 从客户端到服务器的通道已经完全关闭, 但反向通道(服务器到客户端)可能还在传输数据. 客户端等待服务器发送 FIN 包.
-
-* **角色:** 主动关闭方.
-
-=== CLOSE_WAIT (关闭等待)
-
-* **描述:** 被动关闭方(服务器)收到主动关闭方(客户端)的 FIN 包后, 会立刻回复一个 ACK, 然后进入此状态. 它表示服务器已经知道客户端要关闭了. 此时, 服务器可能还有一些数据需要处理或发送给客户端.
-
-* **角色:** 被动关闭方.
-
-* **常见问题:** 如果服务器上出现大量 CLOSE_WAIT 状态, 通常是 **应用程序 Bug** 导致的. 即服务器在检测到对方关闭后, 没有及时调用 close() 来关闭自己这一侧的连接, 导致连接一直挂在这个状态, 资源无法释放.
-
-* **类比:** 客服人员听到客户说要挂电话, 回复"好的", 但自己可能还需要查一下资料再挂断.
-
-=== LAST_ACK (最后确认)
-
-* **描述:** 被动关闭方(服务器)将自己剩余的数据发送完毕后, 调用 close() 函数, 向主动关闭方(客户端)发送一个 FIN 包, 然后进入此状态. 它表示服务器也准备好了, 等待客户端最后的确认.
-
-* **角色:** 被动关闭方.
-
-* **类比:** 客服人员说: "我也说完了, 资料查好了, 可以挂了".
-
-=== TIME_WAIT (时间等待) / 2MSL 等待
-
-* **描述:** 这是最复杂也是最重要的一个状态. 主动关闭方(客户端)在收到被动关闭方(服务器)的 FIN 包后, 会发送最后一个 ACK, 然后立即进入 TIME_WAIT 状态.
-
-* **为什么需要 TIME_WAIT?**
-
-** **可靠性:** 确保最后一个 ACK 能到达服务器. 如果这个 ACK 在网络中丢失, 服务器会超时重传它的 FIN 包. 此时还在 TIME_WAIT 的客户端可以重新回复一个 ACK.
-
-** **让旧连接消逝:** 允许所有在链路上延迟的旧数据包都因超时而消失, 防止它们被之后在同一端口上新建的、无关的连接错误地接收.
-
-* **持续时间:** 这个状态会持续 **2MSL** (Maximum Segment Lifetime, 报文最大生存时间) 的时间, 通常是 2分钟 (Linux 默认是 60秒).
-
-* **角色:** 主动关闭方.
-
-* **常见问题:** 在高性能服务器上, 如果主动关闭大量短连接, 会出现大量处于 TIME_WAIT 状态的连接, 可能会耗尽可用的端口资源. 可以通过调整内核参数(如 net.ipv4.tcp_tw_reuse)来优化.
-
-=== CLOSING (正在关闭)
-
-* **描述:** 一种比较罕见的状态. 双方同时发起关闭(**同时**发送了 FIN 包), 就会进入 CLOSING 状态. 双方都在等待对方的 ACK, 收到 ACK 后都会进入 TIME_WAIT 状态.
-
-=== 特殊状态
-
-=== CLOSED (关闭状态)
-
-* **描述:** 连接完全关闭, 或者从未建立. 这是一个虚拟的起始和终点状态. 资源已被释放.
-
-=== 如何查看 Socket 状态?
-
-在 Linux/Unix/macOS/Windows 系统中, 最常用的工具是 netstat.
-
-[source, bash, linenums]
-----
-# Linux/Unix/macOS 常见用法
-netstat -an | grep :80      # 查看所有与80端口相关的连接
-netstat -tnlp               # 查看所有TCP监听端口和进程
-ss -ant                     # 使用更现代的 `ss` 命令, 功能类似
-
-# Windows 常见用法
-netstat -ano | findstr :80
+C -> S : ① SYN=1, seq=x\n(CLOSED → SYN_SENT)
+S -> C : ② SYN=1, ACK=1, seq=y, ack=x+1\n(LISTEN → SYN_RECV)
+C -> S : ③ ACK=1, seq=x+1, ack=y+1\n(双方 → ESTABLISHED)
+@enduml
 ----
 
-在输出中, State 列就显示了连接当前的状态.
+. 客户端调用 `connect()`, 发送 SYN 报文, 自身从 CLOSED 进入 **SYN_SENT**.
+
+. 服务端收到 SYN 后回复 SYN+ACK, 自身从 LISTEN 进入 **SYN_RECV**.
+
+. 客户端收到 SYN+ACK 后回复 ACK, 进入 **ESTABLISHED**; 服务端收到 ACK 后也进入 **ESTABLISHED**.
+
+NOTE: 握手只需三个报文段, 因为服务端把 SYN 与 ACK 合并为同一个报文发送.
+
+=== 四次挥手与状态流转
+
+连接关闭时双方状态变化更复杂, 需要四个报文段:
+
+[plantuml,"TCP 四次挥手与状态流转",format=png]
+----
+@startuml
+participant "主动方 A" as A
+participant "被动方 B" as B
+
+A -> B : ① FIN=1, seq=u\n(ESTABLISHED → FIN_WAIT_1)
+B -> A : ② ACK=1, ack=u+1\n(ESTABLISHED → CLOSE_WAIT)
+note right of A : A → FIN_WAIT_2
+B -> A : ③ FIN=1, seq=w\n(CLOSE_WAIT → LAST_ACK)
+A -> B : ④ ACK=1, ack=w+1\n(FIN_WAIT_2 → TIME_WAIT)
+note right of B : B 收到 ACK 后 → CLOSED
+note right of A : A 等待 2MSL 后 → CLOSED
+@enduml
+----
+
+. 主动方 A 调用 `close()` 发送 FIN, 进入 **FIN_WAIT_1**.
+
+. 被动方 B 收到 FIN 后回复 ACK, 进入 **CLOSE_WAIT**; A 收到 ACK 后进入 **FIN_WAIT_2**.
+
+. B 的应用随后调用 `close()`, 发送 FIN, 进入 **LAST_ACK**.
+
+. A 收到 FIN 后回复最后 ACK, 进入 **TIME_WAIT**; B 收到 ACK 后进入 **CLOSED**.
+
+IMPORTANT: 被动方 B 必须依赖上层应用调用 `close()` 才会发出 FIN, 这正是 `CLOSE_WAIT` 容易长时间停留的原因.
+
+=== 完整状态机
+
+将握手与挥手合并, 得到完整的 TCP 连接状态机:
+
+[plantuml,"TCP 连接完整状态机",format=png]
+----
+@startuml
+hide empty description
+[*] --> CLOSED : 初始状态
+CLOSED --> LISTEN : 被动打开\nbind()+listen()
+CLOSED --> SYN_SENT : 主动打开\nconnect()
+LISTEN --> SYN_RECV : 收到 SYN\n回 SYN+ACK
+SYN_SENT --> ESTABLISHED : 收到 SYN+ACK\n回 ACK
+SYN_RECV --> ESTABLISHED : 收到 ACK
+SYN_SENT --> SYN_RECV : 同时打开\n收到 SYN
+SYN_RECV --> SYN_SENT : 同时打开\n收到 SYN
+ESTABLISHED --> FIN_WAIT_1 : 主动关闭\nclose() 发 FIN
+ESTABLISHED --> CLOSE_WAIT : 收到 FIN\n回 ACK
+FIN_WAIT_1 --> FIN_WAIT_2 : 收到 ACK
+FIN_WAIT_1 --> CLOSING : 收到 FIN\n回 ACK
+FIN_WAIT_1 --> TIME_WAIT : 收到 FIN+ACK\n回 ACK
+FIN_WAIT_2 --> TIME_WAIT : 收到 FIN\n回 ACK
+CLOSING --> TIME_WAIT : 收到 ACK
+CLOSE_WAIT --> LAST_ACK : 应用 close()\n发 FIN
+LAST_ACK --> CLOSED : 收到 ACK
+TIME_WAIT --> CLOSED : 等待 2MSL 超时
+@enduml
+----
+
+=== 关键状态详解
+
+LISTEN::
+  服务端调用 `listen()` 后进入的状态. 表示套接字正在监听端口, 等待连接请求. 此时内核已分配半连接队列 (SYN 队列) 和全连接队列 (accept 队列).
+
+SYN_SENT::
+  客户端调用 `connect()` 后立即进入的状态. 表示已发送 SYN, 等待服务端确认. 若对端不可达, 连接会在此状态按 `tcp_syn_retries` 重试后超时.
+
+SYN_RECV::
+  服务端收到 SYN 并回复 SYN+ACK 后进入的状态. 连接处于半连接状态, 尚未完成三次握手. 大量 SYN_RECV 堆积通常意味着 SYN Flood 攻击或 accept 队列已满.
+
+ESTABLISHED::
+  三次握手完成后双方进入的稳定状态. 数据可双向可靠传输, 是连接生命周期中最长的阶段.
+
+FIN_WAIT_1::
+  主动关闭方调用 `close()` 发送 FIN 后进入的状态. 等待对端 ACK, 或对端同时发来的 FIN.
+
+FIN_WAIT_2::
+  主动关闭方收到对端 ACK 后进入的状态. 本端已不再发送数据, 但仍在等待对端发送 FIN. 若对端一直不关闭, 会在此状态停留, 直到 `tcp_fin_timeout` 超时 (默认 60 秒).
+
+CLOSE_WAIT::
+  被动关闭方收到 FIN 并回复 ACK 后进入的状态. 对端已关闭, 但本地应用尚未调用 `close()`. 此状态大量堆积说明应用存在遗漏关闭套接字的 bug.
+
+CLOSING::
+  双方同时发送 FIN 时出现的罕见状态. 表示已收到对端 FIN, 但自己的 ACK 尚未被对端确认.
+
+LAST_ACK::
+  被动关闭方调用 `close()` 发送 FIN 后进入的状态. 等待对端最后 ACK, 收到后立即进入 CLOSED.
+
+TIME_WAIT::
+  主动关闭方收到对端 FIN 并回复 ACK 后进入的状态. 需等待 2MSL 后进入 CLOSED, 详见 <<#time-wait, TIME_WAIT 深入分析>>.
+
+CLOSED::
+  连接的最终状态, 表示连接已完全关闭, 套接字不再存在, 也无法被观测到.
+
+=== 如何查看 socket 状态
+
+使用 `ss` (推荐) 或 `netstat` 查看当前系统连接状态:
+
+[source,shell]
+----
+ss -tan                                         # 查看所有 TCP 连接及状态
+ss -tan | awk '{print $1}' | sort | uniq -c     # 按状态统计数量
+netstat -tan                                    # 传统方式, 功能等价
+----
+
+[source,text]
+----
+State      Recv-Q Send-Q Local Address:Port  Peer Address:Port
+LISTEN     0      128    0.0.0.0:8080        0.0.0.0:*
+ESTAB      0      0      192.168.1.5:8080    192.168.1.10:53421
+TIME-WAIT  0      0      192.168.1.5:8080    192.168.1.20:43210
+----
+
+TIP: `ss` 输出中的 `ESTAB` 即 `ESTABLISHED`, `TIME-WAIT` 即 `TIME_WAIT`, 只是缩写形式不同.
+
+=== TIME_WAIT 深入分析
+
+[[time-wait]]
+==== 为什么必须等待 2MSL
+
+主动关闭方在发送最后一个 ACK 后进入 TIME_WAIT, 等待时长为:
+
+stem:[T_(TIME_WAIT) = 2 xx MSL]
+
+其中 MSL 默认 30 秒, 因此 Linux 上 TIME_WAIT 默认为 60 秒. 原因有二:
+
+. **确保最后 ACK 可靠送达:** 若最后的 ACK 丢失, 对端会重发 FIN. TIME_WAIT 期间本端仍可重发 ACK, 保证连接可靠终止.
+
+. **让旧报文从网络中消亡:** 等待 2MSL 可确保本连接产生的旧报文段都已从网络中消失, 避免其影响复用同一四元组的新连接.
+
+==== TIME_WAIT 的影响
+
+* **占用端口资源:** 服务器端大量 TIME_WAIT 会消耗连接四元组, 客户端则可能耗尽本地临时端口.
+
+* **占用内存:** 每个 TIME_WAIT 连接占用的内核结构体很小 (约百余字节), 但数量巨大时仍不可忽视.
+
+==== 优化手段
+
+[source,shell]
+----
+# 允许复用处于 TIME_WAIT 的 socket 发起新连接 (仅对主动连接方有效)
+sysctl -w net.ipv4.tcp_tw_reuse=1
+
+# 限制系统 TIME_WAIT 连接总数, 超出后新关闭的连接会被直接释放
+sysctl -w net.ipv4.tcp_max_tw_buckets=262144
+
+# 查看当前相关设置
+sysctl net.ipv4.tcp_fin_timeout net.ipv4.tcp_tw_reuse net.ipv4.tcp_max_tw_buckets
+----
+
+WARNING: `tcp_tw_recycle` 参数曾在旧版本用于快速回收 TIME_WAIT, 但在 NAT 环境下会导致连接异常, 已在 Linux 4.12 中移除. 不要再使用该参数.
+
+=== 常见问题与排查
+
+[cols="3,3,4"]
+|===
+| 异常现象 | 常见原因 | 排查方向
+
+| CLOSE_WAIT 堆积 | 应用未调用 close() | 检查代码是否遗漏关闭套接字
+| TIME_WAIT 过多 | 短连接频繁建立与主动关闭 | 开启连接复用或改用长连接
+| SYN_RECV 堆积 | SYN Flood 攻击或 accept 队列满 | 检查 tcp_syncookies 与 accept 队列长度
+| FIN_WAIT_2 堆积 | 对端不发送 FIN | 检查 tcp_fin_timeout 与对端实现
+|===
+
+其中 `CLOSE_WAIT` 堆积最为常见. 它不会自动消失, 只能等待应用主动关闭, 因此一旦发现堆积, 应优先排查应用代码中的连接管理逻辑.
 
 === 总结
 
-理解 Socket 状态的关键在于:
+. 三次握手与四次挥手是 socket 状态流转的两条主线, 11 种状态覆盖了连接的全生命周期.
 
-. **分清角色:** 是客户端还是服务器? 是主动关闭方还是被动关闭方?
+. 主动关闭方依次经历 FIN_WAIT_1, FIN_WAIT_2, TIME_WAIT; 被动关闭方依次经历 CLOSE_WAIT, LAST_ACK.
 
-. **关联 TCP 流程:** 将状态与三次握手和四次挥手的每一步对应起来.
+. `CLOSE_WAIT` 堆积通常指向应用 bug, `TIME_WAIT` 过多通常指向连接管理策略问题.
 
-. **关注关键状态:**
-
-** **ESTABLISHED:** 正常通信状态.
-
-** **TIME_WAIT:** 主动关闭后的正常等待, 但过多会影响性能.
-
-** **CLOSE_WAIT:** 被动关闭方, 如果过多通常是程序 Bug.
-
-** **SYN_RCVD:** 如果过多, 可能遭受攻击.
+. 使用 `ss` 或 `netstat` 实时观测状态分布, 是定位网络问题的第一步.

@@ -1,274 +1,265 @@
 == superpowers原理讲解
 
-大模型本质上是一个"文本生成器"——它根据输入概率性地预测下一个 token. 然而, 通过一系列**能力扩展机制**, 大模型得以突破自身局限, 获得执行真实世界任务的能力. 这些扩展能力统称为大模型的 **Superpowers(超能力)**. 本文系统讲解 Superpowers 的概念体系、核心能力维度及各机制间的协作原理.
+Superpowers 是 Jesse Vincent(obra)与 Prime Radiant 团队开源的**面向 AI 编码代理的完整软件开发方法论**, 将头脑风暴, 任务规划, 测试驱动开发(TDD), 子代理执行与代码评审等实践打包为一组**可组合的技能(Skill)**, 配合一段启动引导指令, 让编码代理自动遵循规范流程, 而非直接"上手写代码". 本文系统讲解 Superpowers 的设计理念, 核心架构, 自动触发机制与标准工作流.
 
-参考: <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>>, <<大模型/大模型如何做到调用工具的.adoc#, 大模型如何做到调用工具的>>, <<大模型/大模型MCP原理讲解.adoc#, 大模型MCP原理讲解>>, <<大模型/大模型RAG原理讲解.adoc#, 大模型RAG原理讲解>>, <<大模型/大模型记忆原理讲解.adoc#, 大模型记忆原理讲解>>, <<大模型/大模型工作流原理讲解.adoc#, 大模型工作流原理讲解>>
+参考: <<大模型/skills写作指南.adoc#, skills写作指南>>, <<大模型/Agent Instructions讲解.adoc#, Agent Instructions讲解>>, <<大模型/prompt写作指南.adoc#, prompt写作指南>>, <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>>
 
 === 什么是 Superpowers
 
-Superpowers(超能力):: 大模型通过**外部机制获得的增强能力集合**, 使其超越"文本生成器"的原生角色, 具备感知外部世界、操作真实系统、保持持续记忆和自主决策的能力.
+Superpowers:: 一个基于 **Claude Code 插件机制**构建的技能集合, 当前稳定版为 6.3.0, 通过 `.claude-plugin/plugin.json` 清单声明, 将多个 `SKILL.md` 技能打包为插件分发. 它同时兼容 Codex, Cursor, Gemini CLI, GitHub Copilot CLI 等多种编码代理平台.
 
-大模型的原生能力与 Superpowers 的对比:
+其核心定位不是"又一个工具库", 而是为编码代理注入一套**强制性的开发纪律**:
 
-[cols="2,3,3"]
-|===
-| 能力维度 | 原生大模型(无 Superpowers) | 具备 Superpowers 的大模型
+* **不是**提供零散的代码片段, **而是**规定"动手前先做什么"的流程约束
+* **不是**让用户手动逐条调用, **而是**通过 `description` 字段让代理**自动匹配**并加载
+* **不是**只解决单个任务, **而是**覆盖从需求澄清到分支收尾的完整生命周期
 
-| 信息来源
-| 仅依赖训练数据(知识截止于训练时间)
-| 可实时检索外部知识库、数据库和网络
-| 执行能力
-| 仅能输出文本
-| 可调用 API、执行代码、操作文件系统
-| 记忆能力
-| 无状态, 每次对话独立
-| 可保持跨会话记忆和上下文
-| 决策能力
-| 单次推理, 无流程控制
-| 可编排多步工作流, 自主决策
-| 行为控制
-| 依赖一次性提示词
-| 通过分层的指令体系精确控制行为
-|===
+Superpowers 与其他配置概念的关系:
 
-=== 大模型 Superpowers 的五大核心能力
+Prompt:: 用户手动触发的一次性指令, 面向特定对话任务
+Skill:: 代理自动匹配的领域知识包, 是 Superpowers 的**基本组成单元**
+Agent Instructions:: 始终生效的全局上下文文件, 适用于项目大多数工作
+Superpowers:: 一组经过精心设计的 Skill 的**集合**, 外加启动引导指令, 构成完整方法论
 
-大模型的 Superpowers 可以归纳为五个核心维度, 每个维度对应一种能力扩展机制.
+=== 为什么需要 Superpowers
 
-==== 感知能力: RAG 与外部知识检索
+通用编码代理在执行开发任务时存在几个系统性缺陷, Superpowers 正是针对这些缺陷设计:
 
-大模型的知识受限于训练数据的截止日期, 无法获取实时信息. **RAG (Retrieval Augmented Generation)** 通过检索外部知识源, 赋予模型感知实时信息的能力.
+* **急于写代码** - 代理看到需求就直接产出实现, 跳过需求澄清与设计, 导致返工
+* **跳过测试** - 代理倾向"先写实现再补测试", 甚至不写测试, 无法证明代码正确
+* **缺少可执行计划** - 大型任务被一次性生成, 缺乏可验证的小步拆解
+* **上下文污染** - 长时间对话积累的上下文使代理逐渐偏离最初方案
 
-RAG 的核心流程:
+Superpowers 的答案是把"正确的做事方式"固化为**强制工作流**, 让代理在每一步都有章可循. 其哲学可以概括为四点:
 
-. 用户提出问题
-. 系统将问题转换为向量, 在知识库中检索最相关的文档片段
-. 将检索到的文档片段作为上下文注入到模型输入中
-. 模型基于原始问题 + 检索到的上下文生成回答
+* **Test-Driven Development** - 始终先写测试
+* **Systematic over ad-hoc** - 用流程取代猜测
+* **Complexity reduction** - 以简单为首要目标
+* **Evidence over claims** - 先验证再宣布成功
 
-[plantuml, "RAG 赋予大模型感知能力", format=png]
+=== 核心架构
+
+Superpowers 的工程结构由三个层次组成:
+
+. **插件清单** - `.claude-plugin/plugin.json` 声明插件元数据, 是插件的分发入口
+. **技能库** - `skills/` 目录下每个子目录包含一个 `SKILL.md`, 是知识的最小封装单元
+. **引导技能** - `using-superpowers` 技能在会话启动时注入, 确立"先查技能再行动"的总规则
+
+[source,json]
 ----
-@startuml
-actor "用户" as User
-rectangle "RAG 系统" as RAG {
-  (嵌入模型) as Embed
-  (向量数据库) as VectorDB
-  (检索模块) as Retriever
+{
+  "name": "superpowers",
+  "description": "Core skills library for Claude Code: TDD, debugging, collaboration patterns, and proven techniques",
+  "version": "6.3.0",
+  "author": {
+    "name": "Jesse Vincent",
+    "email": "jesse@fsck.com"
+  },
+  "license": "MIT"
 }
-participant "大模型" as LLM
-
-User -> RAG: 提问
-RAG -> Embed: 向量化问题
-Embed -> VectorDB: 相似度检索
-VectorDB --> Retriever: 返回相关文档
-Retriever -> LLM: 注入检索结果作为上下文
-LLM --> User: 基于实时知识的回答
-@enduml
 ----
 
-详细原理请参考 <<大模型/大模型RAG原理讲解.adoc#, 大模型RAG原理讲解>>.
+每个技能文件遵循标准 Skill 结构: YAML frontmatter 声明 `name` 与 `description`, 正文使用 Markdown 描述知识说明与操作指令. 其中 `description` 是代理发现技能的唯一依据, 其写法直接决定技能能否被正确触发:
 
-==== 行动能力: 工具调用与 MCP
-
-大模型无法主动执行操作——它只能输出文本. **工具调用(Tool Calling / Function Calling)** 让模型能够"驱动"外部工具完成实际操作, 而 **MCP (Model Context Protocol)** 则标准化了工具的描述、发现和调用方式.
-
-工具调用赋予的行动能力包括:
-
-* **查询操作** - 查询数据库、搜索网络、获取文件内容
-* **写入操作** - 创建文件、发送邮件、更新数据库记录
-* **计算操作** - 执行精确数学运算、运行代码
-* **控制操作** - 控制系统服务、触发 CI/CD 流水线
-
-[plantuml, "工具调用赋予大模型行动能力", format=png]
+[source,yaml]
 ----
-@startuml
-participant "大模型" as LLM
-participant "MCP Client" as Client
-participant "MCP Server" as Server
-participant "外部系统" as Ext
-
-note over LLM: 上下文包含工具定义
-LLM -> LLM: 分析意图, 决策调用工具
-LLM --> Client: 输出函数调用 JSON
-Client -> Server: 协议转换并转发
-Server -> Ext: 执行实际操作
-Ext --> Server: 返回结果
-Server --> Client: 返回执行结果
-Client -> LLM: 注入结果到上下文
-LLM -> LLM: 基于结果生成最终回答
-@enduml
+---
+name: test-driven-development
+description: Use when implementing any feature or bugfix, before writing implementation code
+---
 ----
 
-详细原理请参考 <<大模型/大模型如何做到调用工具的.adoc#, 大模型如何做到调用工具的>> 和 <<大模型/大模型MCP原理讲解.adoc#, 大模型MCP原理讲解>>.
+=== 自动触发机制
 
-==== 记忆能力: 上下文管理与持久存储
+Superpowers "自动获得超能力"的特性源于引导技能 `using-superpowers` 确立的**铁律**:
 
-大模型每次推理的上下文窗口有限, 且默认无状态. **记忆机制**让模型能够跨越单次对话的限制, 保持长期上下文.
+IMPORTANT: **在做出任何响应或动作之前, 必须先调用相关技能**, 包括提出澄清问题, 探索代码库或查看文件之前.
 
-记忆分为三个层次:
+这条规则由以下机制支撑:
 
-短期记忆:: 当前对话历史, 在上下文窗口中维护. 模型通过不断追加对话轮次来保持对话的连贯性. 受限于上下文窗口大小.
+* **强制调用** - 只要存在哪怕 1% 可能相关的技能, 代理就必须调用, 不允许以"任务太简单"等理由跳过
+* **优先级排序** - 多个技能同时适用时, **流程类技能**优先(如 brainstorming, systematic-debugging), 因为流程类技能决定整体打法, 实现类技能随后执行
+* **用户指令优先** - 用户直接指令(如 `CLAUDE.md`, `AGENTS.md`, 显式要求)高于技能, 技能高于默认行为
 
-长期记忆:: 跨会话的持久化信息, 存储于外部系统(文件、数据库). 通过 RAG 或专门的记忆模块在需要时检索注入.
-
-工作记忆:: 当前任务中的临时状态, 如已执行的步骤、中间结果. 通常由工作流框架管理.
-
-[plantuml, "大模型记忆分层架构", format=png]
+[source,text]
 ----
-@startuml
-rectangle "大模型推理" as Inference {
-  (上下文窗口) as Context
-}
-
-rectangle "短期记忆" as STM {
-  (当前对话轮次) as Turns
-}
-
-rectangle "长期记忆" as LTM {
-  (用户偏好) as Prefs
-  (项目知识) as Project
-  (历史决策) as History
-}
-
-rectangle "工作记忆" as WM {
-  (任务状态) as State
-  (中间结果) as Temp
-}
-
-Inference --> STM: 直接访问
-STM ..> LTM: 按需检索注入
-Inference --> WM: 流程控制读写
-@enduml
+"Let's build X" -> brainstorming 优先, 然后才是实现类技能
+"Fix this bug"  -> systematic-debugging 优先, 然后才是领域技能
 ----
 
-详细原理请参考 <<大模型/大模型记忆原理讲解.adoc#, 大模型记忆原理讲解>>.
+=== 标准工作流
 
-==== 行为能力: 指令体系与行为控制
+Superpowers 将一次完整的开发任务拆解为七个阶段, 每个阶段由一个技能驱动:
 
-大模型的行为由其输入决定. **分层指令体系**让开发者能够精确控制模型的行为, 确保输出符合预期.
-
-指令体系从"临时"到"永久"分为四个层次:
-
-[cols="2,3,3"]
-|===
-| 层次 | 载体 | 作用范围
-
-| 一次性指令
-| Prompt (用户手动输入)
-| 单次对话, 特定任务
-| 全局指令
-| Agent Instructions (.instructions.md / copilot-instructions.md)
-| 整个项目, 始终生效
-| 领域指令
-| Skill (SKILL.md)
-| 特定领域的任务, 按需加载
-| 启动配置
-| AGENT.md
-| Agent 的身份、工具和行为约束
-|===
-
-这套分层体系让开发者能够:
-
-* **精确约束** - 通过 Agent Instructions 定义项目级行为规范, 如"所有代码输出使用 TypeScript"
-* **按需扩展** - 通过 Skill 为特定任务加载专业知识, 如数据库迁移、安全审查
-* **灵活控制** - 通过 Prompt 在每次对话中给出临时指令, 覆盖或补充全局规则
-
-详细原理请参考 <<大模型/prompt写作指南.adoc#, prompt写作指南>>, <<大模型/Agent Instructions讲解.adoc#, Agent Instructions讲解>>, <<大模型/skills写作指南.adoc#, skills写作指南>>, <<大模型/AGENT.md写作指南.adoc#, AGENT.md写作指南>>.
-
-==== 协调能力: 工作流与多步编排
-
-单次 LLM 调用只能完成一步操作. **工作流(Workflow)** 将多个 LLM 调用、工具执行和条件判断编排为完整的执行流程, 使模型能够完成复杂的多步任务.
-
-常见的工作流模式:
-
-链式调用(Chain):: 将任务分解为线性顺序的步骤, 前一步输出作为后一步输入. 适用于文档生成、数据处理等可自然分解的任务.
-
-路由(Routing):: 根据输入特征选择不同的处理路径. 适用于客服分流、内容分类等需要定向处理的场景.
-
-并行(Parallel):: 同时执行多个独立操作, 再汇总结果. 适用于多维度分析、批量处理等场景.
-
-循环/迭代(Loop):: 反复执行某一步骤直到满足条件. 适用于代码调试、内容优化等需要迭代改进的任务.
-
-编排(Orchestration):: 通过有向图定义步骤间的复杂依赖关系, 支持分支、循环和并行. 由 LangGraph 等框架实现, 适用于复杂业务逻辑.
-
-[plantuml, "工作流编排模型", format=png]
+[plantuml, "Superpowers 标准工作流", format=png]
 ----
 @startuml
 start
-:分析用户请求;
-if (需要外部信息?) then (是)
-  :调用检索工具;
-  if (检索成功?) then (是)
-    :生成回答;
-  else (否)
-    :尝试备用工具;
-  endif
-else (否)
-  :直接生成回答;
-endif
-:质量检查;
-if (通过?) then (是)
-  :输出结果;
-  stop
-else (否)
-  :重新生成;
-  detach
-endif
+:brainstorming
+需求澄清与设计;
+:using-git-worktrees
+创建隔离工作树;
+:writing-plans
+拆解实施计划;
+:subagent-driven-development
+执行任务;
+:test-driven-development
+RED-GREEN-REFACTOR;
+:requesting-code-review
+按计划评审;
+:finishing-a-development-branch
+合并或收尾;
+stop
 @enduml
 ----
 
-详细原理请参考 <<大模型/大模型工作流原理讲解.adoc#, 大模型工作流原理讲解>> 和 <<大模型/LangGraph原理讲解.adoc#, LangGraph原理讲解>>.
+. **brainstorming** - 写代码前先激活, 通过提问澄清需求, 探索替代方案, 分块呈现设计供确认, 并保存设计文档
+. **using-git-worktrees** - 设计确认后激活, 在新分支上创建隔离工作区, 运行项目初始化并验证测试基线干净
+. **writing-plans** - 拿到已确认设计后, 将工作拆解为 2 到 5 分钟一个的原子任务; 每个任务包含精确文件路径, 完整代码与验证步骤
+. **subagent-driven-development** 或 **executing-plans** - 按计划执行; 前者为每个任务派发全新子代理并做两阶段评审, 后者批量执行并设人工检查点
+. **test-driven-development** - 实现过程中强制 RED-GREEN-REFACTOR 循环: 先写失败测试, 看它失败, 写最小代码, 看它通过, 提交
+. **requesting-code-review** - 任务之间激活, 对照计划评审, 按严重程度上报问题; 关键问题阻断后续进度
+. **finishing-a-development-branch** - 任务完成后激活, 验证测试, 提供合并, 发 PR, 保留或丢弃等收尾选项
 
-=== Superpowers 的协作机制
+=== 技能库构成
 
-五大 Superpowers 并非孤立运作, 而是**协同配合**构成完整的 AI Agent 能力体系. 以一个实际场景为例:
+Superpowers 的技能按职责分为四类:
 
-User Prompt: "帮我查一下上周的销售数据, 对比去年同期, 然后生成一份分析报告并保存到我的文档中."
+[cols="1,3,3"]
+|===
+| 类别 | 技能 | 职责
 
-[plantuml, "Superpowers 协作示例", format=png]
+| 测试
+| test-driven-development
+| 强制 RED-GREEN-REFACTOR 循环, 附带测试反模式参考
+
+| 调试
+| systematic-debugging
+| 四阶段根因定位流程
+
+| 调试
+| verification-before-completion
+| 确认问题真正被修复
+
+| 协作
+| brainstorming
+| 苏格拉底式的设计细化
+
+| 协作
+| writing-plans
+| 生成详细实施计划
+
+| 协作
+| executing-plans
+| 带检查点的批量执行
+
+| 协作
+| subagent-driven-development
+| 每任务一个子代理加两阶段评审
+
+| 协作
+| requesting-code-review
+| 提交前评审清单
+
+| 协作
+| receiving-code-review
+| 响应评审反馈
+
+| 协作
+| using-git-worktrees
+| 并行开发分支管理
+
+| 协作
+| finishing-a-development-branch
+| 合并或 PR 决策流程
+
+| 元技能
+| writing-skills
+| 按最佳实践创建新技能(含测试方法论)
+
+| 元技能
+| using-superpowers
+| 技能系统的引导入口
+|===
+
+=== 两个关键机制
+
+==== 子代理驱动开发
+
+`subagent-driven-development` 是 Superpowers 实现"长时自主执行"的关键: 它为每个工程任务派发一个**全新的子代理**, 并执行**两阶段评审**:
+
+. **规格符合性评审** - 检查实现是否严格符合任务规格
+. **代码质量评审** - 检查代码本身的质量
+
+这种设计带来两个收益:
+
+* **上下文隔离** - 每个子代理只携带当前任务所需的最小上下文, 避免长会话的上下文污染
+* **可审查性** - 每一步产出都经过独立评审, 问题在提交前被发现
+
+==== TDD 铁律
+
+Superpowers 的 TDD 技能确立了一条**不可妥协的铁律**:
+
+[source,text]
 ----
-@startuml
-|工作流引擎|
-:解析用户意图;
-|指令体系|
-:应用项目级约束\n(输出格式、文件路径);
-|感知能力 - RAG|
-:检索销售数据库;\n获取上周和去年同期数据;
-|行动能力 - 工具调用|
-:调用数据分析工具;\n计算同比变化;
-:调用文件写入工具;\n保存报告到文档目录;
-|记忆能力|
-:保存结果到长期记忆;\n更新工作记忆状态;
-|协调能力 - 工作流|
-:条件判断是否成功;\n汇总结果生成报告;
-:返回最终结果给用户;
-@enduml
+NO PRODUCTION CODE WITHOUT A FAILING TEST FIRST
 ----
 
-各能力的协作关系:
+其含义是: 没有亲眼看到测试失败, 就不知道它是否测对了目标. 违反流程提前写出的代码必须**删除重写**, 不允许"留作参考"或"先写代码再补测试".
 
-* **指令体系**为所有其他能力提供行为边界和格式约束
-* **感知能力(RAG)** 为模型提供实时外部信息, 弥补知识截止的局限
-* **行动能力(工具调用 + MCP)** 将模型的决策转化为真实操作
-* **记忆能力**让模型保持跨步骤和跨对话的上下文连续性
-* **协调能力(工作流)** 编排所有能力的调用顺序和依赖关系
+[source,text]
+----
+RED      -> 写一个最小失败测试, 必须亲眼看到它失败
+GREEN    -> 写最少的代码让测试通过, 必须亲眼看到它通过
+REFACTOR -> 保持测试全绿的前提下清理重复, 改进命名
+----
 
-=== 总结
+=== Superpowers 与普通 Skill 集合的区别
 
-大模型的 Superpowers 本质上是**通过外部机制扩展模型能力边界**的设计模式集合. 其核心思想可以概括为:
+[cols="2,3,3"]
+|===
+| 维度 | 普通 Skill 集合 | Superpowers
 
-* **不改造模型本身** - Superpowers 不修改模型的参数或架构, 而是通过输入控制(指令)、上下文注入(RAG/记忆)、外部队列(工具调用)和工作流编排来扩展能力
-* **分层解耦** - 各 Superpower 职责清晰: 感知层(RAG)解决信息获取, 行动层(工具/MCP)解决操作执行, 记忆层解决状态保持, 控制层(指令)解决行为约束, 协调层(工作流)解决流程编排
-* **协同增效** - 单一 Superpower 的能力有限, 但组合使用时产生质的飞跃: 模型+RAG 得到有知识的模型, +工具得到能行动的模型, +工作流得到能自主任务的模型, +记忆得到能持续学习的模型
+| 组织方式
+| 零散的知识包, 各自独立
+| 由引导技能统一调度的**方法论**
 
-正是这些 Superpowers 的组合, 使得大模型从"文本生成器"进化为能够执行真实世界任务的 **AI Agent**.
+| 触发方式
+| 依赖代理自主判断
+| 引导技能强制"先查技能再行动"
 
-相关文章:
+| 覆盖范围
+| 单一领域场景
+| 覆盖完整开发生命周期
 
-* <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>> - 大模型基础原理
-* <<大模型/大模型如何做到调用工具的.adoc#, 大模型如何做到调用工具的>> - 工具调用原理
-* <<大模型/大模型MCP原理讲解.adoc#, 大模型MCP原理讲解>> - MCP 协议原理
-* <<大模型/大模型RAG原理讲解.adoc#, 大模型RAG原理讲解>> - RAG 原理
-* <<大模型/大模型记忆原理讲解.adoc#, 大模型记忆原理讲解>> - 记忆原理
-* <<大模型/大模型工作流原理讲解.adoc#, 大模型工作流原理讲解>> - 工作流原理
-* <<大模型/大模型系统角色与用户角色的区别讲解.adoc#, 大模型系统角色与用户角色的区别讲解>> - 指令执行机制
+| 执行约束
+| 建议性
+| 强制工作流, 非建议
+
+| 自我扩展
+| 通常无
+| 提供 writing-skills 元技能自我创建新技能
+|===
+
+=== 总结与注意事项
+
+==== 要点归纳
+
+* Superpowers 的本质是**用技能库加引导指令为编码代理注入开发纪律**, 而非提供现成代码
+* 核心机制是 **`description` 驱动的自动触发**与**强制调用铁律**, 让用户无感地"获得超能力"
+* 标准工作流遵循 **brainstorm -> plan -> TDD 实现 -> 评审 -> 收尾** 的闭环
+* 支持 Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot CLI 等多种平台, 安装方式各异
+
+==== 常见误区
+
+* 误以为 Superpowers 是一个"代码生成器", 它不生成业务代码, 只约束**如何**写代码
+* 误以为技能可以随意跳过, `using-superpowers` 明确禁止以"任务简单"等理由合理化跳过
+* 误以为 TDD 是仪式而非实质, Superpowers 强调"违反规则的字面含义就是违反其精神"
+* 误以为 `description` 不重要, 它是代理发现技能的唯一入口, 写得模糊技能就形同虚设
+
+==== 最佳实践
+
+* 先安装并让 `using-superpowers` 生效, 确保技能从会话第一条消息起就自动触发
+* 允许代理在 brainstorming 阶段充分提问, 再进入 planning, 避免返工
+* 严格执行 RED-GREEN-REFACTOR, 亲手确认每次测试先失败后通过
+* 利用 `writing-skills` 元技能扩展团队专属流程, 使方法论随项目演进
