@@ -3,6 +3,7 @@
 :lang: 中文
 :stem:
 :icons: font
+:mathematical-format: svg
 :source-highlighter: highlightjs
 // :source-highlighter: rouge
 :rouge-style: pastie

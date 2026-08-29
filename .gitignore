@@ -1,6 +1,7 @@
 *.html
 *.pdf
 stem-*.png
+stem-*.svg
 reveal.js/
 .asciidoctor
 assets/*.png
