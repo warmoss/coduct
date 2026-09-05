@@ -1,0 +1,418 @@
+== Serilog讲解
+
+大多数 .NET 应用的日志仍停留在"把字符串拼好再写文件"的阶段: 变量被直接格式化进文本, 机器难以解析, 排障时只能靠正则与肉眼. 本文讲解结构化日志框架 **Serilog** 的设计与用法: 如何用消息模板在调用点保留结构化属性, 如何通过 Sink 把同一事件送往控制台, 文件与远程日志服务, 以及 Enricher, LogContext 等机制如何让日志自带上下文.
+
+参考: <<其他/dotnet依赖注入讲解.adoc#, dotnet依赖注入讲解>>
+
+=== 什么是 Serilog
+
+结构化日志 (Structured Logging):: 记录"事件"而非"文本"的日志方式. 每次调用对应一个结构化事件, 其中每个字段都是可检索, 可聚合的键值属性.
+日志事件 (LogEvent):: 一次日志调用生成的完整记录, 由时间戳, 级别, 消息模板, 模板属性与可选异常组成.
+消息模板 (Message Template):: 一种扩展 .NET 格式化字符串的模板语言, 用命名占位符描述事件, 由 messagetemplates.org 制定规范.
+Sink:: 日志事件的最终输出目的地, 如控制台, 文件或远程日志服务器; 一个日志器可挂多个 Sink, 事件会同时送往每一个.
+Enricher:: 在事件进入 Sink 前为其追加属性的组件, 如机器名, 线程 ID 或当前请求上下文.
+
+Serilog 是面向 .NET 的结构化日志库, 由 Nicholas Blumhardt 创建, 以 Apache-2.0 开源, 当前最新稳定版为 **4.4.0**. 与传统日志库"先格式化文本再输出"不同, Serilog 的调用点只负责**描述事件**, 文本渲染被推迟到 Sink 写入的那一刻, 从而使同一事件既能渲染成易读文本, 也能序列化为 JSON 供机器消费.
+
+Serilog 按 NuGet 包拆分, 核心包只提供日志本体, 输出能力按需引入:
+
+[cols="2,6"]
+|===
+| NuGet 包 | 职责
+
+| Serilog
+| 核心库, 提供 Logger, LoggerConfiguration, 消息模板解析与级别控制
+
+| Serilog.Sinks.xxx
+| 输出接收器, 控制台, 文件, Seq 等目的地按需添加
+
+| Serilog.Settings.Configuration
+| 从 appsettings.json 读取日志配置
+
+| Serilog.AspNetCore / Serilog.Extensions.Hosting
+| 与 ASP.NET Core 或 .NET 通用宿主集成
+|===
+
+=== 为什么需要结构化日志
+
+传统日志把变量在调用点直接拼接成字符串, 得到的是不可再分的"一次性文本":
+
+[source,csharp]
+----
+Log.Information($"Processed {orderId} in {elapsedMs} ms");   // <1>
+----
+<1> 字符串插值在调用点就把事件压平成文本
+
+这样做的代价主要有三点:
+
+* **结构不可恢复:** 一旦拼接, "订单号 1001" 与 "耗时 34ms" 就混在同一字符串里, 后续无法按字段过滤与聚合.
+* **检索靠正则:** 想查某个订单的全部日志, 只能依赖脆弱的文本匹配.
+* **关闭也花钱:** 即使日志级别被关闭, 字符串插值仍会先完成拼接, 白白消耗 CPU.
+
+结构化日志把"记录"与"格式化"分离. Serilog 捕获的是模板与参数值, 事件以键值属性保留:
+
+[source,csharp]
+----
+Log.Information("Processed {OrderId} in {ElapsedMs} ms", orderId, elapsedMs);
+----
+
+同一调用在控制台渲染为可读文本, 写入 Seq, Elasticsearch 或文件时则保留两个独立字段:
+
+[source,json]
+----
+{"OrderId": 1001, "ElapsedMs": 34}
+----
+
+有了字段, 就能直接回答"哪些订单处理超过 1 秒", 无需解析文本. **把日志当作数据, 而不是当作给人看的字符串**, 是结构化日志的出发点.
+
+=== 消息模板: 结构化日志的基石
+
+==== 占位符语法
+
+消息模板由文本与 `{Name}` 形式的命名占位符组成, 占位符按位置与调用参数一一对应:
+
+[source,csharp]
+----
+Log.Information("Hello, {Name}!", "Serilog");
+Log.Information("User {Id} logged in", user.Id);
+----
+
+渲染结果与 .NET 字符串插值一致, 但事件额外记录了 `Name`, `Id` 两个属性, 这正是结构化的来源. 实际输出形如:
+
+[source,text]
+----
+[14:05:32 INF] Hello, "Serilog"!
+----
+
+==== 解构与字符串化操作符
+
+占位符前可加操作符, 决定对象值以何种形态进入事件:
+
+* `{@Position}` **解构 (Destructure):** 将对象序列化为结构化属性, 保留内部字段, 适合业务对象与坐标等.
+* `{$UserId}` **字符串化 (Stringify):** 强制以 ToString() 的结果作为字符串属性, 适合本应视为文本的对象.
+* `{Plain}` **默认:** 普通引用类型调用 ToString(), 未重写时只留下类型名, 值等于丢失.
+
+[source,csharp]
+----
+var pos = new { Latitude = 25, Longitude = 134 };
+Log.Information("At {Position}", pos);       // <1>
+Log.Information("At {@Position}", pos);      // <2>
+----
+<1> 默认走 ToString(), 只得到一个不可检索的文本片段
+<2> 解构操作符保留字段结构, 生成可检索的 Position.Latitude, Position.Longitude
+
+[NOTE]
+====
+永远不要用字符串插值生成消息文本, 例如 `Log.Information($"At {pos}")`. 它既丢失结构, 又让"关闭的日志"仍付出格式化成本. 正确写法是传入模板与参数: `Log.Information("At {@Position}", pos)`.
+====
+
+==== 模板使用准则
+
+* **模板保持稳定:** 消息模板应是固定的"句子", 不要在模板内拼接动态文本, 否则同一类事件无法归类统计.
+* **禁止重名占位符:** 同一模板内占位符名不得重复.
+* **参数按需补充:** 不属于模板的属性可通过 Enricher 或 LogContext 附加, 无需强行写进消息文本.
+
+=== 日志级别与过滤
+
+Serilog 提供六个级别, 从低到高依次为 Verbose, Debug, Information, Warning, Error, Fatal:
+
+[cols="2,8"]
+|===
+| 级别 | 典型用途
+
+| Verbose
+| 最细粒度跟踪, 生产环境一般不开启
+
+| Debug
+| 开发期排障信息
+
+| Information
+| 业务事件的正常记录
+
+| Warning
+| 出现异常但可继续运行
+
+| Error
+| 出错但进程仍存活
+
+| Fatal
+| 致命错误, 进程即将退出
+|===
+
+级别通过 `.MinimumLevel` 声明, 低于该级别的事件在调用点即被丢弃. **被关闭的低级别日志几乎零开销**, 因为模板不会渲染, 参数也无需格式化:
+
+[source,csharp]
+----
+new LoggerConfiguration()
+    .MinimumLevel.Debug()                                      // <1>
+    .MinimumLevel.Override("Microsoft", LogEventLevel.Warning) // <2>
+    .WriteTo.Console()
+    .CreateLogger();
+----
+<1> 全局最低级别为 Debug
+<2> 对命名空间前缀 Microsoft 覆盖为 Warning, 屏蔽框架噪音
+
+`Override` 按命名空间或类别 (SourceContext) 精确调整, 例如单独调高 `Microsoft.EntityFrameworkCore` 的详细度以便排查 SQL.
+
+=== 快速上手
+
+桌面应用通常在启动时构建全局日志器, 退出前刷新并关闭:
+
+[source,csharp]
+----
+// App.xaml.cs 或 Main 入口
+using Serilog;
+
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Debug()
+    .WriteTo.Console()                             // <1>
+    .WriteTo.File("logs/app-.log",                 // <2>
+        rollingInterval: RollingInterval.Day,
+        rollOnFileSizeLimit: true,
+        fileSizeLimitBytes: 20 * 1024 * 1024,
+        retainedFileCountLimit: 30)
+    .CreateLogger();
+
+try
+{
+    Log.Information("应用启动, PID {Pid}", Environment.ProcessId);
+    // 业务逻辑...
+}
+catch (Exception ex)
+{
+    Log.Error(ex, "未处理异常");
+}
+finally
+{
+    await Log.CloseAndFlushAsync();                // <3>
+}
+----
+<1> 输出到控制台
+<2> 按天滚动文件, 单文件上限 20 MB, 保留最近 30 份
+<3> 退出前等待 Sink 排空, 避免丢日志
+
+[NOTE]
+====
+纯 GUI 应用没有控制台, 可将 `.WriteTo.Console()` 换成 `.WriteTo.Debug()` (Serilog.Sinks.Debug) 或直接去掉, 日志仍会写入文件.
+====
+
+同时订阅进程级异常, 兜住未被 try/catch 捕获的致命错误:
+
+[source,csharp]
+----
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+    Log.Fatal(e.ExceptionObject as Exception, "致命错误");
+----
+
+=== 日志管道: 一次事件的生命周期
+
+`LoggerConfiguration` 的 Fluent 链依次声明最低级别, Sink, 增强, 过滤与解构, 调用 `.CreateLogger()` 之后便不可变. 一个事件在管道中的旅程如下:
+
+[plantuml, "Serilog 事件处理管道", format=png]
+----
+@startuml
+start
+:业务代码调用 Log.Information("模板 {Prop}", 值);
+if (级别达到 MinimumLevel?) then (未达到)
+  :丢弃事件, 无格式化开销;
+  stop
+else (达到)
+endif
+:构造 LogEvent, 持有消息模板与已捕获属性;
+:Enricher 追加机器名, 线程 ID, 作用域属性;
+:Destructure 规则序列化对象值;
+if (Filter 命中排除条件?) then (命中)
+  :丢弃事件;
+  stop
+else (未命中)
+endif
+:分发给全部 Sink;
+:各 Sink 独立渲染文本或序列化 JSON;
+:Console 打印 / File 落盘 / 远端推送;
+stop
+@enduml
+----
+
+==== 常用 Sink
+
+[cols="2,4,6"]
+|===
+| NuGet 包 | 输出目标 | 典型场景
+
+| Serilog.Sinks.Console
+| 控制台
+| 本地开发, 容器日志
+
+| Serilog.Sinks.File
+| 滚动文件
+| 桌面与服务的本地落盘
+
+| Serilog.Sinks.Async
+| 异步包装器
+| 为文件, HTTP 等慢 Sink 提供后台缓冲
+
+| Serilog.Sinks.Seq
+| Seq 服务器
+| 自带 UI 的结构化日志检索
+
+| Serilog.Sinks.OpenTelemetry
+| OTLP Collector
+| 接入可观测性后端
+
+| Serilog.Sinks.Http
+| REST 端点
+| 自建日志采集管道
+
+| Serilog.Sinks.Debug
+| 调试器输出
+| GUI 应用开发期观察
+|===
+
+各 Sink 相互独立: 文本渲染模板 (outputTemplate) 与结构化格式 (JSON) 按目的地各自指定, 实现"一次记录, 多样消费".
+
+==== Enricher 与 LogContext
+
+Enricher 在事件分发前为其附加属性. 常用增强器包括 `WithMachineName()`, `WithThreadId()`, `WithProcessId()` 以及展开内部异常链的 `WithExceptionDetails()`:
+
+* `.Enrich.FromLogContext()`: 使 LogContext 推入的属性进入事件, 是使用 LogContext 的前提.
+* `.Enrich.WithProperty(key, value)`: 为所有事件追加固定属性, 如环境名或应用名.
+
+**LogContext** 用于在代码作用域内批量附加属性, 并借助 AsyncLocal 随 async/await 流动:
+
+[source,csharp]
+----
+using Serilog.Context;
+
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()                            // <1>
+    .WriteTo.File("app.log")
+    .CreateLogger();
+
+using (LogContext.PushProperty("OrderId", order.Id))    // <2>
+{
+    Log.Information("开始处理订单");
+    await ProcessAsync(order);                          // <3>
+    Log.Information("订单处理完成");
+}
+Log.Information("离开订单作用域");                        // <4>
+----
+<1> 允许 LogContext 属性进入事件, 缺少此行则属性不会出现
+<2> 推入 OrderId 并进入作用域
+<3> AsyncLocal 使属性跨异步边界传递
+<4> 作用域结束, OrderId 自动弹出, 此后事件不再携带
+
+其生命周期可用时序图表示:
+
+[plantuml, "LogContext 作用域时序", format=png]
+----
+@startuml
+participant "业务代码" as Biz
+participant "LogContext" as LC
+participant "Logger" as Logger
+participant "File Sink" as Sink
+
+Biz -> LC: PushProperty("OrderId", 1001)
+activate LC
+note right: 进入 using 作用域, 属性写入 AsyncLocal
+Biz -> Logger: Information("开始处理订单")
+Logger -> Sink: 事件携带 OrderId = 1001
+Biz -> LC: 退出 using 作用域 (Dispose)
+deactivate LC
+note right: OrderId 弹出, 上下文还原
+Biz -> Logger: Information("作用域外日志")
+Logger -> Sink: 事件不再携带 OrderId
+@enduml
+----
+
+若需要"某个类或模块持续携带来源", 用 `Log.ForContext<OrderService>()` 或 `Log.ForContext("Component", "Billing")` 得到子日志器, 后续事件自动附加对应属性, 在结构化输出中体现为 `SourceContext` 等字段.
+
+==== 过滤与解构
+
+* `.Filter.ByExcluding(evt => ...)`: 按谓词剔除事件, 例如不记录健康检查的成功日志.
+* `.Destructure.ToMaximumDepth(n)` / `.ToMaximumStringLength(n)`: 限制解构深度与字符串长度, 防止巨型对象拖垮 Sink.
+* `.Destructure.ByTransforming<T>(fn)`: 自定义业务对象的解构形状.
+
+=== 与宿主及依赖注入集成
+
+在 ASP.NET Core 或 Worker 服务中, 通过宿主构建器接管 `ILogger<T>`, 使第三方库 (EF Core, HttpClient 等) 的日志也纳入同一管道:
+
+[source,csharp]
+----
+using Serilog;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+builder.Host.UseSerilog((ctx, services, cfg) => cfg  // <1>
+    .ReadFrom.Configuration(ctx.Configuration)       // <2>
+    .ReadFrom.Services(services)                     // <3>
+    .Enrich.FromLogContext()
+    .WriteTo.Console());
+
+var app = builder.Build();
+app.Run();
+----
+<1> 接管宿主默认日志管线
+<2> 读取 appsettings.json 中的 Serilog 节
+<3> 允许已注册的服务参与配置 (如自定义 Enricher)
+
+对应配置可写在 appsettings.json:
+
+[source,json]
+----
+{
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Information",
+      "Override": {
+        "Microsoft": "Warning",
+        "Microsoft.Hosting.Lifetime": "Information"
+      }
+    },
+    "WriteTo": [
+      { "Name": "Console" },
+      {
+        "Name": "File",
+        "Args": { "path": "logs/app-.log", "rollingInterval": "Day" }
+      }
+    ],
+    "Enrich": [ "FromLogContext" ]
+  }
+}
+----
+
+宿主集成的意义在于: 框架自身与业务代码共用同一套级别覆盖与 Sink, 排查问题时不会出现"框架日志去向不一致"的断层.
+
+=== 性能与异步
+
+* **默认同步写入:** 事件被同步送入各 Sink, 慢 Sink (文件 IO, 网络) 会阻塞调用线程. 高吞吐或 UI 线程场景应使用 `Serilog.Sinks.Async` 包裹慢 Sink:
+
+[source,csharp]
+----
+.WriteTo.Async(a => a
+    .File("logs/app-.log", rollingInterval: RollingInterval.Day)
+    .Seq("http://localhost:5341"))
+----
+
+* **热路径慎用低级别:** 关闭的日志虽然开销低, 但参数求值仍会发生, 用 `Log.IsEnabled(LogEventLevel.Debug)` 守卫昂贵的取值.
+* **模板占位符是性能前提:** 事件按引用捕获参数, 渲染前不调用 ToString(), 这是"关闭即零成本"成立的基础; 一旦改用字符串插值, 该前提即失效.
+
+=== 常见误区与最佳实践
+
+* **用字符串插值拼消息:** 结构化属性全部丢失, 也无法享受"级别关闭即零成本". 始终使用模板占位符.
+* **把异常拼进消息文本:** `Log.Error("错误: " + ex)` 会丢失堆栈与异常字段. 应将异常作为第一个参数: `Log.Error(ex, "处理失败, {OrderId}", id)`.
+* **忘记 CloseAndFlush:** 进程退出时缓冲区未排空会丢日志, 务必在退出事件中调用 `Log.CloseAndFlushAsync()`.
+* **记录敏感信息:** 密码, Token, PII 会随模板属性进入远端; 模板参数同样会被记录, 需要脱敏或过滤.
+* **事件体量失控:** 把整个实体塞进事件会放大 IO 与存储成本, 用 Destructure 限深或只记录必要字段.
+* **LogContext 作用域过长:** PushProperty 的 using 作用域应尽量短, 避免属性泄漏到不相关事件.
+
+=== 总结
+
+Serilog 的设计要点可归纳为:
+
+* **记录事件而非文本:** 调用点用消息模板描述, 文本渲染推迟到 Sink 写入时, 同一事件可同时输出为文本与结构化数据.
+* **管道职责清晰:** 级别, Enricher, Destructure, Filter 与多个 Sink 各司其职, LoggerConfiguration 一次性声明且不可变.
+* **上下文三层注入:** Enricher 提供全局属性, LogContext 提供作用域属性, ForContext 提供来源属性, 共同支撑"按字段检索"的可观测性.
+* **生态即插即用:** 控制台, 文件, Seq, OpenTelemetry 等 Sink 按需引入, 配合宿主集成可将第三方库日志一并纳管.
+* **性能三条准则:** 模板占位符代替插值, 关闭的级别零成本, 慢 Sink 交给 Async 包装.
+
+实践中建议为每个部署环境固定唯一模板, 用 appsettings.json 统一管理级别与目的地, 并尽早接入结构化检索后端, 让日志从"排障素材"升级为可聚合分析的数据资产.

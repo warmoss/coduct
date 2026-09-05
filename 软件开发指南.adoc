@@ -16,6 +16,8 @@ include::python/index.adoc[]
 
 include::Web/index.adoc[]
 
+include::desktop/index.adoc[]
+
 include::数据库/index.adoc[]
 
 include::缓存/index.adoc[]

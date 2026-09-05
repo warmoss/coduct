@@ -1,0 +1,453 @@
+== DockerCompose参数讲解
+
+Docker Compose 让你用一份 YAML 文件, 把"用哪些镜像, 开哪些端口, 挂哪些卷, 注入什么环境变量, 谁先启动"一次性描述为可复现的多容器应用. 但编排事故的根因, 大多不在命令而在**参数**: 同样的服务, 参数取值不同, 就会表现为端口暴露到公网, 依赖服务未就绪, 数据被清空, 容器停不下来等线上问题. 本文以 **Docker Compose v2** (`docker compose` 命令, 随 Docker CLI 分发的插件) 与 **Compose Specification** 为准, 先讲清楚 Compose 文件的层级结构, 再按功能分类拆解最常用的参数, 最后用综合示例串联收尾.
+
+NOTE: 传统 `docker-compose` 独立命令与 Compose 文件顶部的 `version` 字段已在 v1 时代被废弃. 新项目应统一使用 `docker compose`, 且不要再写 `version`.
+
+参考: <<运维/Kubernetes原理讲解.adoc#, Kubernetes原理讲解>>, <<运维/crictl讲解.adoc#, crictl讲解>>, <<操作系统/NAT原理讲解.adoc#, NAT原理讲解>>, <<操作系统/ubuntu cgroup原理讲解.adoc#, ubuntu cgroup 原理讲解>>
+
+=== Compose 文件结构与参数层级
+
+Compose 文件(默认文件名 `compose.yaml`, 旧名 `docker-compose.yml` 仍被支持) 的参数按**三个层级**组织:
+
+[source,yaml]
+----
+name: myapp                          # <1>
+services:                            # <2>
+  web:
+    image: nginx:alpine              # <3>
+    ports:
+      - "8080:80"                    # <4>
+networks:                            # <5>
+  frontend: {}
+volumes:                             # <6>
+  db-data: {}
+----
+<1> 覆盖默认的项目名, 默认取所在目录名
+<2> 每个服务在这里定义, 大多数参数都挂在服务名下
+<3> 直接写在服务名下的键值
+<4> 列表项内部的子字段 (ports 的 target/published 等)
+<5> 声明的自定义网络, 服务通过 service 级 `networks` 引用
+<6> 声明的命名卷, 供多个服务共享
+
+[cols="1,1,3"]
+|===
+| 层级 | 常见参数 | 说明
+
+| 顶层
+| `services`, `networks`, `volumes`, `configs`, `secrets`, `name`, `include`
+| 定义项目名与项目级资源; 只有 `services` 为必填
+
+| service 级
+| `image`, `build`, `ports`, `volumes`, `environment`, `depends_on`, `healthcheck`, `restart`, `init`
+| 定义一个服务的镜像来源与运行行为
+
+| 元素级
+| ports 的 `target`/`published`, volumes 的 `source`/`target`/`read_only`
+| 细化单个端口项或挂载项
+|===
+
+当文件里没有显式声明网络时, Compose 会隐式创建 `default` 网络, 让所有服务处于同一网络并以**服务名**互相解析. 这一默认行为解释了为什么很多 Compose 应用"没配网络也能互通".
+
+=== 参数插值与合并规则
+
+在逐参数讲解前, 先理解 Compose 在"读取文件"阶段如何解析参数, 很多"参数没生效"的问题都源于此.
+
+* **环境变量插值:** 文件中 `${VAR}` 会被替换, 支持 `${VAR:-默认值}` (缺省兜底) 与 `${VAR:?错误信息}` (缺失即报错); 需要输出字面 `$` 时写成 `$$`. 变量来源优先级从高到低: 宿主机 shell 环境变量, 项目目录下的 `.env` 文件, Compose 文件内的默认值
+* **多文件合并:** 通过 `-f` 叠加多个文件, 后加载者覆盖先加载者; 当存在 `compose.yaml` (或 `docker-compose.yml`) 时, Compose 还会自动叠加同目录下的 `compose.override.yaml`, 常用于"基础配置 + 本机覆盖"
+* **注入优先级:** 同一变量同时出现在 `environment` 与 `env_file` 中时, `environment` 优先
+
+=== init 参数讲解
+
+`init` 是 service 级**布尔参数**, 控制容器内是否以专用 **init 进程** 作为 PID 1. 默认 `false`, 开启写法如下:
+
+[source,yaml]
+----
+services:
+  web:
+    image: nginx:alpine
+    init: true                       # <1>
+----
+<1> 开启后容器内 PID 1 变为轻量 init 进程 (Linux 上为 tini), 应用进程退居其子进程
+
+==== 为什么要设置 init
+
+容器内的 **PID 1 承担着普通进程没有的两项内核职责**, 而大多数应用并未实现它们, 这正是 init 存在的根本原因.
+
+* **回收僵尸进程:** 孤儿进程会被内核交给 PID 1 收养, 退出后变为僵尸进程 (Zombie), 等待 PID 1 调用 `wait` 回收. 若 PID 1 是应用自身且不回收, 僵尸会持续堆积. 典型场景是 Java/Node 派生子进程, 或 Nginx 的 master/worker 结构
+* **转发终止信号:** 内核把发给容器的 `SIGTERM`/`SIGINT`/`SIGHUP` 只投递给 PID 1. 若 PID 1 是应用, 它可能不处理, 或处理后不转发给子进程, 于是优雅停机失效, 最终只能由守护进程在超时后补发 `SIGKILL`
+
+WARNING: 僵尸进程堆积不会造成明显 CPU 占用, 但会耗尽系统的 PID 上限; 信号转发失败则会导致"进程收到停止指令却迟迟不退".
+
+==== init 如何工作
+
+Linux 上 Docker 注入的 init 进程是 **tini**, 它只做两件事:
+
+. 监听来自容器外部的信号并**转发**给真正的主进程
+. 作为 PID 1 主动 `wait` **回收**全部子进程, 并把主进程的退出码透传为容器退出码
+
+开启 `init: true` 与 `docker run --init` 等价. init 只是垫片, 镜像的 ENTRYPOINT/CMD 仍照常执行, 业务代码无需改动. 不少官方镜像 (如部分 Node/Java 镜像) 自身已内置 tini, 此时再开 `init` 收益有限.
+
+TIP: 排查"容器退不出"或"僵尸进程堆积"时, 先 `docker exec <容器> ps -ef` 看 PID 1 是谁. 若 PID 1 直接是应用进程, 大概率需要开启 `init: true`.
+
+==== 何时不需要 init
+
+* 镜像入口以 **exec 形式**直接启动主进程, 且主进程不派生子进程, 此时无僵尸回收需求
+* 应用本身是多进程管理器 (supervisord, s6 等), 它本身就是合格的 PID 1
+
+NOTE: `init` 解决"进程回收与信号转发", 不解决"单容器内跑多服务的编排", 后者应交给进程管理器或拆分为多个 Compose 服务.
+
+=== 镜像与构建参数
+
+决定"服务用什么镜像, 镜像从哪来":
+
+[cols="1,3"]
+|===
+| 参数 | 取值与说明
+
+| `image`
+| 格式 `[仓库/]镜像[:标签|@摘要]`, 例如 `nginx:alpine`, `my.registry:5000/app@sha256:...`; 与 `build` 并存时, 该标签作为构建产物的命名
+
+| `build`
+| 从源码构建时的配置: `context` (构建上下文), `dockerfile`, `target` (多阶段目标阶段), `args` (构建期变量, 对应 ARG), `platform`
+
+| `pull_policy`
+| 拉取策略: `missing` (本地无镜像才拉, 默认), `always` (总是拉), `never` (只用本地), `build` (总是重新构建); 还可设 `daily`/`weekly`/`every_<时长>` 定时检查更新
+|===
+
+[source,yaml]
+----
+services:
+  app:
+    image: registry.example.com/app:1.2.0   # 优先使用仓库镜像
+    build:
+      context: ./app
+      dockerfile: Dockerfile.prod
+      target: runtime
+      args:
+        APP_VERSION: "1.2.0"
+    pull_policy: missing                     # 本地没有时才拉
+----
+
+=== 进程与入口参数
+
+控制"容器里最终跑什么命令, 以什么身份跑":
+
+[source,yaml]
+----
+services:
+  app:
+    image: node:22
+    entrypoint: ["node", "server.js"]   # 覆盖镜像 ENTRYPOINT
+    command: ["--port", "3000"]         # 覆盖镜像 CMD, 作为参数
+    user: "1000:1000"                   # 以 UID:GID 运行
+    working_dir: /app                   # 覆盖镜像 WORKDIR
+----
+
+* **`entrypoint` 与 `command`:** 拼接规则与 Dockerfile 一致, entrypoint 固定, command 作为其参数; 设为空列表 `[]` 可清空镜像默认值. 需要 shell 展开时必须显式写 `/bin/sh -c '...'`
+* **`user`:** 推荐以 `UID:GID` 数字形式写, 避免容器内外用户 ID 不一致导致数据卷权限错乱
+* **`working_dir`:** 设置容器内的工作目录
+
+=== 环境变量参数
+
+环境变量是"不改镜像即可改配置"的主要手段.
+
+[source,yaml]
+----
+services:
+  app:
+    image: app:latest
+    environment:
+      NODE_ENV: production           # 映射写法
+      SHOW: "true"                   # 布尔值务必加引号
+      HOSTNAME                       # 裸键: 透传宿主机同名变量
+    env_file:
+      - ./app.env                    # 从文件批量加载
+----
+
+* **`environment`:** 支持映射与数组两种写法; 值含 `true`/`false`/纯数字时建议加引号, 防止被 YAML 解析为布尔或数值
+* **`env_file`:** 按文件顺序加载, 靠后的文件覆盖靠前者; 与 `environment` 冲突时 `environment` 胜出. 文件内 `#` 为注释, 单引号内的值不做插值
+* 不要把 `env_file` 与插值用的 `.env` 混淆: `.env` 是 Compose **解析文件本身**时的变量来源, `env_file` 是注入到**容器内**的环境变量
+
+=== 网络参数
+
+决定"服务能否互通, 端口如何暴露到宿主机".
+
+[source,yaml]
+----
+services:
+  web:
+    image: nginx:alpine
+    networks:
+      frontend: {}
+      backend:
+        aliases: [web-internal]      # 该网络内的额外别名
+    ports:
+      - "8080:80"                    # 宿主机 8080 -> 容器 80
+      - "127.0.0.1:9090:9090"        # 仅绑定本机回环
+    expose:
+      - "9000"                       # 仅对同网络服务可见
+    dns: [8.8.8.8]                   # 自定义 DNS
+
+networks:
+  frontend: {}
+  backend:
+    internal: true                   # 内网, 禁止访问外网
+----
+
+* **`networks` (service 级):** 声明服务加入哪些网络; 同网络内的容器可用**服务名**互相访问 (内部基于 DNS), 比硬编码容器 IP 更稳健. `aliases` 可追加额外主机名
+* **`ports`:** 把容器端口发布到宿主机. 短语法 `[IP:]宿主端口:容器端口[/协议]`; 长语法可细写 `target`/`published`/`host_ip`/`protocol`/`mode`. 只写 `"80"` 时宿主机端口由系统随机分配
+* **`expose`:** 仅在 Compose 网络内部开放端口, 不发布到宿主机; 镜像 Dockerfile 中 `EXPOSE` 过的端口本来就对同网络容器可见
+* **`network_mode`:** 支持 `host`/`none`/`service:<名>` 等特殊模式; 用了 `host` 后不得再写 `ports` (端口已直通宿主机)
+* **`dns`:** 覆盖容器内 `/etc/resolv.conf` 的 DNS 服务器
+
+WARNING: `ports` 短语法若不指定宿主 IP, 会绑定到所有网卡 (`0.0.0.0`), 可能绕过宿主机防火墙把服务直接暴露到公网. 只希望本机访问时应写成 `127.0.0.1:8080:80`. 端口映射的本质是 DNAT, 详见 <<操作系统/NAT原理讲解.adoc#, NAT原理讲解>>.
+
+=== 存储与数据持久化参数
+
+解决"容器删除后数据是否还在"的问题. Compose 提供三种挂载类型:
+
+[cols="1,3"]
+|===
+| 类型 | 说明
+
+| bind mount
+| 把宿主机路径挂进容器, 路径以 `./`/`../` 或绝对路径开头; 宿主机改动即时可见, 适合源码与配置热更新
+
+| named volume
+| 由 Compose 管理的卷, 在顶层 `volumes` 声明; 数据生命周期独立于容器, 适合数据库等需要持久化的数据
+
+| tmpfs
+| 仅驻留内存的临时目录, 容器停止即消失, 适合缓存与临时文件
+|===
+
+[source,yaml]
+----
+services:
+  app:
+    image: app:latest
+    volumes:
+      - ./src:/app/src:ro                    # bind 只读
+      - db-data:/var/lib/data                # 命名卷
+      - type: tmpfs                          # 长语法: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1048576
+
+volumes:
+  db-data: {}                                # 顶层声明命名卷
+----
+
+* 短语法为 `源:目标[:模式]`, 模式可取 `ro`/`rw`/`z` (SELinux); 长语法用 `type` 显式区分 `bind`/`volume`/`tmpfs`, 可配 `read_only`, `bind.propagation`, `volume.subpath` 等
+* 相对路径必须以 `./` 或 `../` 开头, 否则会被当成卷名
+* 单个服务独占的宿主机路径可直接写在 service 里; 需要多服务共享或生命周期独立时, 用顶层声明的命名卷
+* 建议把需要落盘的目录 (数据库数据目录, 日志) 都挂到命名卷, 容器重建不丢数据
+
+=== 生命周期与高可用参数
+
+控制"启动顺序, 就绪判定, 崩溃自愈与优雅停机".
+
+[source,yaml]
+----
+services:
+  web:
+    image: nginx:alpine
+    depends_on:
+      db:
+        condition: service_healthy           # <1>
+        restart: true                        # <2>
+    restart: unless-stopped
+  db:
+    image: postgres:18
+    healthcheck:                             # <3>
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s                   # <4>
+----
+<1> 依赖健康检查通过后再启动 web
+<2> 依赖服务更新重启时, web 跟随重启
+<3> 自定义就绪判定命令与参数
+<4> 停止容器时给足优雅退出时间
+
+* **`depends_on`:** 短语法只保证"启动顺序", 不保证"依赖已就绪". 长语法用 `condition` 指定条件: `service_started` (仅已启动, 默认), `service_healthy` (健康检查通过), `service_completed_successfully` (一次性任务成功退出). 附加选项: `restart: true` 让依赖重启时本服务随之重启, `required: false` 把硬依赖降级为仅告警
+* **`healthcheck`:** 常用子字段: `test` (探测命令, 取值 `CMD`/`CMD-SHELL`/`NONE`), `interval`, `timeout`, `retries`, `start_period` (启动宽限期, 不计入失败), `start_interval`; `disable: true` 关闭镜像自带的健康检查
+* **`restart`:** 容器崩溃后由 Docker 守护进程执行的策略: `no` (默认), `always` (任何退出都重启), `on-failure[:N]` (非零退出才重启, 可限次数), `unless-stopped` (手动 stop 之外都重启)
+* **`stop_grace_period` 与 `stop_signal`:** 默认先发 `SIGTERM`, 等待 10s 后再发 `SIGKILL`. 需要更久清理的服务调大 `stop_grace_period`; 不响应 SIGTERM 的服务改用 `stop_signal` (如 `SIGQUIT`)
+
+NOTE: `restart` 只处理"进程崩溃"这类自动重启. 配置变更后执行 `docker compose up -d` 会重建容器, 两者是不同机制.
+
+=== 资源与调度参数
+
+给容器设置资源上限与调度约束, 底层依赖 cgroup (详见 <<操作系统/ubuntu cgroup原理讲解.adoc#, ubuntu cgroup 原理讲解>>).
+
+[source,yaml]
+----
+services:
+  app:
+    image: app:latest
+    cpus: "1.5"              # 最多 1.5 个 CPU
+    mem_limit: 512m          # 内存上限
+    pids_limit: 200          # PID 数量上限, 防 fork 炸弹
+    platform: linux/amd64    # 指定拉取/运行的平台
+    scale: 2                 # 默认副本数
+----
+
+* **`cpus`/`mem_limit`/`pids_limit`:** 本地 `docker compose up` 直接生效; 需与 `deploy.resources` 中的 `limits.cpus`/`limits.memory` 保持一致 (deploy 段主要服务于 Docker Swarm 等平台)
+* **`platform`:** 多架构环境下指定目标平台, 影响镜像拉取与构建
+* **`scale`:** 服务默认启动的副本数; 配合 `container_name` 时不能超过 1 个副本
+* **`profiles`:** 给服务打标签, 未启用对应 profile 时服务不启动, 适合拆分开发/生产/运维工具等可选服务
+
+=== 敏感信息与只读加固参数
+
+* **`secrets`:** 顶层声明 (来源为 `file` 或 `environment`), service 通过 `secrets` 显式授权后, 内容以只读文件挂到 `/run/secrets/<名>`, 默认权限 `0444`; 应用从文件读取, 避免把密码写进环境变量或镜像层
+* **`configs`:** 与 secrets 类似但用于**非敏感**配置, 默认挂到容器内 `/<名>`, 可通过 `target` 挂到任意路径
+* **`read_only`:** 把容器根文件系统设为只读, 只有显式挂载的目录可写, 缩小被写坏的攻击面
+* **`security_opt`:** 常见如 `no-new-privileges` 禁止提权
+* **`cap_drop`/`cap_add`:** 收窄 Linux capabilities, 遵循最小权限原则
+
+[source,yaml]
+----
+services:
+  app:
+    image: app:latest
+    read_only: true
+    tmpfs:
+      - /tmp                          # 只读根文件系统也要可写临时目录
+    secrets:
+      - db_password
+    configs:
+      - source: app_conf
+        target: /etc/app/config.yml
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+
+configs:
+  app_conf:
+    file: ./config.yml
+----
+
+=== 编排执行流程
+
+理解 `docker compose up` 的全过程, 有助于把前面各参数串起来:
+
+[plantuml, "docker compose up 编排流程", format=png]
+----
+@startuml
+actor Developer as Dev
+participant "compose CLI" as C
+participant "Docker Engine" as E
+participant "db" as D
+participant "web" as W
+Dev -> C: docker compose up -d
+C -> C: load & merge compose files
+C -> C: resolve depends_on order
+C -> E: create networks & volumes
+C -> E: pull / build images
+C -> D: start db
+E --> C: db healthy
+C -> W: start web (service_healthy)
+C --> Dev: services up
+@enduml
+----
+
+标准执行阶段:
+
+. **解析配置:** 合并 `-f` 指定的多个文件与自动叠加的 override 文件, 完成 `${VAR}` 插值
+. **准备资源:** 创建文件中声明的自定义网络与命名卷
+. **准备镜像:** 依 `pull_policy` 拉取镜像, 或依 `build` 就地构建
+. **按序启动:** 按 `depends_on` 拓扑创建容器; 使用 `service_healthy` 条件时, 会等待依赖健康检查通过再启动下游
+. **交付运行:** 输出日志与状态; 前台模式 (`up`) 会把多个服务日志合并流式输出
+
+对应的 `docker compose down` 按**相反顺序**停止: 先停 web, 再停 db. 默认不删除命名卷 (数据保留), 需要清空时加 `-v`.
+
+=== 综合示例
+
+把前面各类参数组合成一份接近生产的 Compose 文件:
+
+[source,yaml]
+----
+name: shop
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "127.0.0.1:8080:80"        # 仅本机访问
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [frontend, backend]
+
+  api:
+    build: ./api
+    environment:
+      DB_URL: postgres://app:${DB_PASSWORD}@db:5432/app
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [backend]
+
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 30s
+    networks: [backend]
+
+  redis:
+    image: redis:8
+    init: true
+    networks: [backend]
+
+networks:
+  frontend: {}
+  backend:
+    internal: true                # db/redis 不直接暴露
+
+volumes:
+  db-data:
+
+secrets:
+  db_password:
+    environment: "DB_PASSWORD"    # 从宿主机环境变量取密文
+----
+
+几点呼应前文: `init: true` 保证 redis 作为 PID 1 的进程语义正确; db 通过健康检查才放行下游服务; `internal` 网络让数据库不出公网; 密码经 `secrets` 注入而非写死在环境变量.
+
+=== 最佳实践与常见误区
+
+* 命名与文件: 用 `docker compose` 命令与 `compose.yaml` 文件, 不再写 `version`; 用 `name` 显式给定项目名, 避免同名目录互相干扰
+* 确定性: 生产环境镜像使用固定 tag 或 digest, 配合 `pull_policy`, 避免"本地有旧镜像就不更新"
+* 就绪判定: 依赖其它服务时, 用 `depends_on` 长语法 + `healthcheck` 的 `service_healthy`, 而不是裸短语法
+* 网络安全: 默认网络让服务互通, 需要隔离时自定义网络; 数据库等只应被后端访问的服务放进 `internal` 网络; 端口发布显式写宿主 IP
+* 数据与权限: 持久化数据放命名卷, 以非 root 运行 (`user`), 敏感信息走 `secrets`, 尽量开 `read_only`
+* 误区分辨: `restart` 管崩溃自愈, `depends_on` 管启动顺序, `healthcheck` 管就绪判定, `init` 管 PID 1 语义, 四者职责不同, 不要混用
+* 调试手段: 先用 `docker compose config` 查看合并插值后的最终配置, 再用 `docker compose ps`/`logs` 排查运行状态
+
+=== 总结
+
+Docker Compose 的参数按 **顶层 / service 级 / 元素级** 三个层级组织, 核心是 `services`; 常用参数可按 **镜像构建, 进程入口, 环境变量, 网络, 存储, 生命周期, 资源, 敏感信息** 八类记忆. 线上最易踩坑的三点: `init` 与 PID 1 语义, `depends_on` 不等于"就绪等待", `ports` 默认绑定全部网卡. 弄清每个参数"管什么, 何时用"之后, Compose 就不再是"能跑就行"的黑盒.
