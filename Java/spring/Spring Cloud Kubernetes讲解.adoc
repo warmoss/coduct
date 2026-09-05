@@ -1,0 +1,435 @@
+== Spring Cloud Kubernetes讲解
+
+Spring Cloud Kubernetes 是 Spring Cloud 官方的 Kubernetes 集成实现, 它把 Spring Cloud Commons 定义的服务发现, 配置管理, 负载均衡等抽象一一映射到 Kubernetes 原语 (Service, Endpoints, ConfigMap, Secret). 但必须强调一个前提: **它并不是在 Kubernetes 上运行 Spring Boot 应用的必要条件**. 如果只是把一个 Spring Boot 应用部署到 K8s, 仅靠 Kubernetes 自身的 DNS 与 Service 机制就够了. 本文聚焦的是那些确实需要 Spring Cloud 客户端抽象 (DiscoveryClient, PropertySource, LoadBalancer) 的团队, 解释这些能力是如何在 K8s 之上实现的.
+
+参考: <<Java/spring/SpringBoot4讲解.adoc#, SpringBoot4讲解>>, <<运维/Kubernetes原理讲解.adoc#, Kubernetes原理讲解>>
+
+[[sck-position]]
+=== 定位与核心概念
+
+先厘清贯穿全文的术语:
+
+Kubernetes (K8s):: 容器编排平台, 提供声明式部署, 服务发现, 配置 (ConfigMap/Secret) 与自动伸缩等能力. 集群内的一切访问都经由 API Server.
+
+Service:: K8s 中一组 Pod 的稳定访问入口, 拥有稳定的 DNS 名 (形如 `service.namespace.svc.cluster.local`) 与虚拟 IP.
+
+Endpoints 与 EndpointSlice:: Service 后端真实地址集合的记录, 由控制器根据就绪 Pod 自动维护, 是服务发现最终要拿到的实例清单.
+
+ConfigMap 与 Secret:: K8s 中以键值对存储的配置与敏感数据对象, 可挂载为卷或经 API 读取.
+
+DiscoveryClient:: Spring Cloud Commons 定义的服务发现抽象接口, 核心方法为 `getServices()` 与 `getInstances(serviceId)`.
+
+PropertySource:: Spring `Environment` 中按优先级排列的属性来源抽象, 配置中心的本质就是注入自定义 PropertySource.
+
+Spring Cloud LoadBalancer:: Spring Cloud 官方的客户端负载均衡库, 通过 `ServiceInstanceListSupplier` 提供实例清单.
+
+Spring Cloud Kubernetes 解决的是一类**语义错位**问题: 微服务框架期望"按服务名找到可调用实例", 而 Kubernetes 把这一信息天然地放在 Service/Endpoints 中. 若不引入本框架, 需要自己调用 kube API 或硬编码 Service 名; 引入后, 便能在 K8s 环境里继续使用 `DiscoveryClient`, `@LoadBalanced` 与 `spring.config.import` 等 Spring 既有编程模型, 同时保留 K8s 作为基础设施提供的健康检查, 滚动更新与弹性能力.
+
+* **Kubernetes 意识** - 检测到运行在 K8s 集群内时自动启用相关自动配置
+* **服务发现** - 用 Service/Endpoints 实现 `DiscoveryClient`
+* **配置管理** - 把 ConfigMap/Secret 注入为 PropertySource
+* **负载均衡** - 与 Spring Cloud LoadBalancer 集成, 支持 POD 与 SERVICE 两种模式
+
+[[sck-version]]
+=== 版本与模块
+
+截至本文 (2026 年 9 月), Spring Cloud Kubernetes 的最新稳定版为 **5.0.3** (2026 年 8 月发布). 5.0.0 于 **2025 年 11 月 25 日**发布, 与 Spring Cloud 2025.0.x 发行列车同期, 基于 Spring Boot 3.5.x. 主分支已切到面向 Spring Cloud 2026.0 (Spring Boot 4) 的 `2026.0.0-SNAPSHOT`, 相关里程碑版本正在开发中.
+
+[cols="3,3"]
+|===
+|版本线 |说明
+
+|4.0.x
+|随 Spring Cloud 2024.0.x 发布, 适配 Spring Boot 3.4/3.5
+
+|5.0.x
+|当前稳定线, 随 Spring Cloud 2025.0.x 发布, 基于 Spring Boot 3.5
+
+|2026.0.0-SNAPSHOT
+|开发中, 面向 Spring Boot 4 / Spring Framework 7
+
+|===
+
+WARNING: Spring Cloud Kubernetes 目前**不支持 Spring Boot AOT 变换与 Native Image**. 计划使用 GraalVM 原生镜像的项目需评估此限制.
+
+项目按"Kubernetes Java 客户端"分为两套互斥的实现线, 均提供同名 Starter:
+
+* **Kubernetes Java Client** (官方, `io.kubernetes:client-java`) - Starter 前缀为 `spring-cloud-starter-kubernetes-client`
+* **Fabric8 Kubernetes Client** (社区) - Starter 前缀为 `spring-cloud-starter-kubernetes-fabric8`
+
+WARNING: **两套实现的 Starter 不能混用**, 必须二选一. 两者的自动配置会同时注册相同类型的 Bean, 混用会导致上下文冲突.
+
+[cols="2,3,3"]
+|===
+|能力 |官方 Kubernetes Client |Fabric8
+
+|全部功能
+|`spring-cloud-starter-kubernetes-client-all`
+|`spring-cloud-starter-kubernetes-fabric8-all`
+
+|服务发现
+|`spring-cloud-starter-kubernetes-client`
+|`spring-cloud-starter-kubernetes-fabric8`
+
+|ConfigMap/Secret 配置
+|`spring-cloud-starter-kubernetes-client-config`
+|`spring-cloud-starter-kubernetes-fabric8-config`
+
+|负载均衡
+|`spring-cloud-starter-kubernetes-client-loadbalancer`
+|`spring-cloud-starter-kubernetes-fabric8-loadbalancer`
+
+|基于 HTTP 的服务发现
+|`spring-cloud-starter-kubernetes-discoveryclient`
+|同左 (配合 DiscoveryServer 使用)
+
+|===
+
+模块内部按职责拆分, 官方客户端实现的源码模块包括 `spring-cloud-kubernetes-client-core`, `-config`, `-discovery`, `-loadbalancer`, `-leader`, 以及两者共享的 `spring-cloud-kubernetes-commons` (配置属性, 通用工具与映射逻辑), 另有独立的 `spring-cloud-kubernetes-controllers` (配置监听控制器等).
+
+[[sck-discovery]]
+=== 服务发现
+
+服务发现由模块内的 `*DiscoveryClient` 实现, 它把 **Service 名称解析为一组 ServiceInstance**. 使用前引入对应 Starter:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-kubernetes-client</artifactId>
+</dependency>
+----
+
+解析过程的基础是 Service 及其 Endpoints (默认) 或 EndpointSlice (需开启 `spring.cloud.kubernetes.discovery.use-endpoint-slices=true`), 因此 Pod 的 ServiceAccount 需具备相应资源的读权限 (见 <<sck-rbac, 权限章节>>). 引入后即可注入使用:
+
+[source,java]
+----
+@SpringBootApplication
+@EnableDiscoveryClient
+public class OrderApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(OrderApplication.class, args);
+    }
+}
+----
+
+[source,java]
+----
+@Autowired
+private DiscoveryClient discoveryClient;
+
+public void callInventory() {
+    List<ServiceInstance> instances = discoveryClient.getInstances("inventory-service");
+    // 每个实例包含 host(IP), port, metadata 等
+}
+----
+
+. 命名空间 (namespace) 决定"到哪里去找服务", 三种方式:
+* **单一命名空间** (默认) - 按 <<sck-namespace, Namespace 解析规则>> 自动推断应用所在命名空间
+* **选择性命名空间** - `spring.cloud.kubernetes.discovery.namespaces[0]=ns1` 指定一个列表
+* **全部命名空间** - `spring.cloud.kubernetes.discovery.all-namespaces=true`, 对 API Server 负担大, 慎用
+
+. 过滤规则决定"找到哪些服务", 两种手段:
+* `spring.cloud.kubernetes.discovery.service-labels` - 只发现带指定标签的 Service, 可缩小缓存规模
+* `spring.cloud.kubernetes.discovery.filter` - 用 SpEL 表达式过滤, 表达式针对所选客户端的数据模型类 (fabric8 的 `Service` 或官方客户端的 `V1Service`)
+
+端口与安全位的选择遵循一套确定性规则: 无端口返回 0; 仅一个端口直接采用; 否则依次参考 Service 标签 `primary-port-name`, 属性 `spring.cloud.kubernetes.discovery.primary-port-name`, 名为 `https`/`http` 的端口, 最后才取端口列表首项 (此路径可能导致非确定性行为). 安全位则按标签/注解 `secured`, 内置已知安全端口 `[443, 8443]` 与端口名 `https` 依次判定.
+
+返回的 `ServiceInstance` 除标准字段外还携带扩展元数据, 需显式开启才填充, 例如 `metadata.add-labels=true` 会附带 Service 标签, `metadata.add-pod-labels=true` 附带 Pod 标签, 另有固定的 `k8s_namespace` 与 `type` (ClusterIP/ExternalName 等) 字段.
+
+Kubernetes 还会为 Service 同步维护真实 Pod 的健康状态, 因此默认只返回 **Ready** 地址. 若需监控未就绪实例 (如检查其 `/health`), 可设 `spring.cloud.kubernetes.discovery.include-not-ready-addresses=true`. 同理, `ExternalName` 类型的 Service 默认被排除, 需 `spring.cloud.kubernetes.discovery.include-external-name-services=true` 才纳入.
+
+[plantuml, "服务发现与负载均衡调用时序", format=png]
+----
+@startuml
+actor Client as client
+participant "订单服务 (Spring Boot)" as app
+participant "DiscoveryClient" as dc
+participant "Kube API Server" as api
+participant "库存服务实例" as pod
+
+client -> app : 请求触发对 inventory-service 的调用
+app -> dc : getInstances("inventory-service")
+dc -> api : list 命名空间内的 Service 与 Endpoints
+api --> dc : 返回就绪实例列表 (Pod IP:Port)
+dc --> app : List<ServiceInstance>
+app -> app : LoadBalancer 按策略挑选实例
+app -> pod : HTTP 调用所选实例
+pod --> app : 业务响应
+app --> client : 返回结果
+@enduml
+----
+
+应用若想感知服务目录的持续变化 (如新副本上线), 可开启 **catalog watch**: 在配置类上加 `@EnableScheduling`, 框架会每 `spring.cloud.kubernetes.discovery.catalog-services-watch-delay` 毫秒 (默认 30000) 发布一次心跳事件, 监听者对比两次事件的 `equals` 即可判定差异. 该功能可用 `spring.cloud.kubernetes.discovery.catalog-services-watch.enabled=false` 关闭.
+
+[[sck-config]]
+=== 配置管理
+
+Spring Cloud Kubernetes 将 ConfigMap/Secret 变为 PropertySource, 接入 **Spring Boot 的 Config Data 体系**. 引入 `-config` Starter 后, 在配置文件中声明导入即可:
+
+[source,yaml]
+----
+spring:
+  application:
+    name: order-service
+  config:
+    import: "kubernetes:"
+----
+
+按 Config Data 规则, `kubernetes:` 导入源的**优先级高于声明它的配置文档**, 且多个导入按声明顺序后者的优先级更高. 例如先 `optional:configserver:` 再 `kubernetes:` 时, 后者覆盖前者. 命令行走参, 系统属性, 环境变量等 Spring Boot 高优来源仍可覆盖导入值.
+
+WARNING: 若需像 3.0 之前的版本那样在 **bootstrap 阶段**加载, 必须使用 `spring-cloud-starter-bootstrap` (或 `spring.cloud.bootstrap.enabled=true`). 传统 bootstrap 方式与 `spring.config.import` 方式**互斥, 不可同时使用**.
+
+==== ConfigMap 定位与解析
+
+默认按名称查找 ConfigMap, 候选名依次为 `spring.cloud.kubernetes.config.name`, `${spring.application.name}`, 字面量 `application`. 更常见的做法是用 `sources` 列表显式声明多个来源, 每个来源可指定 name, namespace 或 labels:
+
+[source,yaml]
+----
+spring:
+  cloud:
+    kubernetes:
+      config:
+        namespace: default
+        sources:
+          - name: order-service          # 本命名空间内名为 order-service 的 ConfigMap
+          - namespace: shared            # 命名空间 shared 内名为 order-service 的 ConfigMap
+          - namespace: shared
+            name: common
+----
+
+找到 ConfigMap 后按以下顺序解析其中的键:
+
+. 键名为 `<应用名>.yaml` (缺省回退 `application.yaml/properties`) 的值作为文件解析, 得到基础属性
+. 键名为 `<应用名>-<激活profile>.yaml` 的值作为文件解析, 每个激活 profile 一份, 覆盖基础属性
+. 其余普通键值对作为平面属性, 优先级最高
+
+例: 应用名 `order-service`, 激活 profile `k8s`, 那么 `order-service.yaml` 内的属性先加载, `order-service-k8s.yaml` 内属性后加载并覆盖同名项, 而 ConfigMap 中直接写的 `key: value` 最终胜出. 若某 ConfigMap 只有一个文件型键 (常见于 `kubectl create configmap x --from-file=app.yaml`), 该键名不必是 `application.yaml`.
+
+多来源同名属性时默认"后声明的胜出". 需要隔离可用两种前缀策略:
+
+* `useNameAsPrefix: true` - 以 ConfigMap 名为属性前缀, 如 `order-service.greeting.message`
+* `explicitPrefix: xxx` - 显式前缀, 优先级高于 `useNameAsPrefix`, 仅能配在单个 source 上
+
+[source,yaml]
+----
+spring:
+  cloud:
+    kubernetes:
+      config:
+        useNameAsPrefix: true
+        sources:
+          - name: config-map-one
+            useNameAsPrefix: false   # 该项不套前缀
+          - name: config-map-two
+            explicitPrefix: two      # 该项前缀固定为 two
+----
+
+NOTE: 自 5.0.0 起 `includeProfileSpecificSources` 仅对"按名指定"的 source 生效, 对按标签 (labels) 指定的 source 不再支持.
+
+profile 本身还可拆到**独立 ConfigMap**: 框架会自动尝试读取 `demo`, `demo-development`, `demo-production` 等多个对象, 激活的 profile 越多, 参与合并的 ConfigMap 越多. 应用内激活 profile 通常由 Deployment 环境变量注入 (见 <<sck-rbac, 示例 Deployment>>).
+
+==== Secrets
+
+Secret 的机制与 ConfigMap 完全一致 (同样支持 `sources`, 前缀, fail-fast 与 retry). 但数据来源有三个层次, 且出于安全考虑默认行为不同:
+
+. 递归读取挂载卷中的 Secret 文件 (默认启用, 推荐)
+. 读取名为 `${spring.application.name}` 的 Secret (经 API, **默认关闭**)
+. 匹配 labels 的 Secret (经 API, **默认关闭**)
+
+[source,yaml]
+----
+spring:
+  cloud:
+    kubernetes:
+      secrets:
+        enabled: true
+        name: db-secret          # 经 API 按名读取
+        namespace: default
+----
+
+IMPORTANT: 经 API 读取 Secret 意味着客户端拥有 `list` 权限, 可窥探命名空间内全部 Secret. **首选做法是把 Secret 挂载为卷或经 `secretKeyRef` 注入为环境变量**, 仅当确有需要时才开启 API 读取, 并用最小化 RBAC 约束 (见 <<sck-rbac, 权限章节>>). 数据敏感度较高时可用 `spring.cloud.kubernetes.sanitize.secrets=true` 让 Actuator 的 `/env` 与 `/configprops` 端点脱敏.
+
+==== 加载可靠性
+
+* **fail-fast** - `spring.cloud.kubernetes.config.fail-fast=true` 让启动在无法加载 ConfigMap 时直接失败, 避免带病上线
+* **retry** - 需同时引入 `spring-retry` 与 `spring-boot-starter-aspectj`, 相关参数 `spring.cloud.kubernetes.config.retry.*` (初始间隔 1000ms, 最多 6 次, 最大间隔 2000ms)
+* **read-type** - 5.0.0-M3 起提供两种读取模式:
+  * `BATCH` (默认) - 先 list 命名空间内全部 ConfigMap/Secret 再过滤, 需要命名空间级 `list` 权限
+  * `SINGLE` - 按名逐个读取, API 开销小, 可用 `resourceNames` 做细粒度 RBAC, 让服务账号只能看到自己的配置
+
+==== 属性热更新 (Reload)
+
+内置的 PropertySource Reload 可监听 ConfigMap/Secret 变化并触发刷新, 支持 `refresh` (仅刷新 `@ConfigurationProperties`/`@RefreshScope` Bean, 默认), `restart_context` (优雅重启上下文) 与 `shutdown` (关停应用, 交由 K8s 重启 Pod) 三种策略, 监测方式有事件 (watch API) 与轮询 (周期默认 15s).
+
+WARNING: Reload 自 **2020.0** 起已被标记废弃, 官方推荐的替代方案是独立的 **Configuration Watcher Controller** (`spring-cloud-kubernetes-controllers`). 新项目应优先考虑 controller 方案, 或将配置变更交给 K8s 滚动更新天然完成.
+
+[[sck-namespace]]
+==== Namespace 解析
+
+未显式指定命名空间时, 框架按下述顺序推断, 全部失败则抛异常:
+
+. `spring.cloud.kubernetes.client.namespace` 属性
+. `spring.cloud.kubernetes.client.serviceAccountNamespacePath` 指向的文件
+. 默认 ServiceAccount 命名空间文件 `/var/run/secrets/kubernetes.io/serviceaccount/namespace`
+. 客户端库自身的推断 (fabric8 支持 `KUBERNETES_NAMESPACE` 环境变量等)
+
+[[sck-loadbalancer]]
+=== 负载均衡
+
+Kubernetes 的 Service 自带 **服务端负载均衡** (kube-proxy/iptables 转发), 多数场景无需应用层参与. 需要**客户端负载均衡**的典型诉求是: 按实例粒度做熔断, 重试与指标观测, 或调用方要感知每个 Pod. 引入 `-loadbalancer` Starter 后, 用 `@LoadBalanced` 的 RestTemplate/WebClient 按服务名调用即可:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-kubernetes-client-loadbalancer</artifactId>
+</dependency>
+----
+
+[source,java]
+----
+@Bean
+@LoadBalanced
+RestTemplate restTemplate() {
+    return new RestTemplate();
+}
+----
+
+[source,java]
+----
+String json = restTemplate.getForObject("http://inventory-service/api/stock", String.class);
+----
+
+负载均衡实例清单的解析有 **POD 与 SERVICE 两种模式**, 通过 `spring.cloud.kubernetes.loadbalancer.mode` 指定 (默认 `POD`):
+
+[cols="2,3,3"]
+|===
+|模式 |实例是什么 |适用场景
+
+|`POD` (默认)
+|Service 背后每个就绪 Pod 的 IP 与端口, 客户端直连 Pod
+|需要对实例细粒度观测, 会话保持到具体 Pod
+
+|`SERVICE`
+|Service 的 DNS 名 (如 `inventory-service.default.svc.cluster.local`) 与端口, 流量仍经 Service/ClusterIP
+|跨命名空间调用, 或希望复用 Service 的转发与就绪控制
+
+|===
+
+在 SERVICE 模式下, "服务名到 Service" 的匹配策略由 `spring.cloud.kubernetes.loadbalancer.service-matching-strategy` 决定:
+
+* `NAME` (默认) - 用服务名匹配 Service 的 `metadata.name`
+* `LABELS` - 用 `spring.cloud.kubernetes.discovery.service-labels` 中的标签匹配 Service
+
+两种策略分别对应不同的 `ServiceInstanceListSupplier` 实现 (`kubernetesServicesListSupplier` 与 `kubernetesLabelsBasedServicesListSupplier`), 实例清单自带缓存. 相关默认属性汇总: 集群域 `cluster.local`, 端口名 `http`, 开关 `enabled=true`.
+
+NOTE: 若要用 `DiscoveryClient` 获取**本应用**实例信息 (例如某些 Spring Cloud 组件需要), 必须让 Deployment 中 Service 的名字与 `spring.application.name` 保持一致, 因为框架不会把应用名注册到 Kubernetes.
+
+[[sck-rbac]]
+=== 权限与部署示例
+
+Pod 内通过 ServiceAccount 访问 API Server, 因此必须授予相应资源的读权限, 否则启动即失败. 下面给出一份最小权限示例:
+
+[source,yaml]
+----
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: order-service
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: namespace-reader
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "pods", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]        # 仅当开启 EndpointSlice 时需要
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: order-service-reader
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: namespace-reader
+subjects:
+  - kind: ServiceAccount
+    name: order-service
+    namespace: default
+----
+
+Secrets 若需经 API 读取, 需把 `secrets` 加入 `resources`, 但建议仅授予 `get` 而非 `list`, 并结合 `SINGLE` 读取模式与 `resourceNames` 限定到自身.
+
+本地开发时应用不在集群内, 可通过 `kubeconfig` 指向集群 (官方客户端与 fabric8 都支持), 或配合 `kubectl proxy`. 若在无集群环境临时禁用发现能力, 设置 `spring.main.cloud-platform=NONE`. 一个完整的 Deployment 示例:
+
+[source,yaml]
+----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  labels:
+    app: order-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      serviceAccountName: order-service
+      containers:
+        - name: order-service
+          image: registry.example.com/order-service:1.0.0
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "k8s"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service        # 与应用名一致
+spec:
+  selector:
+    app: order-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+----
+
+TIP: Spring Boot 4 起存活与就绪探针默认开启并暴露 `liveness` 与 `readiness` 分组 (见 <<Java/spring/SpringBoot4讲解.adoc#, SpringBoot4讲解>>), 可与 Deployment 的 `startupProbe`, `readinessProbe`, `livenessProbe` 直接对接, 这些探针能力由 Spring Boot 提供, 并不依赖 Spring Cloud Kubernetes.
+
+[[sck-summary]]
+=== 总结
+
+Spring Cloud Kubernetes 的本质, 是把 Kubernetes 视为**微服务注册中心与配置中心的替代品**, 让 Spring Cloud 的编程模型在 K8s 上继续成立:
+
+* **发现替代注册** - Kubernetes 本身就是服务注册表, Service/Endpoints 由控制器实时维护, 无需 Eureka/Consul 之类的自建注册中心
+* **配置替代配置中心** - ConfigMap/Secret 即配置仓库, 通过 PropertySource 融入 Spring 环境
+* **负载均衡** - POD 模式直连实例, SERVICE 模式复用 Service 转发, 视场景二选一
+* **无基础设施依赖** - 不需要额外的服务发现中间件, 减少了要运维的组件
+
+关键注意事项:
+
+* Spring Cloud Kubernetes 不是部署 Spring Boot 到 K8s 的前提, 轻量场景直接用 Service + DNS 即可
+* Fabric8 与官方 Kubernetes Java Client 两套 Starter 互斥, 全项目只能选一套
+* 不支持 AOT/Native Image; 读取方式 (bootstrap 与 `spring.config.import`) 二选一
+* 配置热更新建议用官方 Controller 而非内置 Reload; 纯配置变更亦可交给滚动更新
+* Secret 优先挂载, 经 API 读取务必收紧 RBAC 并配合脱敏
+* 版本需随 Spring Cloud 发行列车升级, 当前稳定线为 5.0.x (Spring Boot 3.5), 下一代面向 Spring Boot 4
