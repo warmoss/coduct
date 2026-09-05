@@ -106,7 +106,7 @@ NOTE: `init` 解决"进程回收与信号转发", 不解决"单容器内跑多�
 | 参数 | 取值与说明
 
 | `image`
-| 格式 `[仓库/]镜像[:标签|@摘要]`, 例如 `nginx:alpine`, `my.registry:5000/app@sha256:...`; 与 `build` 并存时, 该标签作为构建产物的命名
+| 格式 `[仓库/]镜像[:标签\|@摘要]`, 例如 `nginx:alpine`, `my.registry:5000/app@sha256:...`; 与 `build` 并存时, 该标签作为构建产物的命名
 
 | `build`
 | 从源码构建时的配置: `context` (构建上下文), `dockerfile`, `target` (多阶段目标阶段), `args` (构建期变量, 对应 ARG), `platform`
