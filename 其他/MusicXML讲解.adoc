@@ -1,0 +1,373 @@
+== MusicXML讲解
+
+不同制谱软件(Finale, Sibelius, MuseScore, Dorico 等)之间交换乐谱, 长期是音乐行业的痛点: 各软件的私有格式互不兼容; 图片(PDF, PNG)不可编辑也不可检索; MIDI 虽通用, 却只记录"演奏事件", 丢失了连音线, 符杠, 指法, 歌词等谱面信息. **MusicXML** 正是为解决这一问题而生的**开放乐谱交换标准**: 它用 XML 完整描述一份乐谱的记谱信息, 让乐谱能在不同软件与平台间无损迁移.
+
+参考: <<其他/midi讲解.adoc#, MIDI 原理讲解>>, <<其他/alphaTex讲解.adoc#, alphaTab 的 alphaTex 讲解>>
+
+=== 什么是 MusicXML
+
+MusicXML:: 基于 XML 的**乐谱(记谱)标记语言**, 描述"乐谱长什么样, 如何演唱或演奏", 而非"如何发声". 当前最新稳定版为 4.0.
+score-partwise:: 默认的文档组织形式, 按"声部(Part) -> 小节(Measure) -> 音符(Note)"纵向嵌套, 适合排版渲染.
+score-timewise:: 备选组织形式, 按"小节 -> 声部"横向排列, 便于按时间轴处理(如与音频工程对齐).
+.mxl:: MusicXML 的**压缩容器格式**, 本质是 ZIP 包, 内置乐谱 XML 与相关资源, 是最常用的分发格式.
+
+MusicXML 由 Michael Good 于 2000 年代初期在 Recordare 公司设计, 融合 MuseData 与 Humdrum 两种研究型格式而来; 2004 年发布 1.0, 2015 年移交给 W3C Music Notation Community Group 维护. 它选择 XML 而非私有二进制, 带来四个直接收益:
+
+* **文本可读**: 乐谱本质是文本, 可纳入版本控制(Git)做差异对比与协作
+* **结构可校验**: 有官方 DTD 与 RELAX NG Schema, 可程序化验证乐谱合法性
+* **生态可复用**: 解析, 校验, 转换的 XML 工具链现成, 各语言都有现成解析库
+* **语义可编程**: 程序可遍历音符树, 支撑转调, 声部分离, 音乐信息检索等算法
+
+=== 为什么需要 MusicXML
+
+MIDI, 图像与 MusicXML 代表了乐谱的三种描述层次: MIDI 面向"演奏", 图像面向"视觉", 只有 MusicXML 同时保留**记谱结构与排版语义**.
+
+[cols="4*"]
+|===
+| 维度 | MIDI | 图像(PDF/扫描) | MusicXML
+| 描述内容 | 音符开关, 力度, 控制事件 | 像素 | 音高, 时值, 调号, 拍号, 记谱符号
+| 可编辑性 | 可编辑演奏数据 | 不可直接编辑 | 结构可编辑
+| 排版与歌词 | 无 | 有(已固化) | 有(结构化)
+| 文本可检索 | 否 | 否 | 是
+| 渲染质量 | 无谱面 | 固定分辨率 | 矢量, 无限缩放
+| 跨软件互操作 | 通用但丢记谱 | 无法迁移 | 标准交换
+|===
+
+典型场景: 作曲家在一款制谱软件创作, 导出的 MusicXML 可被另一款软件精确还原谱面; 扫描的纸质乐谱经 OMR(Optical Music Recognition, 光学乐谱识别)转成 MusicXML 后即可编辑复用. 可以说, **MusicXML 之于乐谱, 如同 Docx/ODF 之于文档, MIDI 之于演奏**.
+
+=== 文档结构与数据模型
+
+MusicXML(score-partwise)的文档树可概括为"声明 -> 元数据 -> 声部列表 -> 声部 -> 小节"五层:
+
+[plantuml, "score-partwise 文档结构树", format=png]
+----
+@startuml
+hide members
+object "score-partwise" as sp
+object "work/identification" as meta
+object "part-list" as pl
+object "part id=P1" as p1
+object "measure 1" as m1
+object "attributes" as a1
+object "note" as n1
+object "note" as n2
+object "part id=P2" as p2
+
+sp --> meta
+sp --> pl
+sp --> p1
+sp --> p2
+p1 --> m1
+m1 --> a1
+m1 --> n1
+m1 --> n2
+@enduml
+----
+
+==== 声部列表与声部
+
+`<part-list>` 声明整首乐曲包含哪些乐器, 每个 `<score-part>` 通过 `id` 唯一标识一个声部, 并可内嵌乐器名称与 MIDI 音色信息:
+
+[source,xml]
+----
+<part-list>
+  <score-part id="P1">
+    <part-name>Piano</part-name>
+    <score-instrument id="P1-I1">
+      <instrument-name>Grand Piano</instrument-name>
+    </score-instrument>
+    <midi-instrument id="P1-I1">
+      <midi-channel>1</midi-channel>
+      <midi-program>1</midi-program>
+    </midi-instrument>
+  </score-part>
+</part-list>
+----
+
+主体部分按声部分块, 每个 `<part id="...">` 内按顺序排列该声部的所有小节.
+
+==== 小节与属性
+
+每个 `<measure>` 由 `<attributes>`(整小节生效的记谱设置)和若干 `<note>`, `<backup>`, `<forward>`, `<direction>`, `<barline>` 组成. `<attributes>` 常见子元素:
+
+[cols="3*"]
+|===
+| 元素 | 作用 | 示例值
+| `<divisions>` | 每四分音符的计数单位, 决定 duration 语义 | `2`
+| `<key>` | 调号(fifths 为升降号数量, mode 为大小调) | `fifths=0`, `mode=major`
+| `<time>` | 拍号(beats/beat-type) | `4/4`
+| `<clef>` | 谱号(sign 与 line) | G 谱号在第二线
+| `<staves>` | 谱表数量(如钢琴的上下两行) | `2`
+| `<transpose>` | 移调信息(用于移调乐器) | chromatic=-2
+|===
+
+==== 音符
+
+`<note>` 是文档的最小单元, 核心结构为"音高/休止 + 时值 + 类型 + 附加记号":
+
+[source,xml]
+----
+<note>
+  <pitch>
+    <step>C</step>
+    <alter>1</alter>
+    <octave>4</octave>
+  </pitch>
+  <duration>2</duration>
+  <voice>1</voice>
+  <type>eighth</type>
+  <accidental>sharp</accidental>
+  <stem>up</stem>
+</note>
+----
+
+[cols="3*"]
+|===
+| 元素 | 作用 | 说明
+| `<pitch>` | 音高 | step(A-G), alter(半音升降, -1 降号/1 升号), octave(八度)
+| `<rest>` | 休止符 | 与 `<pitch>` 二选一; 整小节休止加 `measure="yes"`
+| `<duration>` | 时值长度 | 以 divisions 为单位的数值
+| `<type>` | 音符类型 | whole, half, quarter, eighth, 16th 等
+| `<dot>` | 附点 | 出现一次即加一个附点
+| `<voice>` | 声部号 | 同一声部内时间连续
+| `<chord>` | 和弦标志 | 出现表示与前一个音同时发声
+| `<notations>` | 记谱记号 | 延音线, 圆滑线, 吐音, 力度等
+|===
+
+**时值编码**是理解 MusicXML 的关键: `<duration>` 并不直接表示拍数, 而是表示"以该小节 `<divisions>` 为单位的计数". 设 stem:[d] 为 divisions 值, stem:[r] 为音符相对时值(四分音符 = 1, 全音符 = 4), 则:
+
+stem:[duration = r \times d]
+
+例如 divisions=4 时, 四分音符 duration=4, 八分音符 duration=2. divisions 可在不同小节变化, 用于表达变拍号场景下的精确比例.
+
+=== 记谱语义元素
+
+音符只有音高与时值还不足以还原谱面, MusicXML 通过下列元素表达完整记谱语义:
+
+[cols="3*"]
+|===
+| 概念 | XML 元素 | 说明
+| 延音线 | `<tie>` + `<notations><tied>` | 同音高的时值连接, 跨小节常见
+| 圆滑线 | `<notations><slur>` | 连线, 用 start/stop 配对
+| 符杠 | `<beam>` | 八分及更短音符的符杠分组(beam/backup/forward)
+| 连音 | `<time-modification>` | actual-notes/正常-notes, 表达三连音等
+| 吐音/重音 | `<notations><articulations>` | staccato, accent, tenuto 等
+| 装饰音 | `<notations><ornaments>` | trill, turn, mordent 等
+| 力度 | `<direction><dynamics>` | p, mf, f, crescendo/decrescendo(wedge)
+| 文字与速度 | `<direction><words>`, `<metronome>` | 表情文字与节拍器速度
+| 歌词 | `<lyric>` | 歌词文本, 音节切分(syllabic), 延音扩展(extend)
+| 和弦标记 | `<harmony>` | 字母和弦标记(C, Am7 等)
+| 小节线 | `<barline>` | 终止线, 反复记号, ending(房子)
+| 播放速度 | `<sound tempo="...">` | 仅影响播放, 不影响排版
+|===
+
+多声部(复调)是小节内组织音符的难点: 同一小节同一时刻可能有多个声部, 但 `<note>` 只能按时间先后线性排列. MusicXML 用 `<backup>` 回退时间轴: 写完一个声部后用 `<backup>` 把"当前时间"退回到小节起点, 再写另一声部:
+
+[source,xml]
+----
+<measure number="1">
+  <note><pitch><step>C</step><octave>4</octave></pitch>
+    <duration>2</duration><voice>1</voice><type>half</type></note>
+  <backup>
+    <duration>4</duration>
+  </backup>
+  <note><pitch><step>G</step><octave>3</octave></pitch>
+    <duration>4</duration><voice>2</voice><type>whole</type></note>
+</measure>
+----
+
+`<backup>` 的语义是"将光标按 duration 值回退", 之后第二个声部从小节起点开始书写, 从而在同一小节内并置多个声部.
+
+[[musicxml-example]]
+=== 完整示例: 两个小节
+
+以下是一段 C 大调 4/4 拍, 单声部钢琴谱的完整 MusicXML 4.0 文档(divisions=1, 故四分音符 duration=1):
+
+[source,xml]
+----
+<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <work>
+    <work-title>示例小曲</work-title>
+  </work>
+  <identification>
+    <creator type="composer">佚名</creator>
+    <encoding>
+      <software>MuseScore 4.0</software>
+      <encoding-date>2026-01-01</encoding-date>
+    </encoding>
+  </identification>
+  <part-list>
+    <score-part id="P1">
+      <part-name>Piano</part-name>
+    </score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>1</divisions>
+        <key><fifths>0</fifths><mode>major</mode></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <direction>
+        <direction-type>
+          <dynamics><mf/></dynamics>
+        </direction-type>
+      </direction>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>1</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+        <notations><slur type="start"/></notations>
+      </note>
+      <note>
+        <pitch><step>D</step><octave>4</octave></pitch>
+        <duration>1</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+      </note>
+      <note>
+        <pitch><step>E</step><octave>4</octave></pitch>
+        <duration>1</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+      </note>
+      <note>
+        <pitch><step>F</step><octave>4</octave></pitch>
+        <duration>1</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+        <notations><slur type="stop"/></notations>
+      </note>
+    </measure>
+    <measure number="2">
+      <note>
+        <pitch><step>G</step><octave>4</octave></pitch>
+        <duration>1</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+      </note>
+      <note>
+        <pitch><step>A</step><octave>4</octave></pitch>
+        <duration>1</duration>
+        <voice>1</voice>
+        <type>quarter</type>
+      </note>
+      <note>
+        <rest/>
+        <duration>2</duration>
+        <voice>1</voice>
+        <type>half</type>
+      </note>
+    </measure>
+  </part>
+</score-partwise>
+----
+
+阅读要点:
+
+* `<score-partwise version="4.0">` 声明文档类型与格式版本, 解析器据此选择校验规则
+* 小节 1 的 `<attributes>` 在首个小节集中声明 divisions, 调号, 拍号与谱号
+* C 至 F 四个四分音符由 `<slur type="start">` 与 `<slur type="stop">` 配对成一条圆滑线
+* 小节 2 用一个 duration=2 的半休止符补齐 4/4 小节的剩余时值
+
+[[mxl-format]]
+=== 压缩格式: MXL
+
+纯 XML 乐谱冗长且无法内嵌资源, 分发不便. **MXL** 将 MusicXML 打包为 ZIP 容器, 遵循类似 OPC(Open Packaging Conventions)的规范, 结构如下:
+
+[source,text]
+----
+score.mxl
+├── META-INF/
+│   └── container.xml     // 容器清单, 指向乐谱主文件
+└── score.musicxml        // 实际乐谱内容
+----
+
+`container.xml` 使用 `<rootfiles>` 声明容器内的乐谱主文件路径:
+
+[source,xml]
+----
+<?xml version="1.0" encoding="UTF-8"?>
+<container>
+  <rootfiles>
+    <rootfile full-path="score.musicxml"
+              media-type="application/vnd.recordare.musicxml+xml"/>
+  </rootfiles>
+</container>
+----
+
+MXL 是当前乐谱分发的事实标准: 体积更小, 单一文件便于传输, 且可在 ZIP 内附带封面图, 字体与辅助文件.
+
+=== 应用工作流
+
+一份乐谱的典型生命周期: 创作者在某款制谱软件中完成创作, 以 MusicXML 导出; 目标应用导入后重新排版渲染, 或提取数据用于播放与分析.
+
+[plantuml, "MusicXML 应用工作流", format=png]
+----
+@startuml
+actor 制谱者
+participant "制谱软件" as Writer
+participant "MusicXML 文件" as File
+participant "目标应用" as Reader
+participant "渲染/播放引擎" as Engine
+
+制谱者 -> Writer: 创作与排版乐谱
+Writer -> File: 导出 .musicxml 或 .mxl
+File -> Reader: 提供乐谱文件
+Reader -> Reader: XML 解析并按 Schema 校验
+Reader -> Engine: 传入结构化记谱树
+Engine -> Engine: 布局排版(谱表, 小节, 记号)
+Engine -> Engine: 绘制矢量乐谱
+alt 需要播放
+  Engine -> Engine: 提取音高, 时值, 力度与 MIDI 音色
+  Engine -> Engine: 合成器发声
+end
+@enduml
+----
+
+除制谱软件外, MusicXML 亦可由**程序生成**(如作曲算法, 数据驱动的乐谱模板)或由 **OMR 识别软件**从扫描图自动转换而来, 是各类"乐谱数据"进入可编辑世界的通用出口.
+
+=== 生态与工具
+
+MusicXML 得到主流记谱与音乐软件的一致支持, 是事实上的乐谱互操作标准:
+
+[cols="3*"]
+|===
+| 类别 | 代表软件 | 说明
+| 制谱软件 | MuseScore | 开源免费, 导入导出均支持
+| 制谱软件 | Sibelius, Finale, Dorico | 商业制谱三强, 均支持导入/导出
+| 在线平台 | Noteflight, Flat | 浏览器内编辑, 原生支持 MusicXML
+| Web 渲染 | alphaTab, OpenSheetMusicDisplay | 前端解析并渲染矢量乐谱
+| OMR 识别 | Audiveris | 开源, 扫描乐谱转 MusicXML
+| 程序分析 | music21 (MIT) | Python 乐谱分析工具包, 原生读写 MusicXML
+| 排版转换 | LilyPond (musicxml2ly) | 将 MusicXML 转为高质量排版源
+|===
+
+=== 版本演进
+
+[cols="3*"]
+|===
+| 版本 | 时间 | 要点
+| 1.0 | 2004 | Recordare 发布, 奠定 score-partwise/timewise 双模型
+| 2.0 | 2010 | 扩展吉他记谱, 打击乐与多行歌词等记谱细节
+| 3.0 | 2013 | 由 W3C 接管并成为公开标准
+| 3.1 | 2017 | W3C 维护更新, 修复缺陷并小幅扩展
+| 4.0 | 2021 | 当前最新稳定版, 增加乐器组, 谱号与连音线等精细控制
+|===
+
+=== 总结
+
+MusicXML 以 XML 描述了**记谱语义而非音频**, 是连接制谱, 排版, 播放与分析生态的通用语言.
+
+* **定位清晰**: 与 MIDI 互补, MIDI 管演奏, MusicXML 管谱面, 二者常并存于同一文件(通过 midi-instrument 映射音色)
+* **核心理解点**: 文档按"声部 -> 小节 -> 音符"组织; 时值用 divisions 相对计数; 复调靠 `<backup>` 回退时间轴
+* **分发首选 MXL**: 单文件 ZIP 容器, 内嵌资源, 已成为事实标准
+* **常见误区**: 不要期待所有软件对同一文件的排版像素级一致; 交换后仍需在目标软件中复核版面
+
+[NOTE]
+====
+MusicXML 并不包含音频波形, "播放"仍依赖引擎将音符映射到 MIDI 或采样音色. 若需了解演奏数据层面的格式, 参见 <<其他/midi讲解.adoc#, MIDI 原理讲解>>.
+====

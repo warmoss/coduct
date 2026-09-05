@@ -1,0 +1,275 @@
+== dotnet依赖注入讲解
+
+=== 它是什么? 解决什么问题?
+
+当代码通过 `new` 直接创建依赖时, 对象间的耦合会随系统膨胀而失控. 例如 `OrderService` 直接 `new` 一个 `SmtpEmailSender`, 一旦发送渠道换成短信或推送就必须改动业务类; 单元测试时也无法替换成假实现. **依赖注入(Dependency Injection, DI)正是为解开这类耦合而生的编程模式.**
+
+DI 把"依赖的创建与装配"从使用者手中拿走, 交给统一的容器负责, 属于**控制反转(Inversion of Control, IoC)**思想的一种落地方式.
+
+控制反转 (Inversion of Control, IoC):: 将"对象如何获取其依赖"的控制权从对象自身反转给外部容器. 对象不再决定自己依赖谁, 而是被动等待外部注入.
+
+依赖注入 (Dependency Injection, DI):: IoC 的一种实现, 由容器在实例化对象时, 把其构造位置所需的依赖自动传入.
+
+服务容器 (Service Container):: 负责登记服务, 按需实例化并缓存实例的对象, 在 dotnet 中核心接口是 `IServiceProvider`.
+
+dotnet 内置容器位于 `Microsoft.Extensions.DependencyInjection` 包, 是 ASP.NET Core 与 Generic Host 的基石. **本文示例基于 dotnet 10(LTS).** 一句话概括其思想: **对象不再"主动寻找"依赖, 而是"被动接受"依赖.** 由此带来的直接收益:
+
+* **解耦:** 业务类只依赖抽象接口, 替换实现无需改动业务代码.
+* **可测试:** 测试时向容器登记假实现或 Mock, 即可隔离被测单元.
+* **生命周期集中管理:** 实例的创建时机, 共享范围与释放由容器统一负责.
+
+=== 核心概念
+
+服务 (Service):: 被容器管理, 可供其他代码消费的对象, 通常表现为一对抽象与实现, 例如接口 `IEmailSender` 与其实现 `SmtpEmailSender`.
+
+服务描述符 (ServiceDescriptor):: 容器内的一条登记记录, 描述"为哪个服务类型, 以何种生命周期, 由什么方式创建", 三者共同决定解析行为.
+
+作用域 (Scope):: 一组共享 `Scoped` 服务的边界容器, 对应一次请求或一个工作单元; 作用域销毁时, 其内登记的服务一并释放.
+
+组合根 (Composition Root):: 应用中唯一负责组装对象图的位置, 在 dotnet 中通常是程序入口(如 `Program.cs`); 只有这里允许直接触碰容器.
+
+dotnet 内置容器并非性能最强的容器, 但 API 覆盖绝大多数场景, 无第三方依赖, 且与 ASP.NET Core, EF Core, Options, Logging 等深度集成, 因此被官方默认采用. 理解 DI, 围绕"注册, 解析, 生命周期"三个动作即可.
+
+=== 服务注册与解析
+
+==== 注册的四种方式
+
+创建容器前, 先通过 `IServiceCollection` 收集一组服务描述符. 注册方式可归纳为四种:
+
+类型映射:: 登记抽象与实现类型, 由容器负责实例化, 最常用.
+实例注册:: 直接提供现成实例, 仅适合 `Singleton`, 容器不再负责创建与释放.
+工厂注册:: 提供一个委托, 在首次需要时调用; 可通过参数 `sp` 读取容器内其他服务以完成初始化.
+开放泛型:: 以 `typeof(IRepository<>)` 登记泛型抽象, 解析时容器自动闭合类型参数.
+
+[source,csharp]
+----
+var services = new ServiceCollection();
+
+// 1. 类型映射
+services.AddTransient<IEmailSender, SmtpEmailSender>();   // <1>
+services.AddScoped<IOrderRepository, OrderRepository>();
+services.AddSingleton<ITimeProvider, SystemTimeProvider>();
+
+// 2. 实例注册(仅建议 Singleton)
+services.AddSingleton<IConfig>(LoadConfig());
+
+// 3. 工厂注册: 需要其他服务时经 sp 获取
+services.AddScoped<IDbConnection>(sp =>
+{
+    var cfg = sp.GetRequiredService<IConfig>();
+    return new SqlConnection(cfg.ConnectionString);
+});
+
+// 4. 开放泛型
+services.AddScoped(typeof(IRepository<>), typeof(EfRepository<>));
+----
+<1> `AddTransient<TService, TImplementation>()` 是类型映射的便捷方法, Scoped 与 Singleton 同理
+
+[NOTE]
+====
+除 `Add*` 系列外, 扩展命名空间 `Microsoft.Extensions.DependencyInjection.Extensions` 还提供 `TryAdd*` 系列, 仅在类型尚未登记时才生效, 常用于框架包避免覆盖宿主应用已有的登记.
+====
+
+==== 解析方式
+
+服务对象主要通过以下途径取出, 其中构造函数注入是官方推荐的方式:
+
+**构造函数注入(推荐).** 容器激活类型时, 自动解析并传入构造函数所需的每个依赖, 依赖关系一目了然且便于测试时替换:
+
+[source,csharp]
+----
+public sealed class OrderService
+{
+    private readonly IOrderRepository _repository;
+    private readonly IEmailSender _sender;
+
+    public OrderService(IOrderRepository repository, IEmailSender sender)   // <1>
+    {
+        _repository = repository;
+        _sender = sender;
+    }
+}
+----
+<1> 构造参数中可解析的依赖会被容器逐个注入
+
+**方法/属性注入.** 内置容器不支持属性注入; 确有必要时可用 `ActivatorUtilities.CreateInstance` 或引入 Autofac 等第三方容器, 仅在构造函数注入无法满足时考虑.
+
+**服务定位器(Service Locator, 反模式).** 通过 `GetRequiredService<T>()` 主动向容器索取, 属应避免的反模式, 详见下文最佳实践.
+
+=== 生命周期管理
+
+生命周期决定"实例何时创建, 何时复用, 何时销毁", 是 DI 中最容易出错也最关键的一环. 三种生命周期的行为对比如下:
+
+[cols="1,2,2,2", options="header"]
+|===
+| 生命周期 | 创建时机 | 共享范围 | 典型场景
+
+| Transient(瞬态) | 每次解析都新建 | 不共享 | 无状态轻量工具类
+| Scoped(作用域) | 作用域内首次解析时创建 | 同一作用域共享 | 请求内的 DbContext, 工作单元
+| Singleton(单例) | 首次解析时创建, 此后复用 | 进程内全局共享 | 配置对象, 日志器, 无状态缓存
+|===
+
+三条经验法则决定合法组合:
+
+* **Singleton 只能依赖 Singleton.** 否则较短生命周期的依赖会被"捕获"而退化成长生命周期, 即下文要讲的 Captive Dependency 反模式.
+* **Scoped 可依赖 Scoped 或 Singleton.** 依赖 Transient 时需注意其释放时机随作用域结束.
+* **Transient 无约束**, 可依赖任意生命周期.
+
+释放规则同样由容器统一负责:
+
+* 容器释放**由它创建**且实现 `IDisposable` 或 `IAsyncDisposable` 的实例.
+* 释放时机跟随创建它的容器: Singleton 随根容器销毁, Scoped 随作用域结束, Transient 随其所在作用域或根容器.
+* 通过"实例注册"方式提供的现成实例**不由容器释放**, 需调用方自管.
+
+=== 容器的解析流程
+
+从调用方发起请求到拿到实例, 内置容器的解析过程如下:
+
+. 调用方请求 `GetRequiredService<T>()`.
+. 容器在登记表中按服务类型定位服务描述符.
+. 检查当前作用域缓存: Singleton 缓存于根容器, Scoped 缓存于作用域, 命中则直接复用.
+. 未命中时按描述符的创建方式实例化, 并**递归解析**其构造函数参数.
+. 若实例实现 `IDisposable`, 登记到所属容器以便统一释放.
+. 返回实例给调用方.
+
+[plantuml, "服务解析与缓存流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+actor 调用方
+participant "IServiceProvider" as SP
+participant "ServiceDescriptor" as SD
+participant "依赖服务" as Dep
+
+调用方 -> SP: GetRequiredService<T>()
+SP -> SP: 查找当前作用域缓存
+alt 命中缓存(Scoped / Singleton)
+    SP --> 调用方: 返回缓存实例
+else 未命中缓存
+    SP -> SD: 按描述符创建实例
+    SD -> Dep: 递归解析构造参数
+    Dep --> SD: 返回依赖实例
+    SD -> SD: 记录 IDisposable 以便统一释放
+    SD --> SP: 返回新实例
+    SP --> 调用方: 返回实例
+end
+@enduml
+----
+
+内置容器的构造函数选择遵循一条简单规则: **在能被容器完全满足的构造函数中, 挑选参数个数最多者**. 若选中的构造函数存在无法解析的参数, 解析时会抛出 `InvalidOperationException`, 并指明是哪个服务, 在激活哪个类型时失败.
+
+=== 在 ASP.NET Core 中使用
+
+Web 应用只需在 `Program.cs`(组合根)集中登记服务, 框架会在每个 HTTP 请求进入时自动创建独立作用域:
+
+[source,csharp]
+----
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddScoped<IOrderRepository, OrderRepository>();    // <1>
+builder.Services.AddTransient<IEmailSender, SmtpEmailSender>();
+builder.Services.AddSingleton<ITimeProvider, SystemTimeProvider>();
+
+var app = builder.Build();
+app.MapControllers();
+app.Run();
+----
+<1> `AddDbContext` 登记的服务默认是 Scoped, 与请求作用域天然匹配
+
+控制器与最小 API 均由容器激活, 直接在构造函数声明依赖即可完成注入:
+
+[source,csharp]
+----
+[ApiController]
+[Route("api/orders")]
+public sealed class OrdersController : ControllerBase
+{
+    private readonly IOrderService _orderService;
+
+    public OrdersController(IOrderService orderService)    // <1>
+    {
+        _orderService = orderService;
+    }
+
+    [HttpPost]
+    public async Task<IActionResult> Create(OrderRequest request)
+    {
+        await _orderService.PlaceAsync(request);
+        return Ok();
+    }
+}
+----
+<1> 容器递归解析 `OrderService` 及其依赖后注入控制器
+
+从 .NET 8 起, 内置容器还支持**键控服务(Keyed Services)**: 同一抽象可登记多份实现, 以字符串 key 区分, 注入时用 `[FromKeyedServices]` 指定:
+
+[source,csharp]
+----
+builder.Services.AddKeyedScoped<ICache, RedisCache>("redis");
+builder.Services.AddKeyedScoped<ICache, MemoryCache>("memory");
+
+public sealed class ReportService
+{
+    private readonly ICache _cache;
+
+    // 按 key 注入对应实现
+    public ReportService([FromKeyedServices("redis")] ICache cache)
+    {
+        _cache = cache;
+    }
+}
+----
+
+在控制台或后台任务中不存在"请求", 需借助 `IServiceScopeFactory` 手动创建作用域, 否则 `Scoped` 服务会因绑定在根容器而失去正确行为:
+
+[source,csharp]
+----
+public sealed class ReportWorker(IServiceScopeFactory scopeFactory) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();       // <1>
+        var reporter = scope.ServiceProvider.GetRequiredService<IReportService>();
+        await reporter.GenerateAsync(stoppingToken);
+    }
+}
+----
+<1> 作用域结束(using)时, 其中的 Scoped 服务被自动释放
+
+=== 常见误区与最佳实践
+
+**组合根之外勿用容器.** 业务代码应只声明依赖, 不要到处调用 `GetRequiredService`(Service Locator 反模式), 否则依赖关系被隐藏, 解耦与可测性大打折扣.
+
+**警惕 Captive Dependency.** 把 `Scoped` 服务注入 `Singleton`, 前者会被"捕获"在根容器中, 实际退化为 Singleton, 常导致请求级状态错乱或连接泄漏. 同理, `Transient` 若注入 `Singleton`, 一旦被释放便出现悬垂引用.
+
+**避免循环依赖.** 内置容器无法构造互相依赖的对象图, 解析时会抛出异常. 应通过拆分职责或引入中间层/事件打破环.
+
+**开发环境开启验证.** 尽早暴露装配错误. ASP.NET Core 在 Development 环境默认开启 `ValidateScopes`, 亦可在控制台场景显式配置:
+
+[source,csharp]
+----
+var provider = services.BuildServiceProvider(new ServiceProviderOptions
+{
+    ValidateScopes = true,     // <1>
+    ValidateOnBuild = true     // <2>
+});
+----
+<1> 检测从根容器解析 Scoped 服务的行为(捕获依赖)
+<2> 构建时展开整棵依赖树, 提前暴露缺失或循环依赖
+
+**慎用需要释放的 Transient.** 从根容器解析出的 `IDisposable` Transient 要到进程退出才释放, 应在手动创建的作用域内解析.
+
+**保持 Singleton 线程安全.** Singleton 被全局并发共享, 内部可变状态必须加锁或改用并发集合.
+
+**不手动 new 已登记服务.** 绕过容器意味着绕过生命周期管理与释放机制, 会引入难以排查的资源问题.
+
+=== 总结
+
+dotnet 内置依赖注入容器围绕"注册, 解析, 生命周期"三件事工作: 在组合根集中登记服务, 通过构造函数注入消费依赖, 由容器统一管理实例的创建, 缓存与释放. 选对生命周期(Transient/Scoped/Singleton)是正确性的关键, 牢记"长生命周期不得捕获短生命周期依赖", 并在开发环境开启 `ValidateScopes` 与 `ValidateOnBuild`, 即可把大部分装配错误提前暴露在构建期或首次解析时.
+
+=== 参考资料
+
+官方文档: https://learn.microsoft.com/aspnet/core/fundamentals/dependency-injection
+
+DI 设计指南(Microsoft.Extensions.DependencyInjection 项目): https://github.com/dotnet/runtime/blob/main/src/libraries/Microsoft.Extensions.DependencyInjection/README.md

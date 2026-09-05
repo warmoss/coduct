@@ -1,0 +1,406 @@
+== picocli讲解
+
+Java 命令行程序的难点往往不在业务逻辑, 而在参数解析: 要兼容 `-x` 与 `--xxx` 两种前缀, 处理 `--opt=value` 与 `--opt value` 两种取值方式, 还要做类型转换, 必填校验与帮助输出. 手写这套逻辑既繁琐又难以维护. **picocli** 是 Java 生态中最流行的**命令行解析框架**, 它以注解声明命令模型, 自动完成词法解析, 匹配, 类型转换, 校验与执行, 一个注解类即可获得完整 CLI, 包括帮助, 版本, 子命令与 Shell 自动补全. 本文基于最新稳定版 **4.7.7**, 剖析其从注解到模型再到执行的核心原理.
+
+=== 是什么与为什么
+
+==== 是什么
+
+picocli:: 一个**基于注解驱动命令模型**的 Java 命令行解析框架, 支持 Java 5+, 无第三方运行时依赖, 体积小且对 GraalVM 原生镜像友好; 只要声明"有哪些选项与参数", 框架即可生成解析, 帮助, 版本等全部能力.
+
+CommandLine:: picocli 的**门面 (Facade)**, 是模型构建, 解析与执行编排的入口; `new CommandLine(obj)` 是绝大多数用法的主干.
+
+注解:: `@Command`, `@Option`, `@Parameters`, `@ArgGroup`, `@Mixin`, `@Spec` 等, 用来声明命令的静态结构; 注解在运行时被扫描并翻译成模型对象, 之后所有解析与渲染都只读模型.
+
+命令模型:: 由注解生成的**运行时对象树**, 根是 `CommandSpec`, 其下挂 `OptionSpec`(选项) 与 `PositionalParamSpec`(位置参数), 二者共同抽象为 `ArgSpec`; 模型是解析与帮助渲染的**唯一数据源**.
+
+==== 为什么需要
+
+对比手写 `args` 解析, picocli 解决的痛点:
+
+* **解析写法不统一:** `--name=x`, `--name x`, `-nx`, `-n x` 都要支持, 手写极易漏分支
+* **类型转换重复劳动:** 把字符串转成 `int`, `File`, `Path`, 枚举甚至 `java.time` 类型, 每加一个参数就要写一次
+* **错误提示质量差:** 缺少参数, 非法值, 未匹配选项时, 手写解析很难给出"你是否想用 --verbose" 这类建议
+* **帮助与版本是刚需:** 自动生成的 usage, 选项表格, `--version` 输出让 CLI 达到生产可用标准
+* **子命令与参数组:** 实现 `git commit`, `docker run` 这类层级命令时, 手动分发极其痛苦
+
+picocli 与同类框架 (JCommander, args4j, commons-cli) 的差异在于: 它不只是"解析器", 而是一个围绕**命令模型**的完整运行时, 同一模型同时驱动解析, 帮助渲染, 补全脚本生成与原生镜像.
+
+=== 核心概念
+
+在深入原理前, 先统一几个术语:
+
+CommandSpec:: 单个命令的模型: name, description, version, 子命令集合, 以及该命令自己的选项与位置参数
+OptionSpec:: 一个选项的模型, 记录 `names`, 类型, arity, 是否必填等; 对应 `@Option`
+PositionalParamSpec:: 一个位置参数的模型, 对应 `@Parameters`; 通过 index 范围决定吸收第几个位置
+ArgSpec:: `OptionSpec` 与 `PositionalParamSpec` 的公共抽象, 承载 name, type, arity, defaultValue 与转换结果
+Arity:: 一个选项或参数**应消耗的 token 个数** (min..max), 决定重复取值与多值行为
+Mixin:: 把一组可复用的 `@Option` 字段以组合方式并入命令, 解决多个命令共享参数的问题
+
+=== 快速上手
+
+先引入依赖 (最新稳定版 4.7.7):
+
+[source,xml]
+----
+<dependency>
+  <groupId>info.picocli</groupId>
+  <artifactId>picocli</artifactId>
+  <version>4.7.7</version>
+</dependency>
+----
+
+或 Gradle:
+
+[source,groovy]
+----
+implementation 'info.picocli:picocli:4.7.7'
+----
+
+一个最小可运行示例:
+
+[source,java]
+----
+import picocli.CommandLine;                                      // <1>
+import picocli.CommandLine.Command;
+import picocli.CommandLine.Option;
+
+import java.util.concurrent.Callable;
+
+@Command(name = "hello", mixinStandardHelpOptions = true,       // <2>
+    version = "hello 1.0", description = "一个 picocli 示例")
+public class Hello implements Callable<Integer> {               // <3>
+
+    @Option(names = {"-n", "--name"}, defaultValue = "world",
+        description = "问候对象")
+    String name;
+
+    @Override
+    public Integer call() {
+        System.out.printf("Hello, %s!%n", name);
+        return 0;
+    }
+
+    public static void main(String[] args) {
+        System.exit(new CommandLine(new Hello()).execute(args)); // <4>
+    }
+}
+----
+<1> picocli 的公开 API 集中在 `picocli.CommandLine` 及其注解子类型
+<2> `mixinStandardHelpOptions` 自动注入 `-h/--help` 与 `-V/--version` 选项
+<3> 命令体实现 `Callable<Integer>`, 返回值即退出码; 也可实现 `Runnable`
+<4> `execute` 串联"解析 -> 校验 -> 调用" 并返回进程退出码
+
+运行效果:
+
+[source,shell]
+----
+$ java Hello
+Hello, world!
+$ java Hello -n picocli
+Hello, picocli!
+$ java Hello --help
+Usage: hello [-hnV] [--name=<name>]
+      hello 一个 picocli 示例
+  -h, --help      Show this help message and exit.
+  -n, --name=<name>  问候对象
+  -V, --version   Print version information and exit.
+----
+
+这短短十几行就覆盖了选项解析, 默认值, 帮助与版本. 接下来拆解它是如何做到的.
+
+=== 核心原理
+
+==== 模型构建: 注解到 CommandSpec
+
+picocli 与传统"每行 `if` 判断参数" 的本质区别, 是**先建模型, 再谈解析**. 解析器面对的不是注解本身, 而是一棵在内存中构建好的 `CommandSpec` 树:
+
+* 首次执行 `new CommandLine(obj)` 时, 通过反射遍历命令类及其**父类**的字段与方法
+* 读取 `@Command`, `@Option`, `@Parameters`, `@ArgGroup` 等注解, 生成对应的 `CommandSpec`, `OptionSpec`, `PositionalParamSpec` 节点并建立关联
+* 结果**缓存**在 `CommandLine` 中, 后续解析与帮助渲染直接复用
+
+模型与注解解耦带来两个关键能力:
+
+** 注解不是必须的:** 可用 `CommandSpec.create()`, `OptionSpec.builder()` 以纯代码编程式建模, 例如动态拼接来自配置文件或远端注册表的命令
+** 一处建模多处使用:** 同一模型既用于解析, 也用于 usage 渲染, 补全脚本生成, 保证"帮助与行为永远一致"
+
+类型信息在建模期被记录在 `ArgSpec` 中, 这也是后面类型转换能自动完成的前提. 需要把命令类的实例与模型绑定: 解析出的值最终要反射写回对象的字段, 因此 `CommandLine` 始终持有命令对象引用.
+
+==== 词法切分与选项识别
+
+`execute` 内部先把字符串数组交给解析器逐 token 处理, 核心决策如下:
+
+[plantuml, "token 分类与取值流程", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+start
+:逐 token 扫描 args;
+repeat
+  if (等于 "--" ?) then (是)
+    :进入纯位置参数模式, 其后 token 全部按位置参数;
+  elseif (以 "--" 开头 ?) then (是)
+    :长选项: 精确匹配名字, 从 "=" 后或后续 token 取值;
+  elseif (以 "-" 开头且长度大于 1 ?) then (是)
+    :短选项(可组合展开, 如 -abc);
+  else (否)
+    :位置参数;
+  endif
+  :按 arity 收集原始字符串值;
+repeat while (还有 token ?) is (是)
+->否;
+:类型转换与校验;
+:反射注入字段或方法参数;
+stop
+@enduml
+----
+
+几个必须理解的边界行为:
+
+* **`--` 终止选项:** 其后的 token 即使以 `-` 开头也按位置参数处理, 用于传负数值或文件名等以 `-` 开头的字面量
+* **单独的 `-`:** 被视为位置参数, 常见于表示标准输入
+* **组合短选项:** `-abc` 等价于 `-a -b -c`; 若某个选项需要取值, 则同 token 剩余部分可充当其值
+* **长选项等号取值:** `--port=8080` 中 `8080` 直接取自等号后, 不再消耗下一 token; 这是最常见的歧义消除点
+* **空字符串 `""`** 也作为一个有效值, 而非"缺失"
+
+选项的**匹配**分两步: 先按全名精确查找 `OptionSpec`; 找不到且该 token 明显像选项时, 抛出的 `ParameterException` 会附带"你是否想用 `--verbose`" 之类的**候选建议**, 提示质量远超裸 Java 手写解析.
+
+位置参数则按 `@Parameters` 声明的 index 范围顺序填充, 例如 `index = "1..2"` 只吸收第 2 与第 3 个位置, 其余留给其它位置参数或触发未匹配异常.
+
+==== 类型转换
+
+解析阶段收集到的是**原始字符串**, 写入字段前必须转为目标类型. picocli 内置一套 `ITypeConverter` 转换器:
+
+[cols="2,5"]
+|===
+|目标类型 |说明
+
+|基本类型与包装类
+|`byte` 到 `double` 全覆盖, 失败时抛出带原始值的可读异常
+
+|`String` 家族
+|`String`, `StringBuilder`, `CharSequence`
+
+|`java.io.File` / `Path`
+|直接构造文件路径对象
+
+|`URL` / `URI`
+|自动解析并校验格式
+
+|`UUID` / `BigInteger` / `BigDecimal`
+|常见值对象
+
+|枚举
+|不区分大小写匹配枚举常量, 可 `converter` 覆盖
+
+|`java.time` 类型
+|`LocalDate`, `LocalDateTime`, `Instant` 等, 支持自定义格式
+
+|数组与集合
+|选项重复出现时逐次追加, 自动累积为数组或 `List`
+|===
+
+转换器解析规则:
+
+* 目标类型若是**枚举**, 使用其 `valueOf` 语义 (不区分大小写)
+* 否则尝试**静态 `valueOf(String)`** 或**单参数 `String` 构造器**
+* 都不满足时, 报 `TypeConversionException`, 提示可注册自定义转换器
+
+自定义转换只需实现 `ITypeConverter<T>` 并挂到注解或注册到 `CommandLine`:
+
+[source,java]
+----
+@Option(names = "--timeout", converter = DurationConverter.class)
+Duration timeout;
+
+static class DurationConverter implements CommandLine.ITypeConverter<Duration> {
+    public Duration convert(String value) {
+        return Duration.ofMillis(Long.parseLong(value));
+    }
+}
+----
+
+==== 校验与执行
+
+类型转换完成后进入校验, 随后才真正调用业务方法, 完整生命周期如下:
+
+[plantuml, "picocli 解析与执行生命周期", format=png]
+----
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam sequenceMessageAlign center
+
+actor 调用方 as Caller
+participant "CommandLine" as CL
+participant "CommandSpec" as Spec
+participant "ArgSpec" as Arg
+participant "命令对象" as Obj
+
+Caller -> CL: execute(args)
+activate CL
+CL -> CL: 首次调用? 反射扫描注解构建模型并缓存
+CL -> Spec: 逐 token 词法分类
+Spec -> Arg: 匹配 OptionSpec / PositionalParamSpec
+Arg --> CL: 原始字符串值
+CL -> CL: ITypeConverter 类型转换
+CL -> CL: 校验必填, arity 与参数组约束
+CL -> Obj: 反射注入字段
+alt 命中 -h/--help 或 -V/--version
+  CL -> CL: 渲染 usage 或 version 并返回 0
+else 正常
+  CL -> Obj: run() 或 call()
+  Obj --> CL: 执行结果(作为退出码)
+end
+CL --> Caller: 退出码
+deactivate CL
+@enduml
+----
+
+校验规则包括:
+
+* **必填约束:** `required = true` 的选项未出现则抛 `MissingParameterException`
+* **arity 约束:** 提供的值数量不在声明范围内时报错
+* **参数组约束:** `@ArgGroup` 的互斥或至少一个规则 (见进阶特性)
+
+两个容易被误解的设计:
+
+IMPORTANT: 只有解析与校验**全部通过**后才会调用 `run()`/`call()`; 任何异常都通过 `IParameterExceptionHandler` 与 `IExecutionExceptionHandler` 拦截, 默认打印到 `err` 并返回非 0 退出码. 因此业务方法内部无需再处理参数错误.
+
+IMPORTANT: 命中 `-h/--help` 或 `-V/--version` 时**跳过必填校验**并直接返回 0, 这保证新用户即使不带任何必填参数也能看到帮助.
+
+=== 进阶特性
+
+==== 子命令
+
+子命令是 picocli 最受欢迎的能力. 声明的 `subcommands` 会在首个非选项 token 命中其名字时, 把**剩余参数转交给子命令自己的解析器**, 实现层层嵌套:
+
+[source,java]
+----
+@Command(name = "git", mixinStandardHelpOptions = true,
+    subcommands = {CommitCommand.class})
+class GitCommand implements Runnable {
+    @Option(names = {"-C", "--directory"}, defaultValue = ".")
+    Path directory;
+
+    public void run() { /* git 默认行为 */ }
+}
+
+@Command(name = "commit")
+class CommitCommand implements Callable<Integer> {
+    @Parameters(paramLabel = "FILE", arity = "0..*")
+    List<Path> files = new ArrayList<>();
+
+    @Option(names = "-m", required = true)
+    String message;
+
+    public Integer call() {
+        System.out.println("commit " + message + " " + files);
+        return 0;
+    }
+}
+----
+
+运行 `git -C /repo commit -m "fix" a.txt` 时, 顶层解析到 `-C` 后遇到子命令名 `commit`, 便把 `-m "fix" a.txt` 交给 `CommitCommand` 的解析器; 父子命令的模型各自独立, 帮助输出也自动带层级. 子命令还可在运行时动态添加: `cl.addSubcommand("remote", new RemoteCommand())`.
+
+==== 参数组 (ArgGroup)
+
+用 `@ArgGroup` 把一组相关选项打包, 并施加组合约束:
+
+* `exclusive = true` (默认): 组内最多出现一个, 常用于互斥模式
+* `exclusive = false`: 组内可并存
+* `required`: 例如 `= "1"` 表示必须命中其中一个
+
+典型用法是登录方式的二选一:
+
+[source,java]
+----
+@ArgGroup(exclusive = true)
+Credentials creds;
+
+static class Credentials {
+    @Option(names = "--user") String user;
+    @Option(names = "--token") String token;
+}
+----
+
+==== 可否定选项 (Negatable)
+
+布尔选项常需要相反的写法, `negatable = true` 会自动生成 `--no-verbose` 并映射为 `false`:
+
+[source,java]
+----
+@Option(names = "--verbose", negatable = true, description = "冗余输出")
+boolean verbose;
+----
+
+==== 默认值与外部来源
+
+静态默认值直接用 `defaultValue`; 需要从环境变量, 配置文件读取时, 用 `defaultValueProvider` 指向 `IDefaultValueProvider` 实现, picocli 内置了环境变量与系统属性提供器:
+
+[source,java]
+----
+@Option(names = "--host", defaultValueProvider = CommandLine.EnvDefaultProvider.class)
+String host;
+----
+
+这使"未显式传参时回退到 `HOST` 环境变量" 成为一行声明.
+
+==== 交互式输入
+
+对密码等敏感值, `interactive = true` 会要求用户在终端输入且不回显:
+
+[source,java]
+----
+@Option(names = "--password", interactive = true, arity = "0..1")
+char[] password;
+----
+
+配 `char[]` 类型可在用后立即清空, 降低泄露风险.
+
+==== 补全与原生镜像
+
+picocli 附带 `picocli.AutoComplete` 与 `picocli-codegen`, 能从同一命令模型生成 bash/zsh 的**自动补全脚本**, 且由于模型数据在运行时通过反射构建, 配合必要的反射配置即可编译为 GraalVM **原生镜像**, 让 CLI 秒级启动.
+
+=== 总结
+
+对比手写解析与 picocli:
+
+[cols="1,3,3"]
+|===
+|维度 |手写 args 解析 |picocli
+
+|**解析写法**
+|逐 token 手写分支, 易漏
+|注解声明, 自动兼容各种写法
+
+|**类型转换**
+|每类型手写
+|内置转换器 + 自定义扩展
+
+|**帮助/版本**
+|基本没有
+|自动生成, 与模型一致
+
+|**子命令**
+|手动分发
+|声明式嵌套, 自动接管
+
+|**错误提示**
+|粗糙
+|带候选建议的可读异常
+
+|**维护成本**
+|随参数增长线性上升
+|只增注解, 模型统一驱动
+
+|===
+
+常见误区与建议:
+
+* **先立模型再编码:** 不要在业务方法里再解析一次字符串, 所有参数都应声明为字段
+* **用对 arity:** 布尔选项 arity 为 0, 多值集合靠重复出现累积; arity 写错是"参数吃掉参数" 的常见根因
+* **必填与帮助并存:** `mixinStandardHelpOptions` 能保证帮助可访问, 但业务方仍需自己处理"缺参数时给用户明确指引"
+* **复用 Mixin:** 多个命令共享的 `--verbose`, `--config` 等抽成 Mixin 类, 避免重复声明
+* **敏感值用 `char[]` 与 `interactive`:** 避免 `String` 驻留内存带来泄露面
+
+picocli 的价值在于把"解析"从业务代码中彻底剥离: 开发者只描述命令的**形状**, 而词法, 转换, 校验, 渲染与分发全部由模型驱动自动完成, 这正是它成为 Java CLI 事实标准的原因.

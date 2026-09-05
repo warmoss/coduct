@@ -1,0 +1,262 @@
+== MathML讲解
+
+在网页, 电子书与办公文档中排版数学公式, 长期是开发者的难题: 纯文本无法表达分式, 根号, 上下标等二维结构; 图片方案不可检索, 不可缩放, 对读屏软件不友好, 也无法与周围文字同排版. **MathML(Mathematical Markup Language, 数学标记语言)** 正是为解决这一问题而生: 它是基于 XML 的**数学结构化标记语言**, 用树形标签同时表达公式的视觉排版与数学语义, 让数学像 HTML 文本一样可检索, 可复用, 可无障碍朗读.
+
+=== 什么是 MathML
+
+MathML:: 由 W3C 制定的**基于 XML 的数学标记语言**, 1998 年发布 1.0, 2010 年发布 3.0, 2015 年成为 ISO/IEC 40314 国际标准. 它用标签描述数学对象的结构, 排版与语义.
+Presentation MathML(呈现标记):: 描述公式"看起来是什么样", 关注分式, 根号, 上下标, 矩阵等**排版结构**, 对应视觉渲染, 类似 HTML 之于文档.
+Content MathML(内容标记):: 描述公式"实际是什么含义", 用运算符树表达数学语义, 面向机器计算, 公式转换与无障碍朗读.
+MathML Core:: 从 MathML 3 中抽取, 并入 HTML 标准的**浏览器原生实现子集**, 覆盖绝大多数常见排版场景, 是当前浏览器兼容性的实际目标.
+
+MathML 把每个公式视作一棵**表达式树**: 叶子是数字, 变量, 运算符等记号(Token), 内部节点是"分子/分母", "上标/下标", "根号"等布局结构, 或"加法/乘法"等运算关系. 这种树形描述带来四个直接收益:
+
+* **与文本同排版**: 公式作为 DOM 一部分随文字换行, 缩放并继承样式, 无需单独处理图片
+* **可检索与可复制**: 数学内容以字符形式存在, 可被搜索引擎索引, 也能被用户直接选中复制
+* **无障碍访问**: 读屏软件可逐元素朗读公式, 这是图片方案无法实现的
+* **语义可计算**: Content MathML 的语义树可被计算机代数系统(CAS)处理, 支撑公式推导与自动求值
+
+[NOTE]
+====
+MathML 只描述"排版与语义", **不负责最终绘制**; 具体像素由浏览器排版引擎或 JavaScript 库(如 MathJax)完成. 可类比为: MathML 是数学界的"HTML", MathJax 是它的"渲染内核".
+====
+
+=== MathML 的两种编码方式
+
+同一数学对象可用两套编码描述, 分别回答"长什么样"与"是什么".
+
+==== Presentation MathML: 描述长相
+
+Presentation MathML 描述公式的**视觉树**. 它由两类元素构成:
+
+记号元素(Token Element):: 叶子节点, 直接承载字符与样式
+布局元素(Layout Element):: 内部节点, 规定子元素如何排列(横排, 分式, 成组等)
+
+常用记号元素:
+
+[cols="3*"]
+|===
+| 元素 | 类别 | 说明
+| `<mi>` | 标识符 | 变量, 函数名等, 默认斜体, 如 `x`, `sin`
+| `<mn>` | 数字 | 数值字面量, 默认正体, 如 `2`, `3.14`
+| `<mo>` | 运算符 | 运算符与分隔符, 如 `+`, `-`, `=`, `(`, `)`
+| `<mtext>` | 文本 | 普通说明文字, 如 "such that"
+| `<ms>` | 字符串 | 字符串字面量
+| `<mspace>` | 空白 | 显式插入指定宽度空白
+| `<mphantom>` | 隐形占位 | 占位但不显示, 用于水平对齐
+|===
+
+常用布局元素:
+
+[cols="3*"]
+|===
+| 元素 | 类别 | 作用
+| `<mrow>` | 横排分组 | 最常用的容器, 将记号水平排列
+| `<mfrac>` | 分式 | 分子在上, 分母在下, 可多层嵌套
+| `<msqrt>` | 平方根 | 根号加被开方内容
+| `<mroot>` | n 次根 | 被开方内容 + 根指数
+| `<msup>` | 上标 | 底数加指数
+| `<msub>` | 下标 | 底数加下标(如求和变量)
+| `<msubsup>` | 上下标 | 同时含上下标(如积分限)
+| `<mover>` | 顶标 | 内容上方附加(如向量箭头)
+| `<munder>` | 底标 | 内容下方附加(如求和下限)
+| `<mtable>` | 矩阵 | 内含 `<mtr>`(行)与 `<mtd>`(单元格)
+| `<menclose>` | 外框 | 加竖线, 斜线, 圆框等装饰
+|===
+
+一元二次方程求根公式的呈现编码:
+
+[source,xml]
+----
+<math xmlns="http://www.w3.org/1998/Math/MathML" display="block">  <!-- 块级显示 -->
+  <mrow>
+    <mi>x</mi>
+    <mo>=</mo>
+    <mfrac>
+      <mrow>
+        <mo>&minus;</mo>
+        <mi>b</mi>
+        <mo>&PlusMinus;</mo>
+        <msqrt>
+          <msup>
+            <mi>b</mi>
+            <mn>2</mn>
+          </msup>
+          <mo>&minus;</mo>
+          <mn>4</mn>
+          <mo>&InvisibleTimes;</mo>
+          <mi>a</mi>
+          <mo>&InvisibleTimes;</mo>
+          <mi>c</mi>
+        </msqrt>
+      </mrow>
+      <mrow>
+        <mn>2</mn>
+        <mo>&InvisibleTimes;</mo>
+        <mi>a</mi>
+      </mrow>
+    </mfrac>
+  </mrow>
+</math>
+----
+
+* `<mrow>` 把多个记号打包成一个单元, 使分式的分子/分母各自成组
+* `<mo>&minus;</mo>` 使用具名实体表示"减号", 渲染时自动按运算符规则留空
+* `<mo>&InvisibleTimes;</mo>` 表示**隐式乘号**, 如 stem:[4ac] 中数字与变量间的隐形乘号, 排版时几乎不占宽度
+* `<msup>`, `<msqrt>`, `<mfrac>` 均可递归嵌套, 组合出任意复杂结构
+
+上述公式若用 AsciiMath 书写仅需一行: stem:[x = (-b +- sqrt(b^2 - 4ac))/(2a)], 可见 MathML 的冗长换来的是**结构精确与程序可控**.
+
+==== Content MathML: 描述含义
+
+Content MathML 描述公式的**语义树**, 与具体排版无关. 核心思想是"运算符应用": 运算符作用于若干操作数, 构成嵌套的树. 基础元素:
+
+* `<apply>`: 应用一个运算符或函数, 子元素首项为运算符, 其余为操作数
+* `<ci>`: 内容标识符, 表示变量或函数名(如 `x`, `f`)
+* `<cn>`: 内容数字, 可用 `type` 指定整数, 实数, 有理数等类型
+* `<csymbol>`: 语义符号, 表示由外部定义的新运算符或常量
+
+加法 stem:[x + y] 的内容编码:
+
+[source,xml]
+----
+<math xmlns="http://www.w3.org/1998/Math/MathML">
+  <apply>
+    <plus/>
+    <ci>x</ci>
+    <ci>y</ci>
+  </apply>
+</math>
+----
+
+判别式 stem:[b^2 - 4ac] 的内容编码, 语义一目了然:
+
+[source,xml]
+----
+<math xmlns="http://www.w3.org/1998/Math/MathML">
+  <apply>
+    <minus/>
+    <apply>
+      <power/>
+      <ci>b</ci>
+      <cn>2</cn>
+    </apply>
+    <apply>
+      <times/>
+      <cn>4</cn>
+      <ci>a</ci>
+      <ci>c</ci>
+    </apply>
+  </apply>
+</math>
+----
+
+`<apply>` 的外层永远是这个运算符, 由**运算符字典**(Operator Dictionary)统一定义约 200 个标准运算符的语义, 如 `<plus/>`, `<times/>`, `<divide/>`, `<power/>`, `<root/>`, `<sin/>`, `<log/>`, `<eq/>`, `<gt/>`, `<union/>`, `<int/>` 等. 因为语义明确, Content MathML 天然适合作为**系统间交换格式**: 同一个 `<apply><plus/>...</apply>` 既可渲染成排版, 也可交给 CAS 化简求值.
+
+[WARNING]
+====
+两种编码各有所长, 但并不互斥. 实际应用中, Content MathML 常通过 `<semantics>` 与 Presentation MathML 打包在同一 `<math>` 中, 由消费方按需取用. 浏览器只原生渲染 Presentation MathML(MathML Core), Content MathML 需由 JS 库转换后才可显示.
+====
+
+=== 运算符与间距
+
+数学排版的难点之一在于**间距**: 不同运算符周围留白不同, 且随位置(前缀/中缀/后缀)而变化. MathML 的 `<mo>` 依据运算符字典自动决定间距, 不必手工插入 `<mspace>`. 典型间距类别:
+
+[cols="3*"]
+|===
+| 间距 | 示例运算符 | 说明
+| 无 | `(`, `)`, `,`, 上标 | 结构性符号不加空格
+| 细空(ThinSpace) | `+` 前缀, `!` | 前缀正负号与后随内容之间
+| 中空(MediumSpace) | `=`, `<`, `+` 中缀 | 关系与二元运算符两侧
+| 厚空(ThickSpace) | `∫`, `∑` 后随内容 | 大运算符后随被积/求和式
+|===
+
+运算符字典通过 `<mo>` 的三个属性精确匹配:
+
+* `form`: 出现位置, 取值 `prefix`(前缀, 如 `-x`), `infix`(中缀, 如 `a+b`), `postfix`(后缀, 如阶乘 `n!`)
+* `lspace` / `rspace`: 运算符左右预留空间
+* `stretchy`: 是否随内容拉伸(如括号, 根号线)
+
+由于默认规则已覆盖绝大多数情形, 手写 MathML 时通常无需干预间距, 这也是"标记"相比"命令式排版"的优势.
+
+=== 浏览器原生支持与 MathML Core
+
+MathML 的浏览器之路相当曲折: Firefox 早在 2000 年代就内置 MathML 渲染, 而 Chrome 与 Safari 长期缺席, 使 Web 数学一度只能依赖 MathJax 等 JS 库. 这一局面在 2023 年逆转: Chrome 109 与 Safari 17 相继原生支持 **MathML Core**, 至此主流浏览器齐备.
+
+[cols="3*"]
+|===
+| 浏览器/引擎 | 原生支持 | 说明
+| Firefox | 支持, 最早最全 | 自早期版本内置 MathML, 长期是唯一原生选项
+| Chrome / Edge | 支持(109+, 2023) | 原生实现 MathML Core, 默认开启
+| Safari | 支持(17+, 2023) | 对齐 MathML Core, 此前仅部分支持
+| MathJax | JS 库, 全浏览器 | 输入 TeX/AsciiMath/MathML, 输出 HTML+CSS/SVG
+| KaTeX | JS 库, 全浏览器 | 仅 LaTeX 输入, 输出 HTML+CSS, 速度最快
+|===
+
+MathML Core 保留了 Presentation MathML 的核心排版能力(记号, 分式, 根式, 上下标, 矩阵, 间距规则), 而把字体, 颜色等交给 CSS 统一管理, 与 HTML 深度融合. 它刻意**不包含** Content MathML, 后者继续由上层库处理.
+
+=== 网页公式渲染管线
+
+理解 MathML 在现代 Web 中的位置, 关键是认识**渲染管线**: 几乎所有方案最终都会走到"MathML 式表达式树"这一步.
+
+[plantuml, "网页公式渲染管线", format=png]
+----
+@startuml
+start
+:公式源码;
+note right
+  LaTeX / AsciiMath / Content MathML
+end note
+:解析为表达式树(MathML 语义结构);
+:布局计算;
+note right
+  依据运算符字典与字体度量,
+  确定各节点的尺寸与位置
+end note
+:输出;
+note right
+  HTML+CSS / SVG /
+  原生 <math> 元素
+end note
+:渲染到页面;
+note right
+  字符节点仍可检索, 选中,
+  被读屏软件朗读
+end note
+stop
+@enduml
+----
+
+以 MathJax 为例, 它把 TeX, AsciiMath 输入统一解析为**内部 MathML 树**, 再选择输出方式: 支持原生 MathML 的浏览器可直接输出 `<math>`, 否则输出 HTML+CSS 或 SVG. 换句话说, **MathML 是 MathJax 的"中间表示"**, 无论源格式如何, 排版逻辑都工作在 MathML 结构上. 本手册中的公式即由 AsciiMath 编写(stem:[...] 块), 经 Asciidoctor 内嵌的 MathJax 以同一管线渲染.
+
+[NOTE]
+====
+KaTeX 不走 MathML 内部表示, 而是直接把 LaTeX 解析为自身的布局树并输出 HTML+CSS, 因此更快更轻, 但牺牲了 Content MathML 与无障碍接口. 这也是"选择渲染引擎 = 选择功能取舍"的典型例子.
+====
+
+=== 无障碍与可计算性
+
+MathML 的树形结构为**无障碍朗读**提供了天然基础:
+
+* **逐元素朗读**: 读屏软件(如 NVDA, VoiceOver)可依结构朗读, 而非把整条公式当一串乱码
+* **语音规则**: 借助 MathML 语义可生成自然语言描述, 如 "x 等于负 b 加减根号下 b 平方减 4ac, 除以 2a"
+* **键盘导航**: 用户可在 DOM 中逐节点移动, 交互式逐段"读"复杂公式
+
+这种能力来自"字符 + 结构"而非"像素", 是 MathML 相对图片或 SVG 方案的**根本优势**, 也是各国教育, 政务网站强制要求数学内容可访问的重要原因.
+
+=== 典型应用场景
+
+* **浏览器公式渲染**: 维基百科自 2015 年起默认以 MathML 为基础的管线渲染数学公式, 实现缩放与无障碍
+* **办公软件**: Microsoft Word 的"插入公式"内部使用与 MathML 同源的 OMML(Office Math Markup Language), 并可与 MathML 互相转换; LibreOffice 等也内置 MathML 导入
+* **演示文稿**: reveal.js 通过 KaTeX/MathJax 插件渲染数学, 详见 <<reveal讲解.adoc#, reveal讲解>>
+* **无障碍工具**: MathJax 无障碍扩展为 TeX/MathML 生成语音; 配合读屏软件供视障用户使用
+* **科学出版与教学**: 论文审阅系统, 在线题库, Moodle 等 LMS(Learning Management System)用 MathML 作为数学内容标准格式
+
+=== 总结
+
+* MathML 是基于 XML 的数学标记语言, 2015 年成为 ISO/IEC 40314 标准, 同时描述排版(Presentation)与语义(Content)
+* 公式是一棵表达式树: 记号元素做叶子, 布局或运算元素做内部节点
+* `<mo>` 依据运算符字典自动排版间距, `form` 决定前缀/中缀/后缀语义
+* 浏览器原生支持以 **MathML Core** 为准, Chrome 109 与 Safari 17(2023 年)补齐后主流浏览器齐备
+* MathJax 以 MathML 树为中间表示统一渲染 TeX/AsciiMath/Content MathML, 是理解 Web 公式渲染的关键
+* 树形结构带来可检索, 可复制与无障碍朗读, 这是图片方案不可替代的核心价值

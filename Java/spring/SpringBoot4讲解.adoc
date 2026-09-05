@@ -1,0 +1,339 @@
+== SpringBoot4讲解
+
+Spring Boot 4 是 Spring 家族在 3.x 之后的首个主版本升级. 它不只是依赖的大批量更新, 而是以 **Spring Framework 7** 与 **Jakarta EE 11** 为底座, 对自身架构做了一次**模块化重构**, 并让 Jackson 3, HTTP Service Client, API 版本化, OpenTelemetry 等成为一等公民. 对熟悉 Spring Boot 3 的开发者而言, 理解这些变化的动机比记忆新 API 更重要: 它们共同指向更小的运行时, 更强的可观测性和更清晰的组件边界.
+
+参考: <<Java/spring/Spring线程池讲解.adoc#, Spring线程池讲解>>
+
+[[sb4-baseline]]
+=== 版本与基线
+
+Spring Boot 4.0 于 **2025 年 11 月**发布首个 GA, 4.1 于 **2026 年 6 月**发布. 截至本文(2026 年 9 月), 最新稳定版为 **4.1.1**, 4.2 仍在里程碑阶段.
+
+[cols="2,2,3"]
+|===
+|版本线 |发布时间 |定位
+
+|4.0.x
+|2025-11
+|首个 GA, 完成模块化重构与基线升级
+
+|4.1.x
+|2026-06
+|当前稳定线, 新增 Spring gRPC 等能力
+
+|4.2
+|开发中
+|下一功能版本, 预计 2026 年底发布
+
+|===
+
+与 3.5 相比, 4.0 的技术基线整体上移:
+
+[cols="2,3,3"]
+|===
+|维度 |Spring Boot 3.5 |Spring Boot 4
+
+|Java 最低版本
+|17
+|17, 支持最新 LTS(Java 25)
+
+|Spring Framework
+|6.2
+|7.0
+
+|Jakarta EE
+|10
+|11
+
+|Servlet
+|6.0
+|6.1
+
+|默认内嵌容器
+|Tomcat 10.1
+|Tomcat 11.0
+
+|JSON 方案
+|Jackson 2
+|Jackson 3(可回退 2)
+
+|构建工具
+|Gradle 8.x
+|Gradle 8.14+ 与 9, Maven 不变
+
+|===
+
+[[sb4-concepts]]
+=== 核心概念
+
+先厘清贯穿全文的术语:
+
+Spring Boot:: 以"约定优于配置"为核心的 Java 应用框架, 用自动配置与 Starter 把第三方技术接入成本降到最低.
+
+自动配置 (Auto-configuration):: 依据 classpath 依赖与属性自动装配 Bean 的机制. Boot 3.x 中它们被打包在单个 `spring-boot-autoconfigure` 大 jar 中.
+
+Starter:: 一组依赖的聚合 POM, 引入即获得某技术的自动配置与版本管理.
+
+模块 (Module):: Boot 4 按技术拆分的构件, 命名 `spring-boot-<technology>`, 根包 `org.springframework.boot.<technology>`.
+
+Classic Starter:: 为 3.x 用户提供的过渡 Starter, 一次性引入全部模块但**不携带其传递依赖**.
+
+可观测性 (Observability):: 指标, 日志, 链路追踪的统一观察能力, Boot 4 默认向 OpenTelemetry 标准靠拢.
+
+[[sb4-modular]]
+=== 模块化重构
+
+模块化是 Boot 4 最根本的架构变化, 也是理解其它变更的钥匙.
+
+* **为什么做** - `spring-boot-autoconfigure` 从 1.0 的 182 KiB 膨胀到 3.5 的约 2 MiB. 单一巨 jar 带来三类问题: 编译期与 IDE 出现大量用不到的类; 无法区分引入 `webflux` 是想要服务端 `@Controller` 还是只用 `WebClient`, 导致意外触发不需要的自动配置; 启动扫描与体积成本难以削减.
+* **改成什么** - 按技术拆分出小模块, 每个模块有明确的包前缀与自动配置集合, 模块边界成为正式契约而非约定俗成.
+* **换来什么** - 按需引入模块即可, classpath, 启动扫描与镜像体积更小; 例如现在可以脱离 Actuator 单独使用 Micrometer 指标能力.
+
+命名约定与代码结构完全对齐:
+
+[cols="2,3,3"]
+|===
+|类型 |命名 |示例
+
+|功能模块
+|`spring-boot-<tech>`
+|`spring-boot-webmvc`, `spring-boot-jackson`
+
+|Starter
+|`spring-boot-starter-<tech>`
+|`spring-boot-starter-webmvc`
+
+|测试模块
+|`spring-boot-<tech>-test`
+|`spring-boot-webmvc-test`
+
+|测试 Starter
+|`spring-boot-starter-<tech>-test`
+|`spring-boot-starter-webmvc-test`
+
+|===
+
+几个高频 Starter 在 4.0 中改名或新增:
+
+* `spring-boot-starter-web` 更名为 `spring-boot-starter-webmvc`, 旧名保留但标记废弃
+* `spring-boot-starter-web-services` 更名为 `spring-boot-starter-webservices`
+* `spring-boot-starter-aop` 更名为 `spring-boot-starter-aspectj`
+* Flyway, Liquibase 等此前没有 Starter 的技术, 现在需要显式引入 `spring-boot-starter-flyway` 等
+* 安全相关 Starter 统一 `security-` 前缀, 例如 `spring-boot-starter-security-oauth2-client`
+
+对已有 3.x 应用, 依赖调整大致如下:
+
+[source,xml]
+----
+<!-- Spring Boot 3 -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.flywaydb</groupId>
+    <artifactId>flyway-core</artifactId>
+</dependency>
+
+<!-- Spring Boot 4 -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webmvc</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-flyway</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webmvc-test</artifactId>
+    <scope>test</scope>
+</dependency>
+----
+
+TIP: 迁移阶段可直接引入 `spring-boot-starter-classic` 与 `spring-boot-starter-test-classic`, 快速恢复 3.x 式全量自动配置, 再逐步替换为按需 Starter.
+
+[[sb4-jackson3]]
+=== Jackson 3 与 JSON 体系
+
+Boot 4 将默认 JSON 库从 Jackson 2 升级到 **Jackson 3**. Jackson 3 是包名与组 ID 层面的重构: 多数包由 `com.fasterxml.jackson` 迁到 `tools.jackson`, 唯一例外是 `jackson-annotations`, 它仍保留在 `com.fasterxml.jackson.core` 组与 `com.fasterxml.jackson.annotation` 包下.
+
+* 自动配置改为**按格式注入专用 Mapper**: JSON 用 `JsonMapper`, XML 用 `XmlMapper`, 4.1 起还有 `CBORMapper`. 若想替换默认实现, 定义这些专用 Mapper Bean 即可, 只定义 `ObjectMapper` 不再生效.
+* 注解与 API 改名以明确与格式无关的语义: `@JsonComponent` 改 `@JacksonComponent`, `@JsonMixin` 改 `@JacksonMixin`, `Jackson2ObjectMapperBuilderCustomizer` 改 `JsonMapperBuilderCustomizer`.
+* 模块发现更激进: Boot 4 默认扫描 classpath 上**所有** Jackson 模块并注册, 不再限于"知名"白名单, 可用 `spring.jackson.find-and-add-modules=false` 关闭.
+
+对暂时无法迁移的存量代码, Boot 提供两条后路:
+
+Jackson 2 默认行为:: 设置 `spring.jackson.use-jackson2-defaults=true`, 让自动配置的 `JsonMapper` 尽量对齐 Boot 3 的 Jackson 2 默认值.
+spring-boot-jackson2 模块:: 以**废弃**形式随 4.0 提供, 引入后使用 `spring.jackson2.*` 属性, 仅作过渡.
+
+[source,yaml]
+----
+spring:
+  jackson:
+    use-jackson2-defaults: true   # 对齐 Jackson 2 默认行为
+----
+
+[[sb4-observability]]
+=== 可观测性
+
+Boot 4 把可观测性收敛到 **OpenTelemetry** 标准, 链路追踪, 指标与日志开始使用同一套数据模型与导出通道.
+
+* 新增 `spring-boot-starter-opentelemetry`, 自动装配 OpenTelemetry SDK 并通过 **OTLP** 导出指标与链路; 4.1 进一步支持按 OTLP 导出日志, 导出器支持 SSL Bundle 与 OpenTelemetry 环境变量.
+* 属性命名更精确: `management.tracing.enabled` 改名为 `management.tracing.export.enabled`, 并新增 `management.opentelemetry.enabled` 独立开关.
+* 4.0 起**存活与就绪探针默认开启**, health 端点默认暴露 `liveness` 与 `readiness` 分组, 便于直接对接 Kubernetes 探针.
+* 4.1 增强 `@Async` 场景的上下文自动传播, 并自动应用 Kafka, RabbitMQ 等组件的观测约定.
+
+[source,yaml]
+----
+management:
+  tracing:
+    export:
+      enabled: true       # 是否导出链路
+  otlp:
+    metrics:
+      export:
+        compression-mode: gzip   # OTLP 指标压缩
+----
+
+[[sb4-web]]
+=== Web 与 HTTP 客户端
+
+Web 层新增能力集中在 **HTTP 接口客户端** 与 **API 版本化**, 并重构了消息转换器的定制方式.
+
+==== HTTP Service Client
+
+对普通 Java 接口标注 `@HttpExchange` 系列注解, Boot 自动生成实现, 取代手写 `RestTemplate` 或 `WebClient` 的样板代码:
+
+[source,java]
+----
+public interface EchoService {        // <1>
+
+    @PostExchange(url = "https://echo.zuplo.io")   // <2>
+    Map<?, ?> echo(@RequestBody Map<String, String> message);
+}
+----
+<1> 纯接口定义, 无任何实现类
+<2> 声明 HTTP 方法与目标地址, 方法参数映射为请求体
+
+底层执行器可选 `RestClient` 或 `WebClient`, 超时, 重试与 SSL 均可在属性中统一配置.
+
+==== API 版本化
+
+Boot 4 为 Spring MVC 与 WebFlux 增加了**开箱即用的 API 版本化**:
+
+[source,yaml]
+----
+spring:
+  mvc:
+    apiversion:
+      strategy: path     # 基于路径前缀的版本策略
+      path:
+        prefix: /v       # 将 /v2/orders 解析为版本 2
+----
+
+默认提供 Path, Header 等策略, 也可自定义 `ApiVersionResolver`, `ApiVersionParser` 与 `ApiVersionDeprecationHandler`.
+
+==== 消息转换器重构
+
+Boot 3 时代的 `HttpMessageConverters` 已废弃, 原因是它把客户端与服务端转换器混在一起. 取而代之的是 `ClientHttpMessageConvertersCustomizer` 与 `ServerHttpMessageConvertersCustomizer`, 两端可独立增删或替换转换器.
+
+[[sb4-concurrency]]
+=== 并发与任务执行
+
+并发层面围绕**虚拟线程**与任务执行做了系统性改进:
+
+* 通过 `spring.threads.virtual.enabled=true` 一键开启虚拟线程, 相关机制可参考 <<Java/spring/Spring线程池讲解.adoc#, Spring线程池讲解>>
+* Boot 4 把虚拟线程支持扩展到更多自动配置: 开启后, 基于 JDK `HttpClient` 的 HTTP 客户端, Redis 监听容器等组件也会运行在虚拟线程上
+* 支持**多个** `TaskDecorator` Bean, 框架自动组合为 `CompositeTaskDecorator`, 并按 `@Order` 顺序依次包装任务
+* JMS 侧引入 `JmsClient`, 与既有 `JmsTemplate` 并存
+
+[[sb4-new41]]
+=== 4.1 新特性速览
+
+* **Spring gRPC** - 一等支持 gRPC 服务器与客户端, 既可独立 Netty 运行, 也可借助 Servlet 通过 HTTP/2 暴露
+* **SSRF 防护** - HTTP 客户端支持 `InetAddressFilter`, 阻止对特定内网地址的外发请求
+* **懒连接数据源** - `spring.datasource.connection-fetch=lazy` 时用 `LazyConnectionDataSourceProxy` 包装连接池, 真正执行语句时才取物理连接
+* **Redis 注解监听** - 为 `@RedisListener` 提供自动配置, 无需手工装配 `RedisMessageListenerContainer`
+* **更多集成** - Spring Batch 可运行于 MongoDB; OAuth2 资源服务器支持 SpEL 提取 authorities; info 端点补充进程信息
+
+[[sb4-testing]]
+=== 测试体系
+
+测试是升级中最容易踩坑的部分, 主要变化如下:
+
+* `@MockBean` 与 `@SpyBean` 被移除, 统一改用 Spring Framework 7 的 `@MockitoBean` 与 `@MockitoSpyBean`
+* `@SpringBootTest` **不再自动**提供 MockMvc, WebClient 或 `TestRestTemplate`, 需要显式叠加 `@AutoConfigureMockMvc` 或 `@AutoConfigureRestTestClient`
+* 推荐用 `RestTestClient` 取代 `TestRestTemplate`, 前者统一了 Mock 环境与真实服务器的测试姿势
+
+[source,java]
+----
+@SpringBootTest
+@AutoConfigureMockMvc                    // <1>
+class OrderControllerTests {
+
+    @Autowired
+    MockMvc mockMvc;
+
+    @MockitoBean                         // <2>
+    private OrderService orderService;
+}
+----
+<1> 显式启用 MockMvc
+<2> 替代旧的 @MockBean
+
+另外, 测试依赖也模块化了: 每个主 Starter 都有对应的 `-test` Starter, 例如 Web 测试引入 `spring-boot-starter-webmvc-test` 即可, 它已传递包含基础测试 Starter.
+
+[[sb4-removed]]
+=== 移除与废弃
+
+主版本升级必然伴随清理, 升级前先确认以下能力是否被使用:
+
+Removed (4.0):: Undertow 内嵌容器支持; Pulsar Reactive; 可执行 JAR 的嵌入式启动脚本; Spring Session 对 Hazelcast 与 MongoDB 的内置支持; 经典 uber-jar Loader; Spock 集成(4.1 已恢复); 3.x 时期已废弃的 API.
+Deprecated (4.0):: Jackson 2 模块 `spring-boot-jackson2`; 旧命名 Starter(如 `spring-boot-starter-web`).
+Deprecated (4.1):: Derby 集成(Derby 项目已停维, 建议迁往 H2 或 HSQL); DevTools LiveReload; 4.0 中废弃的 API 在 4.1 中被移除.
+Removed (4.1):: layertools jar 模式(请改用 `tools`).
+
+NOTE: Undertow 被移除的原因是它尚未兼容 Servlet 6.1. 若使用外部容器部署, 请确认容器满足 Servlet 6.1 基线.
+
+[[sb4-upgrade]]
+=== 从 3.x 升级到 4
+
+建议按下面顺序推进, 尽量分阶段降低风险:
+
+. **升到最新 3.5.x** - 先清理 3.x 废弃 API, 再进入 4 的升级
+. **评估基线** - 确认 Java 17+(建议用最新 LTS), GraalVM native-image 需 25+, 部署容器需 Servlet 6.1, 放弃 Undertow
+. **迁移配置属性** - 临时引入 `spring-boot-properties-migrator`, 启动时自动诊断并迁移改名属性, 完成后务必移除
+. **调整依赖** - 选择直接换成模块化 Starter, 或先用 `spring-boot-starter-classic` 过渡
+. **补齐测试 Starter** - 为每个主 Starter 添加对应的 `-test` Starter
+. **修复代码** - 处理包名, import, Jackson 3, `@MockitoBean` 等 API 变化
+. **回归验证** - 升级到最新 4.0.x 或 4.1.x 后做构建与测试回归
+
+[plantuml, "Spring Boot 4 升级流程", format=png]
+----
+@startuml
+start
+:升级到最新 3.5.x;
+:引入 spring-boot-properties-migrator;
+if (基线是否满足?) then (是)
+  :替换或新增模块化 Starter;
+else (否)
+  :先升级 Java 或容器;
+endif
+:引入 classic starter 过渡(可选);
+:补齐 -test Starter;
+:修复 import, 包名与 Jackson 3;
+:切换到最新 4.0.x 或 4.1.x;
+:构建与测试回归;
+stop
+@enduml
+----
+
+[[sb4-summary]]
+=== 总结
+
+* Boot 4 的核心是**架构升级**而非功能堆叠: 模块化重构让运行时更小, 边界更清晰
+* 版本基线整体上移: Spring Framework 7, Jakarta EE 11, Servlet 6.1, Jackson 3
+* 新增 HTTP Service Client, API 版本化, OpenTelemetry Starter 与 Spring gRPC 等一等能力
+* 测试与配置属性迁移是主要痛点: 优先用 `spring-boot-starter-classic` 与 `spring-boot-properties-migrator` 平滑过渡
+* 升级前务必核对移除清单(Undertow, `@MockBean`, 旧 Starter 命名等), 避免升级后才发现破坏性变更

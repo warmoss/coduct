@@ -1,0 +1,259 @@
+== GraalVM原理讲解
+
+=== 引言
+
+GraalVM 是 Oracle 推出的**多语言高性能 JDK 发行版**, 它将三件事合而为一: 用 Java 写成的 **Graal JIT 编译器**, 支持多语言共享与互操作的 **Truffle 框架**, 以及把 Java 应用**提前 (AOT) 编译成原生可执行文件**的 **Native Image**. 传统 JVM 场景下存在三个痛点: 应用启动需要类加载与 JIT 预热, 内存占用高, 且不同语言难以在同一进程内高效协作. GraalVM 正是围绕这三者设计的解决方案.
+
+GraalVM 的典型应用是配合 Quarkus, Spring Boot 3 等框架将微服务编译为启动毫秒级, 内存占用极低的原生镜像, 详见 <<Java/Quarkus框架讲解.adoc#, Quarkus框架讲解>>. 本文从编译器, 多语言框架与 AOT 三条主线拆解其核心原理.
+
+=== 核心概念
+
+GraalVM:: 以 JVM 生态为基础, 集成了 Graal 编译器, Truffle 框架与 Substrate VM 的完整运行时发行版. 它既是一个普通 JDK, 又是一套可运行多语言并可产出原生镜像的工具链.
+Graal 编译器:: 完全用 Java 实现的 **JIT 编译器**, 可替换 HotSpot 的 C2, 采用 Sea-of-Nodes 图中间表示, 具备更强的内联与逃逸分析能力.
+Truffle:: 用于构建**自优化 AST 解释器**的语言实现框架. 在其上运行的语言 (如 JavaScript, Python, Ruby) 借助 Graal 编译器达到接近原生语言的执行性能.
+Substrate VM:: Native Image 背后的最小化运行时, 重新实现了线程, GC 等少量 JVM 组件, 不包含类加载与 JIT, 支撑原生可执行文件独立运行.
+Native Image:: 基于 **封闭世界假设** 将 Java 字节码 AOT 编译为平台相关可执行文件的技术, 去除 JVM 启动开销.
+JVMCI (JVM Compiler Interface):: JEP 243 定义的接口, 允许把外部编译器接入 HotSpot, Graal 编译器正是通过它挂载为顶层 JIT.
+封闭世界假设 (Closed-World Assumption):: 假设所有可达类, 方法在构建期已确定, 运行时不再动态加载新类, 是 Native Image 静态分析成立的前提.
+部分求值 (Partial Evaluation):: 一种编译优化: 已知输入提前计算, 只保留依赖未知输入的代码, Truffle 用它把通用解释器"特化"成面向具体程序的高效代码.
+
+=== 架构总览
+
+GraalVM 发行版内部可分为三层: 底层的 HotSpot JVM (提供 GC 与运行时服务), 中间的多语言与编译设施, 以及面向 AOT 的独立工具链.
+
+[plantuml, "GraalVM 整体架构", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+
+package "GraalVM JDK" {
+  rectangle "JVM 应用" as app
+  rectangle "HotSpot JVM" as hotspot {
+    rectangle "C1 客户端编译器" as c1
+    rectangle "Graal JIT 编译器" as graaljit
+    rectangle "Truffle 运行时" as truffle
+  }
+  rectangle "语言运行时" as langs {
+    rectangle "JavaScript / Node.js" as js
+    rectangle "Python" as py
+    rectangle "Ruby / R / WASM / LLVM" as other
+  }
+  rectangle "Native Image\n(Substrate VM)" as ni
+}
+
+app --> hotspot
+js --> truffle
+py --> truffle
+other --> truffle
+truffle --> graaljit : 部分求值后编译
+graaljit --> hotspot : 通过 JVMCI 挂载
+ni --> app : AOT 产出原生可执行文件
+@enduml
+----
+
+三大子系统的分工: Graal JIT 服务运行在 JVM 上的 Java 程序, Truffle 服务各类动态语言, Native Image 则绕开 JVM 直接产出操作系统可执行文件.
+
+=== Graal JIT 编译器
+
+==== 为什么要用 Java 写编译器?
+
+传统 JVM 的顶层编译器 C2 用 C++ 编写, 优化逻辑难以维护与扩展. Graal 编译器改用 Java 实现, 带来两点收益:
+
+* **元循环优势** - 编译器自身也在 JVM 上运行, 享受 JVM 的 GC 与运行时服务, 并能用同一套 Graal 优化自身
+* **可移植与可扩展** - 新优化只需写普通 Java 代码, 同时可作为 Truffle 部分求值的编译后端复用
+
+Graal 编译器对方法的编译产物是**图 (Graph) 形式的中间表示**, 即 Sea-of-Nodes: 数据流与控制流统一在一张图中, 相比 C2 的线性 IR 更容易做跨语句的全局优化.
+
+==== 关键优化
+
+* **跨语言内联** - Graal 编译 Truffle 解释器时可沿着语言边界内联节点, 消除解释器层间接调用开销
+* **部分逃逸分析 (PEA)** - 相比 C2 的逃逸分析, PEA 允许对象部分逃逸, 只要对象未逃逸就做标量替换, 从而消除更多堆分配
+* **推测优化** - 对多态调用, 类型检查等做假设性优化, 失败时通过去优化 (deopt) 回退到解释执行
+
+==== 如何启用
+
+在 GraalVM JDK 中, Graal 编译器**默认作为顶层 JIT** 替代 C2. 在普通 OpenJDK 上可通过 JVMCI 手动挂载:
+
+[source,shell]
+----
+# 在标准 OpenJDK 上启用 Graal 作为 JIT (实验性)
+java -XX:+UnlockExperimentalVMOptions -XX:+UseJVMCICompiler -jar app.jar
+----
+
+NOTE: 启用后代码仍需 JIT 预热, 因此 Graal JIT 改善的是**峰值性能**, 不解决启动慢的问题.
+
+=== Truffle 多语言框架
+
+==== 为什么需要 Truffle?
+
+历史上每种语言都需要重写一套 JIT, 成本极高. Truffle 的思路是: 只要写一个**带自优化能力的 AST 解释器**, 就能借助 Graal 编译器自动获得 JIT 性能. 在 Truffle 之上实现的语言包括:
+
+* **GraalJS** - JavaScript 与 Node.js
+* **GraalPy** - Python
+* **TruffleRuby** - Ruby
+* **FastR** - R
+* **GraalWasm** - WebAssembly
+* **Sulong** - LLVM 位码
+
+==== 自优化解释器
+
+Truffle 的关键机制是"先解释, 后编译":
+
+. 源码被解析为 AST, 以**解释方式**执行, 同时记录运行时的实际类型信息 (profile).
+. 根据观察到的类型, AST 节点**自我专用化**: 例如算术节点从通用多态节点改写为仅处理 `int` 的专用节点, 消除装箱与动态分派.
+. 当节点被充分专用化后, Truffle 请求 Graal 编译器对解释器做**部分求值**: 把"解释任意程序"的通用循环, 特化为"只执行当前这个程序"的编译代码.
+. Graal 编译器对求值结果 JIT 编译, 生成可执行的高效机器码.
+
+[plantuml, "Truffle 从解释到编译的路径", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+start
+:解析源码为 AST, 解释执行并记录类型 profile;
+:节点自我专用化 (去装箱, 去动态分派);
+:部分求值 (Partial Evaluation) 得到特化代码;
+:Graal 编译器 JIT 编译为机器码;
+:执行编译后的高效代码, 失败则去优化回退;
+stop
+@enduml
+----
+
+==== Polyglot 互操作
+
+Truffle 定义了**互操作协议**, 让不同语言的对象可在同一进程内直接互相调用, 无需序列化跨进程通信:
+
+[source,java]
+----
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Value;
+
+public class PolyglotDemo {
+    public static void main(String[] args) {
+        try (Context ctx = Context.newBuilder("js", "python").build()) {
+            Value msg = ctx.eval("js", "'Hello from ' + 'JavaScript'");
+            System.out.println(msg.asString());
+            Value sum = ctx.eval("python", "1 + 2 * 3");
+            System.out.println(sum.asInt());
+        }
+    }
+}
+----
+
+得益于共享的 Graal 编译器后端, 跨语言调用被内联优化后, 性能损耗远低于传统的外进程嵌入方案.
+
+=== Native Image: AOT 原生镜像
+
+==== 解决什么问题?
+
+JVM 模式的两个固有问题在 Serverless, 容器场景被放大: 冷启动慢 (类加载 + JIT 预热可达秒级) 与内存开销高. Native Image 将编译提前到**部署前**: 把字节码直接编译成机器码, 运行时不再需要 JVM, 因此:
+
+* **启动极快** - 无类加载与 JIT 预热, 通常从秒级降至毫秒级
+* **内存低** - 无 JIT 编译器, 无解释器, 常驻内存显著下降
+* **部署简单** - 产物是独立可执行文件 (甚至可静态链接), 镜像可小到几十 MB 级
+
+==== 核心技术
+
+Substrate VM 与封闭世界假设是 Native Image 的两块基石:
+
+* **静态可达性分析** - 构建器在 JVM 中运行, 从入口方法出发做 points-to 分析, 确定所有可达类与方法, 未达代码直接丢弃
+* **运行时最小化** - Substrate VM 只保留线程, GC (默认 Serial GC, 可选 G1), 少量 JDK 组件, 不含类加载器与 JIT
+* **镜像堆 (Image Heap)** - 构建期完成常量与可静态初始化对象的初始化, 把对象图序列化进镜像, 运行时直接以此为初始堆, 省去重复初始化
+* **AOT 编译** - 可达字节码在构建期被编译为机器码固化进可执行文件
+
+由于假设封闭世界, 运行时依赖**动态特性**的代码必须提前声明, 这是使用 Native Image 最大的心智负担:
+
+[cols="2*"]
+|===
+| 动态特性 | 处理方式
+
+| 反射 (`Class.forName`, `getMethod`) | 通过 `reflect-config.json` 或追踪代理注册
+| 动态代理 (`Proxy`) | 通过 `proxy-config.json` 注册
+| JNI | 通过 `jni-config.json` 注册
+| 类路径资源 (getResource) | 通过 `resource-config.json` 注册
+| Java 序列化 | 通过 `serialization-config.json` 注册
+|===
+
+==== 构建工作流
+
+[plantuml, "Native Image 构建流程", format=png]
+----
+@startuml
+skinparam backgroundColor transparent
+start
+:运行 native-image 构建器 (构建期跑在 JVM 上);
+:静态可达性分析, 确定需要保留的代码;
+:读取反射 / JNI / 资源等配置文件;
+:初始化静态数据, 快照镜像堆;
+:将可达字节码 AOT 编译为机器码;
+:产出可独立运行的原生可执行文件;
+stop
+@enduml
+----
+
+==== 使用示例
+
+安装后 (当前发行版已内置), 直接编译:
+
+[source,shell]
+----
+# 编译 HelloWorld
+native-image HelloWorld -O3
+# 运行 (Windows 下为 hello-world.exe)
+./helloworld
+----
+
+[source,java]
+----
+public class HelloWorld {
+    public static void main(String[] args) {
+        System.out.println("Hello, Native Image!");
+    }
+}
+----
+
+收集反射等动态配置, 推荐使用追踪代理: 在 JVM 模式运行应用并复现主要路径, 代理自动落盘配置到 `META-INF/native-image/`:
+
+[source,shell]
+----
+java -agentlib:native-image-agent=config-output-dir=src/main/resources/META-INF/native-image \
+     -jar app.jar
+native-image -jar app.jar
+----
+
+Truffle 与 Graal 编译器等组件的 AOT 编译策略与普通 Java 不同, 需通过 `--language:js` 等参数显式启用, 且多语言镜像体积较大, 应避免无谓地包含语言运行时.
+
+=== 三种形态对比
+
+[cols="4*"]
+|===
+| 维度 | JVM (C1/C2) | Graal JIT | Native Image
+
+| 编译时机 | 运行时分层 JIT | 运行时单层 JIT | 部署前 AOT
+| 启动速度 | 慢 (需预热) | 慢 (需预热) | 极快
+| 峰值性能 | 高 | 更高 | 中 (无运行时 profile)
+| 内存占用 | 高 | 高 | 低
+| 动态特性 | 完整支持 | 完整支持 | 受限, 需配置
+| 典型场景 | 长驻服务 | 长驻服务 | Serverless, 边缘, CLI
+|===
+
+=== 生态与应用
+
+主流 Java 云原生框架均深度集成 Native Image:
+
+* **Quarkus** - 以构建时处理为基础, 对 Native 适配最彻底
+* **Spring Boot 3** - 通过 Spring AOT 提供 GraalVM 支持
+* **Micronaut, Helidon** - 同为构建时处理理念的微服务框架
+
+GraalVM 持续演进: 当前最新稳定版为 **Oracle GraalVM for JDK 25** (Innovation 发行线), 同时提供面向 JDK 21 (LTS) 的版本; 自 GraalVM 23.x 起, Graal 编译器, Native Image 与 Truffle 组件均已内置, 无需再通过 `gu install` 单独安装. Oracle GraalVM 在 GFTC 许可下可免费用于生产.
+
+WARNING: Native Image 并不适合所有应用. 依赖深度反射, 动态代理, 运行时类加载的遗留框架迁移成本高; 追求极致峰值吞吐的长驻服务用 JVM 模式往往更合适. 选型时应先用"封闭世界"标准审视应用是否可控.
+
+=== 总结
+
+GraalVM 的本质是对"Java 运行方式"的三条演进路径:
+
+* **Graal JIT** - 用 Java 重写编译器, 提升峰值性能, 仍走解释 + 预热的老路
+* **Truffle** - 用"自优化解释器 + 部分求值"统一多语言, 让动态语言获得 JIT 级性能与进程内互操作
+* **Native Image** - 以封闭世界假设换取极速启动与低内存, 把 JVM 开销转移到构建期
+
+三者共享 Graal 编译器这一核心引擎, 使其同时服务 JVM 内优化, 多语言编译与 AOT 编译. 理解 GraalVM, 关键在于把握"**编译时机与运行时假设的权衡**": 何时编译, 允许保留多少动态性, 决定了启动速度, 内存与峰值性能之间的取舍.

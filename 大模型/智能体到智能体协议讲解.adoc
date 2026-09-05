@@ -1,0 +1,427 @@
+== 智能体到智能体协议讲解
+
+MCP 统一了"智能体如何调用工具", ACP 统一了"客户端如何连接智能体", 但一个更关键的问题仍未解决: **智能体之间如何直接协作**. 订机票, 订酒店, 换汇, 规划行程往往由不同厂商用不同框架开发的智能体负责, 它们彼此孤立, 只能通过点对点定制集成对话. 把智能体包装成"工具"交给对方调用也并非良策, 因为智能体天然需要协商, 澄清与多轮交互, 工具接口承载不了这种能力. **A2A(Agent2Agent) 协议** 正是为"让任意智能体与任意智能体直接对话"而生的开放协议.
+
+参考: <<大模型/大模型MCP原理讲解.adoc#, 大模型MCP原理讲解>>, <<大模型/智能体客户端协议讲解.adoc#, 智能体客户端协议讲解>>, <<大模型/大模型工作流原理讲解.adoc#, 大模型工作流原理讲解>>, <<大模型/大模型原理讲解.adoc#, 大模型原理讲解>>
+
+=== 什么是 A2A
+
+A2A(Agent2Agent, 智能体到智能体):: 一套**智能体间(Agent-to-Agent)通信的开放协议标准**, 定义异构 AI 智能体之间"发现彼此能力, 协商交互方式, 协同完成任务, 安全交换信息"的统一语言. 它由 Google 于 2025 年发起, 同年 6 月捐赠给 Linux 基金会, 2026 年起由 **Agentic AI Foundation** 治理, 当前最新稳定版为 **1.0.0**.
+
+Agent:: 能感知环境并自主行动以达成目标的程序. A2A 对"智能体内部如何思考"不做任何假设, 只约定其对外暴露的交互边界.
+A2A Client:: 代表用户或其他系统**发起请求**的一方, 通常是承担编排职责的智能体或应用.
+A2A Server(Remote Agent):: **对外暴露 A2A 端点**, 接收并处理任务的智能体, 对应协议术语中的"远端智能体".
+Agent Card:: 由 A2A Server 发布的一份 **JSON 元数据清单**, 描述其身份, 能力, 技能, 端点与鉴权要求, 相当于智能体的"名片".
+
+理解 A2A 的一条主线: 它是"**智能体对智能体**"的协议, 与"智能体对工具"的 MCP, "客户端对智能体"的 ACP 处在智能体技术栈的不同层级:
+
+[plantuml, "智能体技术栈中的 A2A, MCP 与 ACP", format=png]
+----
+@startuml
+rectangle "Agent Client(编辑器, 应用)" as UI
+rectangle "编排 Agent" as Orch
+rectangle "工具/数据源" as Tool
+rectangle "专业 Agent(航班, 酒店...)" as Sub
+
+UI <--> Orch: ACP(客户端到智能体)
+Orch <--> Sub: A2A(智能体到智能体)
+Sub --> Tool: MCP(智能体到工具)
+@enduml
+----
+
+=== 为什么需要 A2A
+
+把多个独立智能体拼成一套系统时, 常见的两种做法都有明显短板:
+
+* **把智能体包装成工具暴露**: 借助 MCP 等机制把 agent 封装为 tool, 对方只能以"调用一次拿一个结果"的方式使用它. 但真正的协作需要 agent 之间直接协商, 例如中途反问澄清, 请求授权, 分多次返回结果, 工具接口无法表达这些行为.
+* **点对点定制集成**: 为每一对需要协作的智能体单独开发接口. 集成数量随智能体数量呈平方级增长, 且各厂商接口, 鉴权, 错误处理五花八门, 难以维护与扩展.
+
+在无标准协议的世界里, 这些智能体互相隔离, 无法自行发现对方能做什么, 也无法形成跨厂商的智能体生态.
+
+[cols="2,4,4"]
+|===
+| 对比维度 | 点对点定制集成 | 基于 A2A
+
+| 集成方式
+| 每对组合单独开发, 工作量为 MxN
+| 双方各自实现一次协议, 工作量为 M+N
+| 能力暴露
+| 往往需要把 agent 包装成 tool, 能力受限
+| 以 agent 原生形态直接对话, 支持多轮协商
+| 可发现性
+| 靠人工约定与文档
+| 通过 Agent Card 标准发现
+| 安全与异步
+| 各套实现不一致, 长期任务难处理
+| 统一鉴权, 原生支持流式与异步通知
+| 生态演进
+| 新增一个智能体需同步改造所有对接方
+| 接入 A2A 即可互联, 独立演进
+|===
+
+A2A 的价值与 HTTP, LSP 等标准如出一辙: **协议一旦被广泛采纳, 任意智能体之间即可即插即用**, 创新可在每个智能体内部独立发生.
+
+=== A2A 的核心架构
+
+A2A 采用简单的**客户端-服务端**模型, 核心是两个角色与一张"名片":
+
+* **A2A Client**: 请求的发起方, 承担用户请求的编排与拆解, 例如把"规划一次国际旅行"拆给航班, 酒店, 换汇等多个专业智能体.
+* **A2A Server**: 请求的接收方, 每个智能体暴露一个统一端点, 处理消息并把任务结果以 Artifact 形式返回.
+* **Agent Card**: Server 在固定地址(`/.well-known/agent-card.json`) 发布的 JSON 名片, 是 Client 发现与配置 Server 的**唯一入口**.
+
+规范层面, A2A 采用"**规范数据模型 + 抽象操作 + 协议绑定**"三层结构, 语义与传输解耦:
+
+* **Layer 1 - 数据模型**: 用 Protocol Buffers(`a2a.proto`) 定义 Task, Message, Part, Artifact, AgentCard 等规范对象, 是所有绑定的共同语言.
+* **Layer 2 - 抽象操作**: 定义 SendMessage, GetTask 等能力, 与具体协议无关.
+* **Layer 3 - 协议绑定**: 提供 JSON-RPC 2.0, gRPC, HTTP+JSON/REST 三种标准实现, 语义等价.
+
+[[a2a-architecture]]
+[plantuml, "A2A 核心架构", format=png]
+----
+@startuml
+actor 用户 as User
+rectangle "A2A Client(编排智能体)" {
+  (Agent Card 发现与解析) as Disc
+  (任务拆解与状态跟踪) as Track
+  (鉴权凭证管理) as Auth
+}
+rectangle "A2A Server(专业智能体)" {
+  (A2A 端点) as EP
+  (任务执行引擎) as Exec
+  (内部大模型与工具) as Inner
+}
+database "Agent Card" as Card
+
+User -> Track: 复杂请求(规划旅行)
+Track -> Disc: 读取名片, 发现可用智能体
+Disc --> Card: GET /.well-known/agent-card.json
+Card --> Disc: 能力/端点/鉴权要求
+Disc --> Auth: 按 securitySchemes 取凭证
+Auth -> EP: SendMessage(携带凭证)
+EP -> Exec: 创建 Task, 驱动内部执行
+Exec -> Inner: 调用自有大模型与工具
+EP --> Track: 返回 Task 或流式更新
+Track --> User: 汇总为完整结果
+@enduml
+----
+
+=== 核心概念与数据模型
+
+A2A 的对象模型围绕"任务"展开, 核心概念如下:
+
+Task(任务):: 一次工作的**有状态单元**, 由 Server 在收到消息时生成, 分配唯一 `id`. 它是 A2A 协作的基本单位.
+TaskState(任务状态):: 任务生命周期的枚举状态, 含 `TASK_STATE_SUBMITTED`, `WORKING` 等.
+Message(消息):: 客户端与服务端之间**一个回合的通信**, 携带 `role` 与若干 `parts`.
+Role(角色):: 消息发送方, 只有 `ROLE_USER`(客户端发往服务端) 与 `ROLE_AGENT`(服务端发往客户端) 两种.
+Part(片段):: 消息或产物内容的**最小单元**, 只能是 `text`(文本), `raw`(内嵌二进制, base64), `url`(文件引用) 或 `data`(结构化数据) 中的一种.
+Artifact(产物):: 任务**产出的结果**(文档, 图片, 结构化数据等), 由若干 `parts` 组成. 结果必须放进 Artifact, 而非塞进 Message, 以便区分"对话"与"输出".
+contextId(上下文标识):: 用于把多个相关 Task 与 Message 归入**同一会话**, 支撑多轮交互.
+
+一条典型消息的 JSON 形态(HTTP+JSON 绑定):
+
+[source,json]
+----
+{
+  "message": {
+    "messageId": "msg-uuid",
+    "role": "ROLE_USER",
+    "parts": [
+      { "text": "请帮我查询本周上海往返东京的航班" }
+    ]
+  }
+}
+----
+
+==== 任务状态机
+
+任务的生命周期由 TaskState 表达, 分为三类:
+
+* **进行中**: `TASK_STATE_SUBMITTED`(已受理), `TASK_STATE_WORKING`(处理中).
+* **中断**: `TASK_STATE_INPUT_REQUIRED`(需要用户补充输入), `TASK_STATE_AUTH_REQUIRED`(需要授权), 任务可在收到后续消息后继续.
+* **终态**: `TASK_STATE_COMPLETED`(成功), `TASK_STATE_FAILED`(失败), `TASK_STATE_CANCELED`(取消), `TASK_STATE_REJECTED`(拒绝). 进入终态后不可再接收消息.
+
+[plantuml, "Task 状态机", format=png]
+----
+@startuml
+[*] --> SUBMITTED
+SUBMITTED --> WORKING
+WORKING --> INPUT_REQUIRED: 需要补充信息
+INPUT_REQUIRED --> WORKING: 收到后续消息
+WORKING --> AUTH_REQUIRED: 需要授权
+AUTH_REQUIRED --> WORKING: 授权完成
+WORKING --> COMPLETED
+WORKING --> FAILED
+WORKING --> CANCELED
+WORKING --> REJECTED
+COMPLETED --> [*]
+FAILED --> [*]
+CANCELED --> [*]
+REJECTED --> [*]
+@enduml
+----
+
+==== 多轮交互
+
+任务执行中若需要更多输入, Server 把任务置为 `TASK_STATE_INPUT_REQUIRED`, 并在状态消息中说明需要什么. Client 携带相同的 `taskId`(与 `contextId`) 再次发送消息即可续接任务, 由此形成"你来我往"的多轮对话, 而不是"一次调用拿一个结果"的工具式交互.
+
+==== 内容协商与传输约定
+
+* JSON 字段一律 **camelCase**, 枚举值一律 **SCREAMING_SNAKE_CASE**(如 `ROLE_USER`, `TASK_STATE_WORKING`).
+* 时间戳使用 **ISO 8601 UTC** 格式, 如 `2025-10-28T10:30:00.000Z`.
+* 所有 ID 都是简单 UUID, 直接对应数据库主键.
+* 二进制内容经 base64 内嵌(`raw`) 或通过 URL 引用(`url`) 传递, 模态无关.
+
+=== Agent Card: 能力发现
+
+Agent Card 是 A2A 的发现机制, 相当于智能体对外展示的"名片", 声明四类信息:
+
+* **身份**: `name`, `description`, `provider`, `iconUrl`, `version`.
+* **端点**: `supportedInterfaces`, 按优先级排列的接口数组, 每项含 `url`, `protocolBinding`(JSONRPC, GRPC 或 HTTP+JSON) 与 `protocolVersion`; 首个接口为**首选**.
+* **能力**: `capabilities` 中的 `streaming`, `pushNotifications`, `extendedAgentCard`, 客户端据此决定可用功能; 还有 `defaultInputModes`, `defaultOutputModes`.
+* **技能**: `skills`, 描述智能体擅长做什么, 含 `id`, `description`, `tags`, `examples` 与各自的输入输出格式.
+* **安全**: `securitySchemes` 与 `securityRequirements`, 声明 API Key, HTTP Auth, OAuth 2.0, OpenID Connect, mTLS 等鉴权方案.
+
+[source,json]
+----
+{
+  "name": "Flight Booking Agent",
+  "description": "查询并预订航班, 支持多程与退改签",
+  "version": "1.2.0",
+  "supportedInterfaces": [
+    {
+      "url": "https://flight.example.com/a2a/v1",
+      "protocolBinding": "HTTP+JSON",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": true
+  },
+  "securitySchemes": {
+    "api": { "apiKeySecurityScheme": { "name": "Authorization", "location": "header" } }
+  },
+  "defaultInputModes": ["text/plain", "application/json"],
+  "defaultOutputModes": ["text/plain"],
+  "skills": [
+    {
+      "id": "flight-search",
+      "name": "航班搜索",
+      "description": "按航线与日期查询航班与价格",
+      "tags": ["flight", "travel"],
+      "examples": ["查询下周上海到东京的直飞航班"]
+    }
+  ]
+}
+----
+
+发现途径有三种:
+
+* **Well-Known URI**: 直接访问 `https://{server_domain}/.well-known/agent-card.json`, 这是标准化位置.
+* **注册目录**: 查询第三方维护的智能体目录.
+* **直接配置**: 把 Agent Card 的 URL 或内容预先配置给客户端.
+
+Agent Card 内容变化频率低, 但客户端可能频繁抓取, 因此服务端宜配合 `Cache-Control` 与 `ETag` 走标准 HTTP 缓存. 为防止名片被篡改, v1.0 还支持用 **JWS(RFC 7515)** 对名片签名(先按 RFC 8785 做 JSON 规范化, 签名时排除 `signatures` 字段), 客户端可校验至少一个签名后再信任.
+
+=== 核心操作
+
+A2A 的抽象操作不多, 可归纳为四组:
+
+* **消息**: `SendMessage`(发起或续接任务), `SendStreamingMessage`(流式版本).
+* **任务查询**: `GetTask`(取任务状态与产物), `ListTasks`(按条件分页列出), `CancelTask`(取消), `SubscribeToTask`(订阅任务更新流).
+* **推送配置**: `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig`.
+* **扩展名片**: `GetExtendedAgentCard`(鉴权后获取更详细的名片).
+
+三种标准绑定对同一组操作的命名与端点映射如下:
+
+[cols="1,2,2,3"]
+|===
+| 操作 | JSON-RPC | gRPC | HTTP+JSON/REST
+
+| 发送消息
+| `SendMessage`
+| `SendMessage`
+| `POST /message:send`
+| 流式发送
+| `SendStreamingMessage`
+| `SendStreamingMessage`
+| `POST /message:stream`
+| 查询任务
+| `GetTask`
+| `GetTask`
+| `GET /tasks/{id}`
+| 列出任务
+| `ListTasks`
+| `ListTasks`
+| `GET /tasks`
+| 取消任务
+| `CancelTask`
+| `CancelTask`
+| `POST /tasks/{id}:cancel`
+| 订阅任务
+| `SubscribeToTask`
+| `SubscribeToTask`
+| `POST /tasks/{id}:subscribe`
+|===
+
+==== 发送一条消息
+
+HTTP+JSON 绑定下的完整请求, 注意 `A2A-Version` 头用于版本协商:
+
+[source,json]
+----
+POST /message:send HTTP/1.1
+Host: flight.example.com
+Content-Type: application/a2a+json
+A2A-Version: 1.0
+Authorization: Bearer <token>
+
+{
+  "message": {
+    "messageId": "msg-001",
+    "role": "ROLE_USER",
+    "parts": [
+      { "text": "查询下周三从上海到东京的直飞航班" }
+    ]
+  },
+  "configuration": {
+    "acceptedOutputModes": ["application/json"]
+  }
+}
+----
+
+服务端可能返回两种结果之一: 简单场景直接返回 `message`; 需要跟踪进度时返回 `task`:
+
+[source,json]
+----
+HTTP/1.1 200 OK
+Content-Type: application/a2a+json
+
+{
+  "task": {
+    "id": "task-uuid",
+    "contextId": "context-uuid",
+    "status": {
+      "state": "TASK_STATE_SUBMITTED",
+      "timestamp": "2025-10-28T10:30:00.000Z"
+    }
+  }
+}
+----
+
+是否阻塞等待取决于 `SendMessageConfiguration.returnImmediately`:
+
+* **阻塞模式(默认)**: 一直等到任务进入终态或中断态(`INPUT_REQUIRED`, `AUTH_REQUIRED`) 才返回, 响应中带完整状态与产物.
+* **非阻塞模式**: 创建任务后立即返回, 调用方后续通过轮询, 流式或推送获取结果.
+
+=== 任务更新的三种机制
+
+Agent 协作常涉及耗时任务, A2A 提供三种获取更新的机制, 按实时性与实现成本取舍:
+
+* **轮询(Polling)**: 客户端周期性调用 `GetTask`. 实现最简单, 兼容所有绑定, 但延迟高, 有无效请求. 适合更新频率低或处在严格防火墙后的集成.
+* **流式(Streaming)**: 通过 `SendStreamingMessage` 或 `SubscribeToTask` 建立 SSE 长连接, 事件实时按序推送. 延迟低, 适合交互式界面与实时进度展示; 需 Server 在 Agent Card 中声明 `streaming: true`.
+* **推送(Push Notification)**: 客户端注册一个 webhook URL, 任务状态变化时由服务端主动 `HTTP POST` 到该地址. 客户端无需维持长连接, 适合服务端到服务端, 长期运行的任务; 需声明 `pushNotifications: true`.
+
+流式场景下, 每个推送事件都是 `StreamResponse` 包装对象, **只能包含四者之一**: `task`, `message`, `statusUpdate`(状态变更事件) 或 `artifactUpdate`(产物增量事件). 例如:
+
+[source,json]
+----
+data: {"statusUpdate": {"taskId": "task-uuid", "contextId": "ctx-uuid",
+       "status": {"state": "TASK_STATE_WORKING"}}}
+
+data: {"artifactUpdate": {"taskId": "task-uuid", "contextId": "ctx-uuid",
+       "artifact": {"artifactId": "a1", "parts": [{"text": "已为您找到 3 班直飞..."}]}}}
+
+data: {"statusUpdate": {"taskId": "task-uuid", "contextId": "ctx-uuid",
+       "status": {"state": "TASK_STATE_COMPLETED"}}}
+----
+
+流会在任务进入终态时自动关闭. 值得注意: 同一任务可被多个客户端**并发订阅**, 事件向所有活动流按相同顺序广播, 关闭其中一路不影响其他路.
+
+[cols="2,3,3,3"]
+|===
+| 机制 | 实时性 | 客户端要求 | 适用场景
+
+| 轮询
+| 低(受轮询间隔限制)
+| 可主动发起 HTTP 请求即可
+| 简单集成, 低频更新
+| 流式(SSE)
+| 高
+| 维持长连接
+| 交互式界面, 实时进度
+| 推送(Webhook)
+| 高
+| 提供公网可达的回调地址
+| Server-to-Server, 长任务
+|===
+
+=== 完整交互流程
+
+把以上概念串起来, 一次"跨智能体协作"的完整时序如下: Client 先读 Agent Card 完成发现, 按需鉴权, 再通过 `SendMessage` 派发任务; Server 收到后创建 Task, 边执行边推送状态与产物; 若需补充信息则进入 `INPUT_REQUIRED`, 由 Client 续发消息; 最终产出 Artifact 并以终态收尾.
+
+[plantuml, "A2A 一次协作的完整时序", format=png]
+----
+@startuml
+actor 用户 as User
+participant "A2A Client(编排智能体)" as C
+participant "Auth Server" as A
+participant "A2A Server(专业智能体)" as S
+
+User -> C: 规划一次国际旅行
+C -> S: 1. GET /.well-known/agent-card.json
+S --> C: 2. 返回 Agent Card
+C -> C: 3. 解析能力与端点
+C -> A: 4. 按 securitySchemes 换 token
+A --> C: 5. 返回凭证
+C -> S: 6. SendMessage(订航班, 带凭证)
+S --> C: 7. 返回 Task(SUBMITTED)
+C -> S: 8. SendStreamingMessage 续接该 Task
+S --> C: 9. statusUpdate(WORKING)
+S --> C: 10. artifactUpdate(候选航班)
+S --> C: 11. statusUpdate(COMPLETED)
+C -> User: 12. 汇总为完整行程
+@enduml
+----
+
+=== 与 MCP, ACP 的关系
+
+三份协议解决不同层级的连接问题, 定位互补而非竞争:
+
+* **MCP**: 连接"智能体与工具, 数据源", 工具通常无状态, 一次调用完成一件预定义的事.
+* **ACP**: 连接"客户端(编辑器等界面) 与智能体", 负责把智能体的流式过程, 权限请求等呈现给用户.
+* **A2A**: 连接"智能体与智能体", 让 agent 以原生形态互相委托, 协商与多轮交互.
+
+典型的协同方式: 编排智能体通过 **A2A** 把任务派给专业智能体, 专业智能体内部再用 **MCP** 调用底层工具与数据源, 整个过程由 **ACP** 面向用户呈现.
+
+[cols="2,4,4"]
+|===
+| 对比项 | MCP | A2A
+
+| 连接对象
+| 智能体到工具, 数据源
+| 智能体到智能体
+| 交互形态
+| 一次调用, 无状态
+| 多轮协商, 有状态任务
+| 角色
+| Client 调用 Server 的工具
+| Client 与 Server 互为对等协作方
+| 发现机制
+| 工具列表(listTools)
+| Agent Card 能力声明
+| 典型场景
+| 查数据库, 读文件, 调 API
+| 跨厂商智能体编排, 任务委托
+|===
+
+NOTE: 不要用"把 agent 封装成工具"的方式替代 A2A. 工具适合表达无状态的原子能力, 而 agent 之间需要澄清, 授权与分步返回, 这正是 A2A 的用武之地.
+
+=== 总结
+
+* A2A 是面向"智能体与智能体"的开放协议, 最新稳定版为 1.0.0, 旨在打破不同厂商, 不同框架智能体之间的孤岛.
+* 核心机制可概括为: **Agent Card 发现能力**, **Message/Task 承载协作**, **Artifact 交付结果**, 三者构成一次完整交互.
+* 任务是有状态, 有生命周期的对象, 通过 `SUBMITTED -> WORKING -> 终态` 的状态机流转, 支持 `INPUT_REQUIRED` 与 `AUTH_REQUIRED` 两种中断态实现多轮与人机协同.
+* 三种标准绑定(JSON-RPC, gRPC, HTTP+JSON) 共享同一数据模型与操作语义, 可按需选用; 生产环境务必启用 HTTPS 并遵循 Agent Card 声明的鉴权方案.
+* 长期任务可用轮询, 流式或推送三种机制获取更新, 流式与推送能力需先在 Agent Card 中声明.
+* 与 MCP(智能体-工具), ACP(客户端-智能体) 互补, 三者共同构成"工具, 智能体, 界面"全链路的互联标准.

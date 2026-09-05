@@ -1,0 +1,333 @@
+== 智能体客户端协议讲解
+
+MCP 解决了"大模型如何连接外部工具"的问题, 但在 AI 编码智能体与其承载界面(编辑器, IDE)之间, 仍隔着一层未被标准化的接口. 结果是每家编辑器都要为每个智能体单独开发集成, 每个智能体也要为不同编辑器分别适配. **智能体客户端协议(ACP, Agent Client Protocol)** 正是为统一这层"客户端到智能体"通信而生的开放协议, 目标是"连接任意编辑器到任意智能体".
+
+参考: <<大模型/大模型MCP原理讲解.adoc#, 大模型MCP原理讲解>>, <<大模型/大模型如何做到调用MCP的.adoc#, 大模型如何做到调用MCP的>>, <<大模型/大模型工作流原理讲解.adoc#, 大模型工作流原理讲解>>
+
+=== 什么是 ACP
+
+ACP(Agent Client Protocol, 智能体客户端协议):: 由 Zed 于 2025 年提出的**开放协议标准**, 定义了"智能体客户端(Agent Client)" 与"智能体服务端(Agent Server)" 之间的通信方式. 它借鉴 LSP 的思路, 把历史上"编辑器 x 编码智能体"的 M x N 点对点集成, 收敛为 M+N 的标准接口.
+
+ACP 与 MCP 一脉相承又互为补充:
+
+MCP(Model Context Protocol):: 统一**智能体如何连接外部工具与数据源**, 是"agent 到工具"的标准.
+ACP(Agent Client Protocol):: 统一**上层 UI 如何连接智能体**, 是"客户端到 agent"的标准.
+
+[plantuml, "MCP 与 ACP 的分工"]
+----
+@startuml
+rectangle "Agent Client(编辑器/IDE)" as Client
+rectangle "Agent Server(编码智能体)" as Agent
+rectangle "MCP Server(工具/数据源)" as MCP
+
+Client <--> Agent: ACP(JSON-RPC, 双向)
+Agent --> MCP: MCP
+Agent --> Agent: 内部驱动大模型, 编排工具调用
+@enduml
+----
+
+=== 为什么需要 ACP
+
+在 ACP 出现之前, 编辑器与编码智能体的耦合是双向碎片化的: 编辑器要对接多种智能体, 智能体也要适配多种编辑器. 这种模式带来四类问题:
+
+* **集成开销:** 每新增一对(编辑器, 智能体)组合, 都需一次自定义开发, 成本随数量呈平方增长.
+* **兼容性受限:** 智能体只能在少数已适配的编辑器上运行, 编辑器也只能接入有限的智能体.
+* **开发者锁定:** 选择某个智能体, 往往意味着同时接受其固定的一套界面与交互方式.
+* **能力重复:** 渲染 diff, 请求权限, 管理终端等通用能力, 在每套集成里被重复且不一致地实现.
+
+[cols="2,4,4"]
+|===
+| 对比维度 | 传统点对点集成 | 基于 ACP
+
+| 集成方式
+| 每对组合单独开发, 工作量为 MxN
+| 两端各自实现一次协议, 工作量为 M+N
+| 兼容范围
+| 智能体仅支持已适配的编辑器
+| 支持 ACP 的编辑器与智能体全互通
+| 演进节奏
+| 编辑器与智能体需同步排期
+| 两端可独立迭代, 互不阻塞
+| 功能一致性
+| 权限, diff, 终端等体验各不统一
+| 由协议统一描述, 界面体验一致
+|===
+
+ACP 的价值与 LSP 如出一辙: **标准一旦被广泛采纳, 生态每一方都只需面对一个接口, 创新可以在两端各自独立发生**.
+
+=== ACP 的核心架构
+
+ACP 采用经典的**客户端-服务端(Client-Server)** 架构, 包含两个角色与一个传输层:
+
+Agent Server:: 使用生成式 AI **自主修改代码**的程序(如 Copilot, Claude Code 等编码智能体). 它负责驱动大模型, 执行工具调用循环并维护会话状态, 通常以编辑器的**子进程**形式运行.
+Agent Client:: 为用户与智能体提供界面的程序, 通常就是**代码编辑器**. 它管理运行环境, 处理用户交互, 控制资源访问(文件系统, 终端)并裁决授权.
+Transport Layer:: 两端之间的通信通道. 本地智能体通过 **stdio**(标准输入输出) 通信, 远程智能体可通过 HTTP 或 WebSocket 通信.
+
+[[acp-architecture]]
+[plantuml, "ACP 核心架构", format=png]
+----
+@startuml
+actor 用户 as User
+rectangle "Agent Client(代码编辑器)" {
+  (界面渲染/流式展示) as UI
+  (会话管理) as Sess
+  (文件系统/终端/权限控制) as Res
+}
+rectangle "Agent Server(编码智能体)" {
+  (大模型编排) as LLM
+  (工具调用循环) as Loop
+  (会话状态) as State
+}
+
+User -> UI: 输入指令
+UI -> Sess: 转发 prompt
+Sess -> LLM: ACP: session/prompt
+LLM --> UI: ACP: session/update(流式推送)
+Loop -> Res: ACP: session/request_permission(请求授权)
+Res --> Loop: 权限响应
+Loop --> UI: 工具执行结果回传
+UI --> User: 渲染结果与 diff
+@enduml
+----
+
+一个值得强调的架构事实: **一条 ACP 连接可以承载多个并发会话(session)**. 编辑器可在同一智能体进程上同时开启多条"思维链", 互不干扰, 避免为每个会话重复启动进程.
+
+==== 设计原则
+
+ACP 的设计遵循三条原则:
+
+* **MCP-friendly:** 底层复用 JSON-RPC 与 MCP 的数据表示, 集成方无需为常见数据类型再造一套格式.
+* **UX-first:** 专为解决与 AI 智能体交互的界面体验问题设计, 足以清晰表达智能体的意图, 又不过度抽象. 例如默认以 **Markdown** 作为可读文本格式, 既能表达富文本, 又无需编辑器具备 HTML 渲染能力.
+* **Trusted:** ACP 假设用户在受信任的编辑器里与可信模型协作. 编辑器把本地文件与 MCP Server 交给智能体, 但通过权限请求保留对工具调用的最终控制.
+
+=== 消息模型与传输
+
+ACP 遵循 **JSON-RPC 2.0** 规范, 消息分两类:
+
+Method(方法):: **请求-响应**对, 调用方期待返回 result 或 error. 例如 `session/prompt`.
+Notification(通知):: **单向**消息, 不期待任何响应. 例如 `session/update`.
+
+ACP 大量使用通知实现**流式更新**, 让智能体的中间过程实时推送到界面; 同时利用 JSON-RPC 的**双向请求**, 允许智能体反向调用编辑器能力(如请求权限, 读写文件).
+
+发起一次会话请求:
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "session/prompt",
+  "params": {
+    "sessionId": "sess_01H",
+    "prompt": {
+      "message": {
+        "id": "msg_100",
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "请修复 src/app.js 中的空指针问题" }
+        ]
+      }
+    }
+  }
+}
+----
+
+服务端边执行边推送的流式更新通知:
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+    "sessionId": "sess_01H",
+    "update": {
+      "type": "agent_message_chunk",
+      "messageId": "msg_101",
+      "content": [
+        { "type": "text", "text": "我先定位异常发生的位置..." }
+      ]
+    }
+  }
+}
+----
+
+服务端向客户端请求用户授权:
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "session/request_permission",
+  "params": {
+    "sessionId": "sess_01H",
+    "permissionRequest": {
+      "id": "perm_001",
+      "kind": "request_tool_call_permission",
+      "toolCall": {
+        "id": "call_001",
+        "toolName": "bash",
+        "input": { "command": "npm test" }
+      }
+    }
+  }
+}
+----
+
+客户端返回授权结果:
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "permissionResponse": {
+      "kind": "allow"
+    }
+  }
+}
+----
+
+协议还约定若干通用规则:
+
+* 所有文件路径**必须为绝对路径**, 行号从 1 开始.
+* 对象属性键使用 `camelCase`, 判别字段的字符串值使用 `snake_case`.
+* 错误遵循 JSON-RPC 2.0 标准, 含 `code` 与 `message`.
+
+=== 核心方法
+
+ACP 把方法按"由谁提供, 供对方调用"划分. 服务端提供的方法供客户端调用:
+
+[cols="1,3"]
+|===
+| 方法 | 说明
+
+| `initialize`
+| 协商协议版本, 交换双方 capabilities
+| `authenticate`
+| 在服务端要求时完成认证(可选)
+| `session/new`
+| 新建会话
+| `session/load`
+| 恢复历史会话(需 `loadSession` 能力)
+| `session/prompt`
+| 提交用户消息, 开始一轮对话
+| `session/set_mode`
+| 切换智能体的运行模式(可选)
+| `logout`
+| 结束当前已认证状态(可选)
+
+|===
+
+客户端提供的方法供服务端反向调用:
+
+[cols="1,3"]
+|===
+| 方法 | 说明
+
+| `session/request_permission`
+| 请求用户授权某次工具调用(基线方法)
+| `fs/read_text_file`
+| 通过编辑器读取文本文件(可选)
+| `fs/write_text_file`
+| 通过编辑器写入文本文件(可选)
+| `terminal/create`, `terminal/output`
+| 在编辑器侧创建终端并获取输出(可选)
+| `terminal/release`, `terminal/kill`
+| 释放或强制结束终端命令(可选)
+| `elicitation/create`
+| 向用户请求结构化信息(可选)
+
+|===
+
+关键的**通知**方法:
+
+* `session/update`(服务端到客户端): 推送会话变更, 包括消息分片(agent, user, thought), 工具调用及更新, 执行计划, 可用命令等.
+* `session/cancel`(客户端到服务端): 中断正在进行的操作, 无需响应.
+* `elicitation/complete`(客户端到服务端): 上报一次带外 URL 交互已完成.
+
+NOTE: 客户端侧的 `fs/*` 与 `terminal/*` 方法体现了 ACP 的**职责边界**设计. 智能体不直接操作系统资源, 而是请求编辑器代为读写文件, 执行终端命令, 这样权限校验, 安全边界与 UI 反馈都收口在编辑器一侧.
+
+=== 工作流程: 一次完整的 Prompt Turn
+
+一次典型交互可按如下步骤展开:
+
+. **初始化:** 客户端启动智能体子进程, 发送 `initialize`, 协商 `protocolVersion` 并交换双方 capabilities.
+. **认证(可选):** 若服务端要求, 双方走 `authenticate` 流程完成登录.
+. **建立会话:** 用 `session/new` 新建会话, 或对已支持的场景用 `session/load` 恢复历史会话.
+. **发起对话:** 客户端以 `session/prompt` 提交用户消息, 可一并携带编辑器已配置的 MCP Server 清单, 让智能体直接连接这些工具.
+. **流式执行:** 服务端通过 `session/update` 通知持续推送思考与输出; 需要执行有副作用的工具时, 通过 `session/request_permission` 请求用户授权.
+. **收尾与渲染:** 服务端返回带 `stopReason` 的 `session/prompt` 响应, 客户端汇总工具结果并渲染最终 diff 与回复; 用户可随时以 `session/cancel` 中断.
+
+[[acp-prompt-turn]]
+[plantuml, "一次 Prompt Turn 的完整时序", format=png]
+----
+@startuml
+participant 用户 as User
+participant "Agent Client(编辑器)" as Client
+participant "Agent Server(智能体)" as Agent
+
+User -> Client: 输入指令
+Client -> Agent: session/prompt(携带 MCP 配置)
+Agent --> Client: session/update(agent_message_chunk 流式输出)
+Agent --> Client: session/update(tool_call 开始执行)
+Agent -> Client: session/request_permission(请求运行命令)
+Client -> User: 弹出授权确认
+User --> Client: 允许
+Client --> Agent: permission 响应 allow
+Agent --> Client: session/update(tool_call_update 返回结果)
+Agent --> Client: session/update(最终消息)
+Agent --> Client: session/prompt 响应(stopReason)
+Client -> User: 渲染 diff 与结果
+@enduml
+----
+
+=== ACP 与 MCP, LSP 的定位关系
+
+三者处于协议栈的不同层次, 常被混淆, 需厘清边界:
+
+[cols="2,5,5,5"]
+|===
+| 对比项 | LSP | MCP | ACP
+
+| 核心问题
+| 语言服务器接入编辑器
+| 智能体接入工具/数据源
+| 智能体接入客户端 UI
+| 通信双方
+| 编辑器 <--> 语言服务器
+| 智能体 <--> 工具
+| 编辑器 <--> 编码智能体
+| 复用关系
+| ACP 的"参考范式"
+| ACP 复用的数据与传输基础
+| 可承载 MCP-over-ACP
+|===
+
+三者的实际关系可概括为: **LSP 启发了 ACP 的标准化思路, MCP 提供了数据表示与传输基础, ACP 则在其上定义了面向编码智能体的 UX 语义**. 具体到运行链路, 当智能体需要工具时, 通常由编辑器把 MCP Server 配置转交智能体, 智能体再通过 MCP 直连工具, 形成"编辑器 -ACP-> 智能体 -MCP-> 工具"的完整链条.
+
+=== 生态与进展
+
+ACP 自发布后生态迅速扩张:
+
+* **官方 SDK:** 提供 Rust, TypeScript, Python, Java, Kotlin 五种语言的官方实现.
+* **ACP Registry:** 官方维护的智能体与客户端目录, 用于发现和安装 ACP 兼容组件.
+* **版本节奏:** 当前稳定协议版本为 **v1**, 以 `initialize` 阶段协商的 `protocolVersion` 判定线上兼容性; v2 已发布草案, 引入新的 prompt 生命周期等能力.
+* **开源治理:** 采用 Apache-2.0 许可, 以工作小组与兴趣小组(如 Transports Working Group) 协作演进.
+
+[WARNING]
+====
+ACP 对**远程智能体**(云托管或独立基础设施, 经 HTTP/WebSocket 通信) 的支持仍在完善中. 本地 stdio 场景已是稳定主线, 远程部署场景建议关注协议更新后再落地.
+====
+
+=== 总结
+
+ACP 用一个开放协议, 把"编辑器与编码智能体"从 NxM 的私有集成中解放出来, 与 MCP 各司其职: **MCP 管智能体怎么用工具, ACP 管客户端怎么连智能体**.
+
+* **角色分明:** 智能体专注推理与执行, 编辑器负责界面, 资源与授权.
+* **流式体验:** 以通知机制驱动实时渲染, 兼顾权限控制与双向交互.
+* **生态互通:** 一套 SDK 接入, 编辑器与智能体即可跨厂商自由组合.
+
+在智能体工具链不断标准化的今天, ACP 是继 LSP 与 MCP 之后, 打通"编辑器 - 智能体"最后一公里的关键一环.

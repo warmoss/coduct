@@ -1,3 +1,5 @@
+include::GraalVM原理讲解.adoc[]
+
 include::Java内存模型讲解.adoc[]
 
 include::volatile关键字讲解.adoc[]

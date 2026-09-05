@@ -1,0 +1,347 @@
+== frp原理讲解
+
+家庭或企业内部的大量设备位于 NAT 与防火墙之后, 只拥有私网地址, 公网无法主动访问. 若想从办公室 SSH 到家里的 NAS, 或把本地开发的 Webhook 回调暴露给第三方, 传统做法是配置路由器端口映射, 但这要求拥有公网 IP 且能控制路由器; 在小区宽带, 公司出口防火墙等场景中, 该前提往往不成立. **frp** 用"反向连接"的思路绕开限制: 让内网设备主动外连一台有公网地址的服务器, 由该服务器代为承接公网流量并转回内网, 从而把任意内网服务"搬"到公网. 本文以当前最新稳定版 v0.71.0 为例, 讲解其架构, 数据通路, 代理类型与 NAT 打洞原理.
+
+参考: <<操作系统/NAT原理讲解.adoc#, NAT原理讲解>>, <<操作系统/socket状态讲解.adoc#, socket状态讲解>>
+
+=== frp 是什么? 为什么需要它?
+
+**frp (Fast Reverse Proxy)**:: 一个用 Go 编写的开源内网穿透与反向代理工具, 由 fatedier 维护. 通过一台有公网地址的中转服务器, 把 NAT 之后的内网服务安全地暴露到公网, 支持 TCP, UDP, HTTP, HTTPS 等多种协议.
+**内网穿透**:: 泛指让公网能够访问处于内网 (NAT 之后) 的设备或服务的技术手段.
+**frps**:: frp 的**服务端**程序, 运行在具有公网 IP 的服务器上, 负责监听公网端口并协调转发.
+**frpc**:: frp 的**客户端**程序, 运行在内网机器上, 主动向 frps 发起连接并注册要暴露的本地服务.
+**隧道 (Tunnel)**:: frpc 与 frps 之间建立的持续通道, 外部流量经由此通道进出内网.
+
+为什么需要 frp 这类工具, 根源在于 NAT 的**单向性**:
+
+* NAT 允许内网设备主动向外发起连接, 返回流量可沿既有映射表项进入, 但公网无法主动向私网地址发起连接, 因为没有可达路由
+* 端口映射虽然能把公网端口"钉"到内网, 却依赖公网 IP 和路由器的控制权, 且每暴露一个端口就要修改一次设备
+* frp 让 frpc 主动外连 frps, 在公网上"占住"一条通道, 把"等待入站连接"变成"维护出站连接", 从而不再需要任何入站放行
+
+NOTE: NAT 的建立与映射规则是理解 frp 的前提, 相关机制参见 NAT 原理讲解.
+
+=== 整体架构
+
+frp 由三个角色组成: 公网上的 frps, 内网里的 frpc, 以及一个或多个本地服务.
+
+[plantuml,"frp 整体架构",format=png]
+----
+@startuml
+actor "外网用户" as User
+
+package "公网" {
+  node "公网服务器 (有公网 IP)" as ServerNode {
+    component "frps" as Server
+  }
+}
+
+package "内网 (NAT / 防火墙之后)" {
+  node "内网主机" as InnerNode {
+    component "frpc" as Client
+    component "本地服务 (SSH / Web / DB)" as Local
+  }
+}
+
+User --> Server : 访问 frps 上的公网端口
+Server <--> Client : frpc 主动外连建立的隧道\n(控制连接 + 工作连接)
+Client --> Local : 转发到本地服务
+@enduml
+----
+
+各角色职责:
+
+* **frps:** 对外提供监听端口, 认证与注册 frpc, 承接公网入站流量并转发给对应 frpc
+* **frpc:** 启动即外连 frps, 注册代理描述 (本地服务地址, 类型, 期望的远端端口), 并承接隧道流量
+* **本地服务:** 被暴露的目标, frp 对它是透明的, 服务本身无任何改动
+
+=== 核心原理: 控制连接与工作连接
+
+frp 隧道按职责拆成两类连接, 这是理解其数据通路的关键:
+
+控制连接 (Control Connection):: frpc 与 frps 之间的**长连接**, 用于登录认证, 注册/更新代理, 心跳保活, 以及传递"有用户连入"等控制指令. 每条 frpc 只维护一条.
+工作连接 (Work Connection):: 真正**承载业务数据**的连接 (流). 当外部用户访问某代理时建立, 数据经它在 frps 与 frpc 间双向流动.
+
+一次 TCP 代理的完整数据通路:
+
+[plantuml,"TCP 代理中继流程",format=png]
+----
+@startuml
+actor "外网用户" as User
+participant "frps (公网)" as Server
+participant "frpc (内网)" as Client
+participant "本地服务" as Local
+
+Client -> Server : [1] 建立控制连接并登录 (携带 token)
+Server --> Client : 登录成功
+Client -> Server : [2] 注册代理 ssh: tcp, remote_port=6000 -> 127.0.0.1:22
+Server --> Client : 注册成功, frps 开始监听 :6000
+
+User -> Server : [3] 连接 frps:6000
+Server --> Client : [4] 经控制连接通知: 新建工作连接
+Client -> Server : [5] 建立工作连接 (声明归属代理 ssh)
+Client -> Local : [6] 连接本地 127.0.0.1:22
+Server --> User : 关联完成, 进入转发
+User <-> Server : 双向数据
+Server <-> Client : 双向数据 (工作连接)
+Client <-> Local : 双向数据
+@enduml
+----
+
+流程要点:
+
+. **登录与注册:** frpc 启动后主动连接 frps 并完成 token 认证, 随后把每个代理的元信息 (名称, 类型, 本地地址, 远端端口) 上报
+. **监听公网端口:** frps 根据注册信息在本机监听对应 remotePort, 成为公网入口
+. **触发转发:** 外部用户连入该端口后, frps 不会直接把用户连接数据塞进控制连接, 而是经控制连接通知 frpc 再开一条工作连接, 再让 frpc 去连本地服务
+. **桥接拷贝:** frps 把"用户连接"与"工作连接"配对, 双向拷贝字节流; frpc 同样把工作连接与本地连接配对
+
+几个对性能与可靠性至关重要的机制:
+
+* **TCP 多路复用:** transport.tcpMux 默认开启, 多条工作连接不再各自占用一条 TCP, 而是复用同一条底层连接上的独立流, 显著减少握手开销与连接数
+* **连接池:** transport.poolCount 可让 frpc 预先建立若干空闲工作连接, 用户连入时免去"通知 frpc 再拨号"的往返延迟, 提升首包时延表现
+* **心跳保活:** frpc 默认约每 10 秒发送一次心跳, frps 在 transport.heartbeatTimeout (默认 90 秒) 内未收到则判定该客户端离线并清理其代理
+* **断线重连:** 控制连接意外断开后, frpc 按退避策略自动重连, 成功后重新注册全部代理, 对本地服务无感知
+* **远端端口分配:** remotePort 固定时由 frps 监听该端口; 设为 0 则 frps 随机分配并在注册响应中返回
+
+=== 代理类型
+
+frp 通过"代理类型"决定数据面的行为, 常见类型如下:
+
+[cols="1,2,2,3"]
+|===
+| 类型 | 公网入口 | 数据路径 | 典型场景
+
+| tcp
+| frps 监听 remotePort
+| 经 frps 中继
+| 转发任意 TCP 服务, 如 SSH, RDP, 数据库
+
+| udp
+| frps 监听 remotePort (UDP)
+| 经 frps 中继
+| 自定义 UDP 服务, 游戏联机
+
+| http
+| frps 的 vhostHTTPPort 按域名路由
+| 经 frps 中继
+| 用一个公网端口暴露多个内网 Web 站点
+
+| https
+| frps 的 vhostHTTPSPort 按域名路由
+| 经 frps 中继
+| 需要 TLS 的 Web 服务
+
+| stcp
+| 不开放公网端口, 由访问方 frpc 接入
+| 经 frps 中继, secretKey 鉴权
+| 只允许特定访问者的安全服务
+
+| xtcp
+| 不开放公网端口, 由访问方 frpc 接入
+| NAT 打洞后 frpc 之间直连
+| 大流量, 低延迟的服务直连
+|===
+
+其余类型如 sudp (UDP 版加密代理), tcpmux (单端口复用/HTTP CONNECT) 等可查阅官方文档.
+
+==== HTTP(S) 域名路由
+
+http/https 类型需要 frps 开启 vhost 端口, 由 frps 依据请求的 Host 域名把流量路由到对应代理, 一个公网端口即可托管多个站点:
+
+[source,toml]
+----
+# frps.toml 中开启 vhost 与泛域名
+vhostHTTPPort = 80
+subDomainHost = "frp.example.com"
+
+# frpc.toml 中把本机 Web 以二级域名暴露
+[[proxies]]
+name = "blog"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 8080
+subdomain = "blog"            # 访问 http://blog.frp.example.com
+httpUser = "admin"            # 可选: Basic Auth 保护
+httpPassword = "secret"
+----
+
+* **customDomains:** 用自定义域名列表精确匹配 Host, 域名需解析到 frps
+* **subdomain:** 与服务端 subDomainHost 拼接, 自动生成二级域名, 适合批量开站点
+* **httpUser/httpPassword:** 为站点追加 Basic Auth, 避免未授权访问
+
+==== stcp: 不暴露公网端口的加密代理
+
+stcp (Secret TCP) 不占用 frps 的任何公网端口, 访问方也必须运行一个 frpc 才能接入. 两端共享 secretKey, frps 据此鉴权, 只有持有相同密钥的访问者能建立隧道, 因此**攻击面被压缩到最小**:
+
+* 提供方在 frpc 里声明一个 type=stcp 的代理, 只写 localIP/localPort 与 secretKey, 不写 remotePort
+* 访问方在另一个 frpc 里配置 type=stcp 的 visitor, 指向目标 serverName, 并在本机 bindAddr/bindPort 上监听
+* 访问方访问**本机**的 bindPort 即进入隧道, 数据仍经 frps 中继
+
+==== xtcp: 点对点打洞
+
+xtcp 的目标是让两端 frpc **绕过 frps 直连**, 消除中继带来的带宽与延迟瓶颈, 详见下节.
+
+=== P2P 直连: xtcp 打洞原理
+
+中继模式下所有流量都经过 frps, 公网服务器带宽成为上限. xtcp 让 frps 只做**信令协调**, 尽量在内网双方之间建立点对点隧道.
+
+打洞思路建立在 NAT 的行为特点上: 内网设备对外发包会在 NAT 上建立映射; 若双方几乎同时向对方的公网端点发包, 各自 NAT 便会在"收到对方入站包之前"已经因出站探测建立了表项, 从而放行对端流量. 具体过程:
+
+. 访问方 frpc (visitor) 向 frps 请求访问提供方的 xtcp 代理
+. frps 作为信令服务器, 向双方交换彼此观测到的公网端点 (frps 可从既有连接直接观测, 也可借助 STUN 服务器)
+. 双方几乎同时向对方的公网 ip:port 发送探测包, 各自 NAT 建立或复用映射
+. 当双向映射都成立时, 点对点隧道建立, 业务数据不再经过 frps
+
+[plantuml,"xtcp NAT 打洞流程",format=png]
+----
+@startuml
+actor "访问方 frpc (visitor)" as V
+participant "frps (信令)" as Server
+actor "提供方 frpc" as P
+
+V -> Server : [1] 请求访问 xtcp 代理
+Server -> P : [2] 转发访问请求
+P --> Server : [3] 同意
+Server --> V : [4] 返回提供方公网端点
+Server --> P : [5] 转发访问方公网端点
+P -> V : [6] 双方同时向对方公网端点发包 (打洞)
+V -> P : [6] 双方同时向对方公网端点发包 (打洞)
+... 各自 NAT 建立双向映射 ...
+note over V, P : 打洞成功, 建立点对点隧道
+V <-> P : 数据直连, 不再经过 frps
+@enduml
+----
+
+注意事项:
+
+* **成功率受限:** 打洞结果取决于两端 NAT 的行为. 若 NAT 对同一内网端口映射到不同公网端口, 或严格限制入站, 打洞会失败; 这类环境建议退回到 stcp 或 tcp 中继
+* **回退保障:** v0.71 支持为 xtcp visitor 配置 fallbackTo 指向一个 stcp visitor, 打洞失败时自动回退到中继模式, 保证连接可用
+* **访问控制:** xtcp 提供方同样可配置 secretKey 与 allowUsers 限制可接入的访问者
+
+=== 传输与安全
+
+frpc 与 frps 之间的传输层可独立于代理类型配置, 以适配不同网络环境:
+
+* **传输协议:** transport.protocol 支持 tcp (默认), kcp, quic 与 websocket/wss. 当出站 TCP 被防火墙干扰时可改用基于 UDP 的 kcp/quic, 两端配置必须一致
+* **TCP 多路复用:** transport.tcpMux 默认开启, 减少连接数量与握手开销
+* **TLS 加密:** 自 v0.50.0 起 frpc 默认以 TLS 连接 frps; 服务端可用 transport.tls.force 强制只接受 TLS, 并可通过 certFile/keyFile 使用自有证书
+* **共享密钥认证:** auth.token 是默认认证方式, frpc 与 frps 需配置相同 token; 要求更高的部署可改用 OIDC
+* **端口白名单:** 服务端 allowPorts 可限定 frpc 能申请的 remotePort 范围, 防止客户端随意占用端口
+* **按代理加密/压缩:** 单个代理可开启 transport.useEncryption 与 transport.useCompression, 但会牺牲一定性能
+* **可观测性:** frps 提供 Web 面板 (webServer.port, 默认 7500), frpc 提供管理 API (默认 7400), 并支持 Prometheus 指标
+
+WARNING: token 属于弱共享凭证, 一旦泄露任何人即可冒充客户端注册代理. 长期运行应使用高熵 token 并开启 TLS; 不要把 frps 面板的默认账号 (admin/admin) 暴露到公网.
+
+=== 快速上手 (以 v0.71.0 为例)
+
+. 从 GitHub Releases 下载对应平台压缩包, 解压得到 frps 与 frpc 两个可执行文件
+. 在公网服务器上编写 frps.toml 并启动 frps
+. 在内网机器上编写 frpc.toml 并启动 frpc
+. 从任意公网机器验证隧道
+
+公网服务器 frps.toml:
+
+[source,toml]
+----
+bindAddr = "0.0.0.0"
+bindPort = 7000                        # <1>
+
+auth.method = "token"
+auth.token = "your-strong-token"       # <2>
+
+# 对外提供 http 域名访问时开启, 端口可能需 root 权限
+# vhostHTTPPort = 80
+
+webServer.addr = "127.0.0.1"           # <3>
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "admin"
+----
+<1> frpc 连接 frps 所用的端口
+<2> 客户端需提供相同 token 才能注册
+<3> 服务端管理面板, 建议仅绑定回环地址
+
+内网机器 frpc.toml:
+
+[source,toml]
+----
+serverAddr = "frp.example.com"         # <1>
+serverPort = 7000
+
+auth.method = "token"
+auth.token = "your-strong-token"
+
+transport.heartbeatInterval = 10       # <2>
+transport.heartbeatTimeout = 90
+transport.poolCount = 5                # <3>
+
+[[proxies]]
+name = "ssh"                           # <4>
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+----
+<1> frps 的公网地址或域名
+<2> 心跳间隔与超时, 默认即为该值
+<3> 预建工作连接数, 降低首包延迟
+<4> 把本机 22 端口映射到 frps 的 6000 端口
+
+启动与验证:
+
+[source,shell]
+----
+# 公网服务器
+./frps -c ./frps.toml
+
+# 内网机器
+./frpc -c ./frpc.toml
+
+# 任意公网机器直接 SSH 到内网主机
+ssh -oPort=6000 user@frp.example.com
+----
+
+TIP: Windows 下可注册为服务或用系统计划任务守护, 保证 frpc 常驻与开机自启; frp 自身也会在控制连接断开后自动重连.
+
+=== 与同类方案对比
+
+[cols="1,3,3,3"]
+|===
+| 维度 | frp (自建) | ngrok / Cloudflare Tunnel (托管) | Tailscale (组网)
+
+| 前置条件
+| 需要一台自有公网服务器
+| 无需公网 IP, 域名即可
+| 无需公网 IP
+
+| 数据路径
+| 自控服务器中继或 P2P
+| 经第三方节点
+| P2P + 中继兜底
+
+| 暴露粒度
+| 端口 / 域名级
+| 端口 / 域名级
+| 全网互通 (类内网)
+
+| 适用场景
+| 长期可控, 批量暴露
+| 快速临时演示
+| 多设备组建私有网络
+|===
+
+=== 典型使用场景
+
+* **远程运维:** 从公网 SSH/RDP 到家中或办公室内网机器, 免改路由器
+* **本地联调:** 把微信/支付宝支付回调, OAuth 回调, Webhook 打到本机开发环境
+* **临时演示:** 把内网站点或 API 临时暴露给客户或第三方验证
+* **批量暴露:** 多台内网机器共用一台 frps, 各自注册不同代理; 多个 frpc 注册同名代理并配合 loadBalancer.group 实现服务端负载均衡
+* **边缘设备管理:** 云端统一管理位于客户内网的设备或工控系统
+
+=== 总结与注意事项
+
+frp 本质上是把"等待公网入站"转换为"维护内网出站连接": 控制连接负责信令与注册, 工作连接承载数据, 配合 tcpMux 与连接池优化性能; xtcp 更进一步让 frps 只做信令, 通过 NAT 打洞实现点对点直连. 使用中的常见误区与建议:
+
+* **暴露即攻击面:** 把内网服务搬到公网等于开放入口, 只暴露必要端口, 配合强 token, TLS 与 Basic Auth
+* **优先 stcp/xtcp:** 不希望开放公网端口时, 用 stcp/xtcp 让访问也必须经 frpc, 能显著收敛风险
+* **版本对齐:** frpc 与 frps 大版本应尽量一致; 自 v0.52.0 起配置支持 TOML/YAML/JSON, 旧版 INI 已弃用, 新特性仅在 TOML/YAML/JSON 中提供
+* **版本升级:** frp 演进较快, 生产环境升级前先阅读对应版本 Release Notes, 关注配置项与默认值变化

@@ -1,3 +1,5 @@
+include::阿里云MySQL字段加密原理讲解.adoc[]
+
 include::MySQL数据存储原理讲解.adoc[]
 
 include::MySQL Gap Lock 原理讲解.adoc[]

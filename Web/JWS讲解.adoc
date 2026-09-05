@@ -1,0 +1,290 @@
+== JWS讲解
+
+在各类网络应用中, 把一段数据附上签名再做传输是最常见的安全组合: 登录令牌, 授权回调, Webhook 通知, 甚至智能体之间的名片, 都需要保证数据未被篡改且确实来自可信方. 若每家系统都自造一套私有格式, 则算法标识, 签名对象, 编码细节各说各话, 跨系统对接成本极高. **JWS (JSON Web Signature)** 正是 RFC 7515 为统一解决该问题而定义的**签名数据表示规范**, 它把**受保护数据 + 签名/MAC**编码为紧凑且 URL 安全的文本, 是 JWT 访问令牌, OIDC 身份令牌以及各类请求签名方案的底层载体.
+
+参考: <<安全算法/hmac讲解.adoc#, HMAC讲解>>, <<安全算法/rsa原理讲解.adoc#, RSA原理讲解>>, <<业务/OAuth2.1原理讲解.adoc#, OAuth2.1原理讲解>>, <<业务/OpenID原理讲解.adoc#, OpenID原理讲解>>
+
+=== 什么是 JWS
+
+JWS 属于 **JOSE (JSON Object Signing and Encryption)** 标准家族, 与加密格式 JWE, 密钥格式 JWK 及算法注册表 JWA 共同构成一套完整方案:
+
+JWS (JSON Web Signature):: RFC 7515 定义的一种**签名数据表示格式**, 将一段受保护的数据与对该数据的签名或 MAC 编码为 URL 安全的文本. 此处的签名是广义的, 既包括 RSA, ECDSA, EdDSA 等非对称签名, 也包括 HMAC 等对称消息认证码.
+
+JWE (JSON Web Encryption):: 与 JWS 对应的**加密表示格式**, 保证内容的机密性(不可读), 而 JWS 只保证完整性与来源, 不隐藏内容.
+
+JWK (JSON Web Key):: RFC 7517, 以 JSON 描述密钥(公钥, 私钥或对称密钥). 验签方通常通过 **JWKS (JWK Set)** 端点获取一组公钥.
+
+JWA (JSON Web Algorithms):: RFC 7518, JOSE 的**算法注册表**, 为各签名与加密算法统一定义 `alg` 名称(如 `HS256`, `RS256`, `ES256`).
+
+JWT (JSON Web Token):: RFC 7519, 建立在 JWS/JWE 之上的**令牌封装层**, 规定 Payload 必须是一组 JSON Claims, 并预定义 `iss`, `sub`, `aud`, `exp` 等标准字段.
+
+理解四者关系的一条主线: **JWS/JWE 是通用的数据安全载体, JWT 只是其上一个使用约定**. 从结构上看, 一个紧凑序列化的 JWT 与 JWS 完全相同, 都是 `Header.Payload.Signature` 三段, 差别仅在于 JWT 额外约定 Payload 为 Claims. 因此本文介绍的机制对 JWT 完全适用.
+
+[plantuml, "JOSE 标准家族关系", format=png]
+----
+@startuml
+package "JOSE 家族" {
+  [JWS\n签名/完整性] as JWS
+  [JWE\n加密/机密性] as JWE
+  [JWK\n密钥表示] as JWK
+  [JWA\n算法注册表] as JWA
+  [JWT\n访问/身份令牌] as JWT
+}
+JWS --> JWA : 使用算法
+JWE --> JWA : 使用算法
+JWS --> JWK : 使用密钥
+JWE --> JWK : 使用密钥
+JWT --> JWS : 基于
+JWT --> JWE : 基于
+@enduml
+----
+
+=== JWS 解决什么问题
+
+在缺少统一标准时, 自行拼接数据与签名的私有方案普遍存在以下问题:
+
+* **互操作差:** 算法名, 签名对象, 编码方式各成体系, 对接方必须逐个对齐私有约定
+* **验签信息缺失:** 验签方无法从数据本身得知该用哪个算法, 哪把密钥
+* **签名对象含糊:** 到底签了哪几段字节没有标准答案, 极易漏签, 多签或错签
+* **编码不友好:** 标准 Base64 含 `+`, `/`, `=` 等字符, 不能直接放入 URL 或 HTTP Header
+
+JWS 通过统一规范一次性解决这些痛点:
+
+* **三段式序列化:** 输出固定为 `Header.Payload.Signature` 三段 Base64URL, 语义唯一
+* **自描述头部:** Header 用 `alg` 声明算法, 用 `kid` 等字段提示密钥, 使验签可以自动化
+* **精确的签名输入:** 签名对象被精确定义为两段编码的连接, 不存在二义
+* **URL 安全字符集:** 编码只含 `[A-Za-z0-9_-]`, 可安全置于 URL, Cookie 与各类文本协议
+
+按密码学性质, JWS 支持的机制分为两类:
+
+对称认证 (HMAC):: 签发与验签共用同一把**共享密钥**, 只能证明消息来自持有该密钥的一方, 无法向无关第三方提供不可否认性. 代表算法为 `HS256`.
+非对称签名 (RSA/ECDSA/EdDSA):: **私钥签名, 公钥验签**, 公钥可公开分发. 因此既能验证来源, 也能向第三方证明消息确由私钥持有者签发. 代表算法为 `RS256`, `ES256`, `EdDSA`.
+
+NOTE: JWS 只提供完整性与来源认证, **不提供机密性**. Payload 是明文可读的, 需要保密时应改用 JWE 或先用其它手段加密内容.
+
+=== 核心原理: 紧凑序列化
+
+[[jws-compact]]
+JWS 默认使用**紧凑序列化 (Compact Serialization)**, 输出为三段由句点 `.` 分隔的 Base64URL 文本:
+
+[source, plaintext, linenums]
+----
+BASE64URL(UTF8(JOSE Header))  "."  BASE64URL(Payload)  "."  BASE64URL(Signature)
+----
+
+以经典 HS256 示例(本质就是一个 JWT)为例:
+
+[source, text]
+----
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+----
+
+拆开看, 各段解码后的内容分别是:
+
+[options="header", cols="1,5"]
+|===
+| 段 | 解码后内容
+| Header | `{"alg":"HS256","typ":"JWT"}`
+| Payload | `{"sub":"1234567890","name":"John Doe","iat":1516239022}`
+| Signature | HS256 计算出的 32 字节 MAC 的 Base64URL
+|===
+
+Base64URL:: 标准 Base64 的 URL 安全变体, 将 `+` 替换为 `-`, 将 `/` 替换为 `_`, 并**移除末尾的 `=` 填充**. 结果不含任何 URL 保留字符, 长度也更短.
+
+各组成部分的职责:
+
+JOSE Header:: 描述算法与密钥的 JSON 对象. 在紧凑序列化中整段都参与签名, 因此又称 **protected header**, 任何字段被篡改都会导致验签失败.
+Payload:: 被保护的数据本体. JWS 本身不限定其内容, 实际应用中通常是 JSON 文本(例如 JWT 的 Claims).
+Signature:: 用 Header 声明的 `alg`, 对签名输入计算得到的签名或 MAC 的 Base64URL.
+
+JOSE Header 常见字段:
+
+[options="header", cols="1,1,5"]
+|===
+| 字段 | 必选 | 含义
+| `alg` | 是 | 签名或 MAC 算法, 取值来自 JWA 注册表(如 `RS256`)
+| `typ` | 否 | 媒体类型提示, JWT 场景约定为 `JWT`
+| `cty` | 否 | Payload 的媒体类型, 用于 Payload 本身是嵌套 JWS/JWE 的场景
+| `kid` | 否 | 密钥 ID, 帮助验签方在多把密钥中快速定位
+| `jku` | 否 | JWK Set 的 URL, 指明从何处获取验签公钥
+| `jwk` | 否 | 内嵌的公钥(JSON 对象), 免去外部获取
+| `x5c` | 否 | X.509 证书链(Base64 编码), 可内嵌证书供验签
+| `crit` | 否 | 必须被理解的扩展字段名列表, 验签方不理解时必须拒绝
+|===
+
+=== JWS 支持哪些算法
+
+JWA (RFC 7518) 建立了 `alg` 注册表, 常用签名算法按族划分如下:
+
+[options="header", cols="2,3,3,4"]
+|===
+| alg | 底层算法 | 密钥形式 | 说明
+| `HS256/384/512` | HMAC-SHA-2 | 对称共享密钥 | 计算快, 但签发与验签必须共享同一密钥
+| `RS256/384/512` | RSASSA-PKCS1-v1_5 | RSA 私钥签, 公钥验 | 兼容性最广, 新系统更推荐 PSS
+| `PS256/384/512` | RSASSA-PSS | RSA 私钥签, 公钥验 | 概率性填充, 安全性优于 PKCS1-v1_5
+| `ES256/384/512` | ECDSA (P-256/384/521) | EC 私钥签, 公钥验 | 密钥与签名更短; JWS 用裸 R和S 拼接, 而非 ASN.1 DER 编码
+| `EdDSA` | Ed25519/Ed448 | 私钥签, 公钥验 | 现代曲线, 性能与安全性兼备, 近年日益普及
+| `none` | 无 | 无 | 不做任何完整性保护, 生产环境禁止使用
+|===
+
+两个常见选型细节:
+
+* **HS 族密钥长度:** HS256 的共享密钥应至少与哈希输出等长(即 256 bit, 32 字节), 否则相当于人为降低安全强度
+* **ES 族签名编码:** JWS 规范对 ECDSA 签名采用裸 `R || S` 拼接(固定长度), 与 OpenSSL 等常用的 DER 编码不同, 实现时必须按规范转换
+
+=== 签名与验签流程
+
+JWS 的安全根基是**签名输入 (Signing Input) 的精确定义**. 待签名数据是如下 ASCII 字符串:
+
+[source, plaintext, linenums]
+----
+ASCII(BASE64URL(UTF8(Header))) || "." || ASCII(BASE64URL(Payload))
+----
+
+即先分别对 Header 与 Payload 做 UTF-8 编码再 Base64URL, 然后用一个句点连接. 注意签名输入中**不含第三段签名**; 签发与验签双方都必须使用完全相同的输入, 任何一处偏差都会导致验签失败.
+
+签发方计算签名, 例如 HS256 与 RS256 分别为:
+
+* stem:[tag = HMAC(SHA-256, K, signingInput)] (HS256)
+* stem:[tag = RSA-SSA-PKCS1-v1_5(SHA-256, sk, signingInput)] (RS256)
+
+随后把签名字节 Base64URL 编码作为第三段, 即得到完整的紧凑 JWS.
+
+[plantuml, "JWS 签发与验签流程(以非对称算法为例)", format=png]
+----
+@startuml
+participant "签发方" as Signer
+participant "验证方" as Verifier
+participant "JWKS 端点" as JWKS
+
+Signer -> Signer : 1. 组装 Header 与 Payload
+Signer -> Signer : 2. 用私钥对 signingInput 签名
+Signer -> Verifier : 3. 发送紧凑 JWS(Header.Payload.Signature)
+Verifier -> JWKS : 4. 按 kid 请求公钥
+JWKS --> Verifier : 5. 返回 JWK 集合
+Verifier -> Verifier : 6. 重算 signingInput 并用公钥验签
+Verifier -> Verifier : 7. 校验 exp/aud/nonce 等声明(应用层)
+@enduml
+----
+
+验签方在收到 JWS 后的标准步骤:
+
+. 按 `.` 将令牌拆为三段, Base64URL 解码 Header 与 Payload
+. 用服务端配置的 **`alg` 白名单**校验算法, 依据 `kid` 定位到受信任的公钥
+. 按同一规则重算 signing input
+. 验签: 非对称用公钥验证签名, 对称则用共享密钥重算 MAC 并做**恒定时间比较**
+. 在应用层校验 Payload 中的 `exp`, `aud`, `nonce` 等声明(这些属于 JWT/业务约定, 而非 JWS 本身)
+
+公钥的获取通常通过 JWKS 端点完成, 例如:
+
+[source,json]
+----
+GET https://issuer.example.com/.well-known/jwks.json
+
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "k1",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2e...",
+      "e": "AQAB"
+    }
+  ]
+}
+----
+
+JWKS 中同一签发方通常同时发布多把公钥, `kid` 的作用正是告诉验签方取用哪一把, 从而支持**密钥轮换**而不中断服务.
+
+=== 其它序列化格式: JSON 序列化
+
+紧凑序列化只支持单个签名且 Header 必须为 protected header. 当需要**多个签名者**或拆分 protected/unprotected header 时, 使用 JSON 序列化 (JSON Serialization):
+
+[source,json]
+----
+{
+  "payload": "eyJzdWIiOiJ1c2VyLTEwMDEifQ",
+  "signatures": [
+    {
+      "protected": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0",
+      "signature": "第一个签名者的签名"
+    },
+    {
+      "protected": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImsyIn0",
+      "signature": "第二个签名者的签名"
+    }
+  ]
+}
+----
+
+上例为 **General JSON 序列化**, 顶层 `signatures` 数组可容纳多个签名. 若只对同一数据做单个签名, 可用简化的 **Flattened JSON 序列化**, 把唯一签名提升到顶层:
+
+[source,json]
+----
+{
+  "payload": "eyJzdWIiOiJ1c2VyLTEwMDEifQ",
+  "protected": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0",
+  "signature": "签名"
+}
+----
+
+在 JSON 序列化中, Header 可拆为两类, 安全性截然不同:
+
+protected header:: 参与签名, 任何改动都会导致验签失败. 凡是影响安全的参数(`alg`, `kid`, `crit` 等)都应放入这里.
+unprotected header:: **不参与签名**, 修改不会被发现, 只能承载不影响安全的描述信息. 实践中应尽量把所有字段都放进 protected header.
+
+多签名的典型用途: 同一数据同时由硬件与软件模块签名, 或在密钥轮换期两种算法并存, 让新旧客户端各用其可识别的签名.
+
+=== 分离式内容 (Detached Content)
+
+当 Payload 体积很大, 或希望保持原始内容不经过 Base64 时, 可采用**分离式 JWS**: Payload 段置空, 内容以带外方式(如 HTTP 请求体)另行传输:
+
+[source, text]
+----
+Header..Signature     // 注意中间两连点, Payload 段为空
+----
+
+验签方先拿到原始内容, 用它与 Header 段拼接出 signing input 再验签. 这样既保留了签名保护, 又避免对大体积内容做 Base64 膨胀. 典型场景是**对 HTTP 请求体签名**(签名放请求头, 原文放请求体), 常用于 API 请求防篡改与 Webhook 验签.
+
+=== 典型应用场景
+
+JWT 令牌:: OAuth2.1 的 `access_token` 与 OIDC 的 `id_token` 本质都是 JWS. 资源服务器用授权服务器的 JWKS 公钥本地验签, 免去每次回源验证, 实现无状态鉴权.
+回调与跳转参数防篡改:: 登录跳转, 支付回调等场景把关键参数打包为 JWS, 接收方验签后采信, 防止参数被中途改写.
+开放 API 请求签名:: 把请求中的关键字段(方法, 路径, 时间戳等)签名后放入请求头, 服务端验签以识别合法调用方与防重放.
+智能体名片签名:: A2A 协议按 RFC 7515 对 Agent Card 签名, 客户端验签通过后才信任名片内容(详见 <<大模型/智能体到智能体协议讲解.adoc#, 智能体到智能体协议讲解>>).
+软件与配置清单签名:: 对下发清单, 更新元数据签名, 客户端验证来源与完整性, 防止投毒与篡改.
+
+=== 安全注意事项
+
+[[jws-security]]
+JWS/JWT 的大多数真实漏洞都出在**验签侧的实现**而非算法本身. 只需守住以下要点, 即可规避绝大多数已知攻击.
+
+==== 算法混淆攻击 (Algorithm Confusion)
+
+这是 JWS 最典型的攻击, 前提是验签方信任 Header 中的 `alg` 字段. 以 `RS256` 签发的 JWT 为例, 攻击仅需四步:
+
+. 签发方用 RSA 私钥签发, 验签方信任对应的 RSA 公钥, 而公钥通常经 JWKS **公开**
+. 攻击者截获令牌, 将 Header 的 `alg` 改为 `HS256` 并随意改写 Payload
+. 攻击者把公开的 RSA 公钥当作 HMAC 的共享密钥, 用 `HS256` 重新计算签名
+. 若验签方只信 Header 的 `alg`, 又把自己持有的公钥当 HMAC 密钥使用, 伪造签名即可通过验签
+
+防御的核心是**确保算法与密钥的组合由服务端决定, 而非由令牌内容决定**:
+
+* 验签前用**显式白名单**校验 `alg`, 只接受服务端预先配置的算法, 出现其它算法一律拒绝
+* 按密钥类型隔离: 校验公钥的 `kty` 与 `use`, 不提供把公钥当对称密钥使用的代码路径
+* 校验 `kid` 必须指向服务端已知的受信任密钥, 防止指向攻击者自控的密钥
+* 生产环境一律拒绝 `none` 算法
+
+==== 其它要点
+
+* **密钥强度与选型:** HMAC 密钥至少 32 字节且高熵; RSA 建议不低于 2048 bit, 新系统优先 `PS256`, `ES256` 或 `EdDSA`; 长期使用的签名私钥应支持轮换, 配合 `kid` 与 JWKS 平滑切换
+* **恒定时间比较:** HMAC 验签必须使用恒定时间比较(如 Java 的 `MessageDigest.isEqual`), 避免逐字节比较提前返回而泄露时序信息
+* **防重放:** JWS 本身不含时间或一次性标记, 需在 Payload 中携带 `exp`, `iat`, `jti`/`nonce` 等并由应用层校验
+* **严格处理输入:** 拒绝带填充或多余空白的非规范 Base64URL 表示, 防止同一签名对应多种编码导致校验绕过
+* **`crit` 扩展字段:** 遇到不理解的 `crit` 字段必须拒绝, 不得静默忽略, 否则可能跳过关键校验
+* **敏感数据勿入 Payload:** JWS 不加密, Payload 任何持有者都可读. 密码, 手机号等敏感信息不得放入其中, 需要保密时改用 JWE
+
+=== 总结
+
+JWS (RFC 7515) 用**紧凑三段式结构 + 精确签名输入定义**解决了 Web 场景中签名数据标准化的难题, 是 JWT, OIDC 以及各类请求签名方案的底座. 掌握它的关键是理解三点: 签名输入由 Header 与 Payload 的 Base64URL 连接而成, 验签必须基于 `alg` 白名单防算法混淆, 以及 JWS 只保证完整性与来源而不提供机密性. 在此之上, 密钥管理, 防重放与敏感数据保护仍需要由令牌层与业务层共同补齐.

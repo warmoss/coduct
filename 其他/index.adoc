@@ -1,5 +1,13 @@
 = 其他
 
+include::dotnet依赖注入讲解.adoc[]
+
+include::MusicXML讲解.adoc[]
+
+include::frp原理讲解.adoc[]
+
+include::MathML讲解.adoc[]
+
 include::UTF8编码讲解.adoc[]
 
 include::KMS密钥管理服务讲解.adoc[]
