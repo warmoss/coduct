@@ -1,0 +1,840 @@
+== Vulkan讲解
+
+Vulkan 是 Khronos 组织维护的跨平台、低开销的图形与计算 API, 于 2016 年 2 月发布, 被视为 OpenGL 的继任者.
+
+如果把 OpenGL 比作"自动挡"汽车, Vulkan 就是"手动挡": 内存分配、管线状态、同步、多线程调度这些原本由驱动代劳的事情, 全部交还给应用. 代价是代码量陡增, 回报则是**可预测的帧时间**与**对硬件的完全掌控**.
+
+=== 为什么会有 Vulkan?
+
+OpenGL 诞生于 1992 年, 其设计前提是"硬件差异极大、应用只想画图", 因此它本质上是一个**全局状态机**:
+
+* 纹理、缓冲区、着色器程序都绑定在全局上下文里, 每次绘制时驱动都要遍历并翻译当前状态.
+
+* 着色器通常延迟到首次使用时才完成编译与链接, 造成帧时间尖刺(卡顿).
+
+* 内存由驱动托管, 资源何时真正上传、何时释放由驱动决定, 应用的显存预算不可控.
+
+* 驱动需要做大量参数校验与隐式同步, 这些开销在 PC 上尚可接受, 在移动端和多核 CPU 上却成为瓶颈.
+
+* Context 与线程绑定, 多线程录制渲染命令几乎不可行, 典型架构只能是"一个渲染线程 + 若干业务线程".
+
+2013 年 AMD 推出 Mantle API, 用"显式资源管理 + 多线程 + 预编译着色器"大幅压缩了驱动的 CPU 开销. 2015 年 AMD 将 Mantle 捐给 Khronos, 在此基础上 Vulkan 1.0 于 2016 年发布. 同一时期 Direct3D 12 与 Metal 也走向了类似方向, 说明这是硬件规模与多核化带来的必然结果.
+
+=== 设计哲学: 把"隐式"变成"显式"
+
+Vulkan 的所有设计都围绕一句话展开: **驱动不做猜测, 应用承担全部责任**. 具体表现为:
+
+* **显式资源管理:** 显存由应用分配, 内存类型由应用选择, 上传时机由应用决定.
+
+* **显式同步:** 驱动不会自动插入等待或刷新, 少一个屏障就可能读到未写入的数据.
+
+* **显式状态:** 渲染状态被"烘焙"进不可变的管线对象, 绘制时不再有 per-draw 的状态翻译.
+
+* **无全局状态:** 几乎所有函数都要显式传入设备或命令缓冲, 不存在隐式的"当前上下文".
+
+* **离线着色器:** 着色器以 SPIR-V 二进制形式提供, 语法错误在构建期暴露, 运行时不再解析 GLSL 文本.
+
+* **校验与驱动分离:** 参数校验放在可选的校验层(Validation Layer)里, 生产环境关闭后驱动只做最少工作.
+
+[cols="2,5,5"]
+|===
+|维度 |OpenGL(隐式) |Vulkan(显式)
+
+|**内存**
+|驱动托管, 应用只给数据
+|应用分配 `VkDeviceMemory` 并显式绑定
+
+|**资源状态**
+|驱动内部跟踪, 应用基本无感
+|图像布局、访问掩码由应用通过屏障管理
+
+|**同步**
+|驱动按启发式插入等待/刷新
+|Fence、Semaphore、Barrier 全部手写
+
+|**着色器**
+|运行时编译 GLSL 文本
+|构建期编译为 SPIR-V
+
+|**渲染状态**
+|全局状态机, 逐次 `glEnable`/`glBlendFunc`
+|创建管线时一次性烘焙, 运行时不可变
+
+|**线程模型**
+|上下文绑定线程
+|命令录制可多线程并行
+
+|**错误检查**
+|驱动始终校验, `glGetError` 查询
+|校验层可选, 生产环境零开销
+
+|**驱动职责**
+|翻译状态、管理内存、隐式同步
+|只做命令翻译与派发
+
+|===
+
+=== 整体架构: 从应用到 GPU
+
+Vulkan 程序并不直接与驱动对话, 中间隔着一层 **Loader**:
+
+[cols="2,4,8"]
+|===
+|层次 |组件 |职责
+
+|**应用**
+|业务代码 / 引擎
+|创建对象、录制命令、提交队列
+
+|**Loader**
+|`vulkan-1.dll` / `libvulkan.so.1`
+|根据 ICD 清单文件(JSON)加载具体驱动, 转发函数调用
+
+|**Layer**
+|校验层、调试层、最佳实践层
+|位于应用与 ICD 之间, 可拦截并检查每一次调用
+
+|**ICD**
+|厂商驱动(如 NVIDIA、AMD、Intel、Mali)
+|把 Vulkan 命令翻译为 GPU 指令
+
+|**GPU**
+|硬件队列与执行单元
+|真正执行图形/计算/传输工作
+
+|===
+
+加载器通过注册表或 `/usr/share/vulkan/icd.d` 下的清单发现驱动; 同一台机器可以同时安装多块不同厂商的 GPU, 应用通过枚举 `VkPhysicalDevice` 选择其中之一.
+
+==== 核心对象一览
+
+Vulkan 用一组句柄(本质上是不透明的整数)描述所有资源, 常见对象及其职责如下:
+
+[cols="3,5,5"]
+|===
+|对象 |作用 |创建/销毁
+
+|`VkInstance`
+|应用与 Vulkan 运行时的连接, 声明应用信息、API 版本、实例级扩展与层
+|`vkCreateInstance` / `vkDestroyInstance`
+
+|`VkPhysicalDevice`
+|某块物理 GPU 的只读句柄, 用于查询队列族、显存堆、格式与特性
+|由实例枚举, 不可销毁
+
+|`VkDevice`
+|逻辑设备, 启用具体特性与设备扩展, 是绝大多数对象的"分配器"
+|`vkCreateDevice` / `vkDestroyDevice`
+
+|`VkQueue`
+|向硬件队列提交工作的句柄
+|从设备获取, 不单独销毁
+
+|`VkCommandPool` / `VkCommandBuffer`
+|命令的内存来源与录制容器
+|`vkCreateCommandPool` / `vkDestroyCommandPool`
+
+|`VkSwapchainKHR`
+|呈现引擎管理的图像队列, 负责把渲染结果送到屏幕
+|依赖 `VkSurfaceKHR`, 窗口变化时需重建
+
+|`VkShaderModule` / `VkPipeline`
+|SPIR-V 模块与不可变的管线状态
+|`vkCreateGraphicsPipelines` 等
+
+|`VkDescriptorSetLayout` / `Pool` / `Set`
+|资源绑定的"结构体定义"、分配器与实例
+|`vkAllocateDescriptorSets` 等
+
+|`VkBuffer` / `VkImage` / `VkImageView` / `VkSampler`
+|缓冲区、图像、图像视图与采样器
+|`vkCreateBuffer` / `vkCreateImage` 等
+
+|`VkDeviceMemory`
+|一块显存, 需要显式绑定到缓冲区或图像
+|`vkAllocateMemory` / `vkFreeMemory`
+
+|`VkFence` / `VkSemaphore`
+|CPU 与 GPU、队列与队列之间的同步对象
+|`vkCreateFence` / `vkCreateSemaphore`
+
+|===
+
+NOTE: Vulkan 对象**没有引用计数**, 也不会自动回收. 谁创建谁销毁, 且销毁顺序通常与创建顺序相反. 忘记销毁的对象会被校验层报告为泄漏.
+
+=== 队列与命令模型
+
+Vulkan 的执行模型可以分为"两类对象 + 两个阶段": 队列负责执行, 命令缓冲负责描述要执行什么; **录制**在 CPU 上完成, **提交**之后由 GPU 异步执行.
+
+==== 队列族
+
+物理设备把队列划分成若干**队列族**(Queue Family), 每个族支持一组能力:
+
+[cols="3,4,8"]
+|===
+|队列族能力 |主要命令 |说明
+
+|Graphics
+|`vkCmdDraw*`
+|图形绘制, 同时也能执行传输命令
+
+|Compute
+|`vkCmdDispatch*`
+|通用计算, 同样支持传输命令
+
+|Transfer
+|`vkCmdCopy*` / `vkCmdBlitImage`
+|只支持传输命令, 适合纯上传与回读
+
+|Sparse binding
+|稀疏绑定
+|虚拟纹理、超大体积数据的按需驻留
+
+|Protected
+|受保护内存访问
+|DRM 视频播放等场景
+
+|Video decode / encode
+|Vulkan Video 扩展
+|硬件编解码
+
+|===
+
+选择 GPU 时不能只看性能, 还必须确认它存在同时支持 **Graphics 与 Present** 的队列族, 否则需要额外的队列族所有权转移. 不同厂商、不同驱动的队列族布局并不一致, 因此**不能把队列族索引写死**.
+
+==== 录制与提交
+
+命令缓冲里记录的是"要做什么", 而不是"立刻去做":
+
+[source,cpp]
+----
+vkBeginCommandBuffer(cmd, &beginInfo);
+
+vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                        0, 1, &descriptorSet, 0, nullptr);
+vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, offsets);
+vkCmdDraw(cmd, vertexCount, 1, 0, 0);
+
+vkEndCommandBuffer(cmd);
+
+VkSubmitInfo submit{};
+submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+submit.commandBufferCount = 1;
+submit.pCommandBuffers = &cmd;
+vkQueueSubmit(graphicsQueue, 1, &submit, fence);
+----
+
+几个关键事实:
+
+* 同一队列内的命令**按提交顺序开始执行**, 但不同阶段的执行可以重叠, 完成顺序也不保证; 因此有数据依赖时必须写屏障.
+
+* 不同队列之间**没有任何顺序保证**, 必须用信号量建立依赖.
+
+* 命令缓冲分为**一级**(可直接提交)与**二级**(只能被一级调用, 便于并行录制).
+
+* 命令池是命令内存的真正来源, 建议**每个线程一个池、每帧一个池**, 避免加锁与跨帧复用冲突.
+
+=== 图形管线
+
+Vulkan 的图形管线是一组固定的阶段, 与 OpenGL 的可编程管线一一对应, 但**所有状态在创建管线时就必须确定**:
+
+[cols="3,5,8"]
+|===
+|阶段 |Vulkan 标志 |作用
+
+|输入装配
+|`VERTEX_INPUT`
+|读取顶点/索引缓冲, 组装图元, 应用顶点属性格式
+
+|顶点着色
+|`VERTEX_SHADER`
+|顶点变换、骨骼动画、法线计算
+
+|细分控制/评估
+|`TESSELLATION_CONTROL` / `EVALUATION`
+|曲面细分(可选)
+
+|几何着色
+|`GEOMETRY`
+|图元增删改(可选, 移动端性能代价高)
+
+|光栅化
+|由 viewport / scissor / rasterization state 控制
+|图元转片元, 决定剔除、填充模式、深度偏移
+
+|早期深度/模板测试
+|`EARLY_FRAGMENT_TESTS`
+|片元着色前剔除被遮挡片元
+
+|片元着色
+|`FRAGMENT_SHADER`
+|计算颜色、采样纹理
+
+|后期深度/模板测试
+|`LATE_FRAGMENT_TESTS`
+|写入深度/模板
+
+|颜色混合
+|`COLOR_ATTACHMENT_OUTPUT`
+|混合并写入颜色附件
+
+|===
+
+==== 不可变管线
+
+OpenGL 里 `glEnable(GL_BLEND)`、`glBlendFunc`、`glDepthFunc` 这类调用可以在任意时刻改变状态; Vulkan 则把这些状态打包进 `VkGraphicsPipelineCreateInfo`, 在 `vkCreateGraphicsPipelines` 时一次性烘焙成 GPU 可执行的对象. 好处是绘制时驱动无需再翻译状态, 代价是**状态组合多时会创建大量管线**.
+
+常见优化手段:
+
+* **动态状态(Dynamic State):** viewport、scissor、blend constants、depth bias 等少数状态可在录制时用 `vkCmdSetViewport` 等命令修改, 减少管线数量.
+
+* **管线缓存(VkPipelineCache):** 把编译结果序列化到磁盘, 下次启动直接复用, 显著缩短首帧耗时.
+
+* **管线库(Graphics Pipeline Library):** 把顶点输入、光栅化、片元输出等部分分别预编译再链接, 降低运行时卡顿.
+
+NOTE: Vulkan 的裁剪空间与 OpenGL 不同: **Y 轴向下, 深度范围是 0~1**(OpenGL 为 -1~1). 如果沿用 OpenGL 的投影矩阵, 画面通常上下颠倒, 需要用负高度的 viewport 或在投影矩阵中做 Y 翻转.
+
+=== 着色器与资源绑定
+
+==== SPIR-V
+
+Vulkan 只接受 **SPIR-V** 二进制. 构建期用工具把源码编译过去:
+
+* GLSL -> `glslangValidator` / `shaderc`
+* HLSL -> `dxc`
+* Slang -> `slangc`
+
+SPIR-V 是一种基于 SSA 的中间表示, 好处是: 语法与类型错误在构建期暴露; 驱动不必再解析文本; 同一份二进制可以跨平台使用(仍需驱动翻译为具体 ISA).
+
+* **特化常量(Specialization Constant):** 在管线创建时才确定值的常量, 一份 SPIR-V 可派生出多种变体, 避免着色器爆炸.
+
+* **推送常量(Push Constant):** 每次绘制可直接写入的一段小数据(通常保证 128 字节), 适合变换矩阵、材质索引等高频小参数.
+
+==== 描述符
+
+Vulkan 的资源绑定通过**描述符集**完成, 它把"着色器里的 binding"落实为具体的缓冲区、图像与采样器:
+
+[cols="3,5,7"]
+|===
+|对象 |含义 |类比
+
+|`VkDescriptorSetLayout`
+|描述一个集合中有哪些 binding、类型与数量
+|C 语言里的结构体定义
+
+|`VkDescriptorPool`
+|描述符的内存分配器, 需预设各类描述符上限
+|结构体的对象池
+
+|`VkDescriptorSet`
+|一组实际绑定值的集合
+|结构体的实例
+
+|`VkPipelineLayout`
+|把多个 SetLayout 与推送常量范围组合起来
+|函数签名
+
+|===
+
+描述符集在绑定后, 只要内容不变就可以被多次绘制复用. 现代渲染器常用两种进阶方案:
+
+* **Bindless(描述符索引):** 用一个巨大的描述符数组 + 动态索引, 让着色器自行挑选纹理, 大幅减少绑定开销(Vulkan 1.2 核心特性).
+
+* **描述符缓冲(Descriptor Buffer):** 把描述符直接写进内存并由着色器按地址访问, 减少驱动侧的描述符管理开销(Vulkan 1.4 已转正).
+
+=== 内存管理
+
+OpenGL 的 `glBufferData`、`glTexImage2D` 隐含了"分配 + 上传"两件事; Vulkan 把它们拆成显式的几步:
+
+. 创建 `VkBuffer` / `VkImage`, 只描述用途与大小, 此时还没有显存.
+
+. 用 `vkGetBufferMemoryRequirements` 查询对齐与内存类型要求.
+
+. 在合适的堆上 `vkAllocateMemory` 得到 `VkDeviceMemory`.
+
+. 用 `vkBindBufferMemory` / `vkBindImageMemory` 绑定.
+
+. 对纹理还需创建 `VkImageView` 与采样器, 并在上传前把布局转换到 `TRANSFER_DST_OPTIMAL`.
+
+==== 内存类型
+
+[cols="4,5,9"]
+|===
+|标志 |典型用途 |说明
+
+|`DEVICE_LOCAL`
+|纹理、顶点/索引缓冲、渲染目标
+|显存, 通常 CPU 不可映射
+
+|`HOST_VISIBLE` + `HOST_COHERENT`
+|暂存缓冲(staging)、少量 UBO
+|CPU 可直接写, 无需手动刷新
+
+|`HOST_VISIBLE` 非一致
+|大块回读
+|需要 `vkFlushMappedMemoryRanges` / `vkInvalidateMappedMemoryRanges`
+
+|`LAZILY_ALLOCATED`
+|移动端 tile 内存
+|声明时几乎不占显存, GPU 使用时才真正分配
+
+|`PROTECTED`
+|DRM 内容
+|受保护内存, 不允许 CPU 访问
+
+|===
+
+==== 上传的正确姿势
+
+设备本地显存通常不可由 CPU 直接写入, 标准做法是**暂存缓冲 + 拷贝**:
+
+. 创建一块 `HOST_VISIBLE | HOST_COHERENT` 的暂存缓冲并映射写入数据.
+
+. 创建 `DEVICE_LOCAL` 的目标缓冲/图像.
+
+. 录制 `vkCmdCopyBuffer` 或 `vkCmdCopyBufferToImage`.
+
+. 插入屏障, 把目标资源转换到着色器可读的布局.
+
+. 提交后等待 fence, 再销毁暂存资源(或放进回收队列延迟销毁).
+
+==== 分配策略
+
+驱动对**单次分配的数量**有硬性限制(`maxMemoryAllocationCount` 保证值通常只有 4096), 因此"一个资源一次分配"在真实项目里必然撞墙. 常见做法是用 **VMA(Vulkan Memory Allocator)** 在大块 `VkDeviceMemory` 上做子分配, 并按资源生命周期做内存复用(别名 aliasing).
+
+==== 图像布局
+
+`VkImage` 有一个显式的"布局"状态: `UNDEFINED`、`GENERAL`、`TRANSFER_DST_OPTIMAL`、`SHADER_READ_ONLY_OPTIMAL`、`COLOR_ATTACHMENT_OPTIMAL`、`PRESENT_SRC_KHR` 等. 布局转换由**屏障**完成, 并且是渲染正确性的一大来源:
+
+* 布局不对 -> 校验层报错、画面花屏或性能骤降.
+
+* 转换过多 -> 中断 GPU 的 tile 优化, 帧率下降.
+
+* 建议按"上传 -> 着色器读 -> 附件写 -> 呈现"的路径规划固定转换点.
+
+=== 同步机制
+
+Vulkan 没有隐式同步, 所有依赖关系都要应用自己声明. 同步对象分为三类:
+
+[cols="3,4,5,8"]
+|===
+|机制 |方向 |语义 |典型用法
+
+|`VkFence`
+|GPU -> CPU
+|一次性或可重复的"提交批次完成"信号, 由应用重置
+|等待上一帧完成, 限制 CPU 领先 GPU 的帧数
+
+|`VkSemaphore`
+|GPU 队列 -> GPU 队列
+|提交批次之间的依赖
+|acquire 图像 -> 渲染, 渲染 -> present
+
+|Timeline Semaphore
+|GPU / CPU 双向
+|带单调递增计数值, 可等待任意值
+|多队列、多线程的细粒度同步(1.2 核心)
+
+|`VkEvent`
+|队列内 / CPU
+|可置位与等待
+|把同一命令缓冲切成多个依赖段
+
+|Barrier
+|队列内
+|执行依赖 + 内存可见性 + 布局转换
+|资源在读写之间切换状态
+
+|===
+
+一个最常见的图像布局转换屏障如下:
+
+[source,cpp]
+----
+VkImageMemoryBarrier barrier{};
+barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+barrier.image = texture;
+barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+barrier.srcAccessMask = 0;                          // 旧内容不需要保留
+barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+vkCmdPipelineBarrier(cmd,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     0,
+                     0, nullptr, 0, nullptr,
+                     1, &barrier);
+----
+
+理解屏障的关键是**两个掩码 + 两个阶段**:
+
+* `srcStageMask` / `srcAccessMask`: 我要等"谁"完成、它的写入要对后续可见.
+
+* `dstStageMask` / `dstAccessMask`: "谁"要读/写, 它必须能看到前面的结果.
+
+* 阶段与访问类型必须匹配, 例如传输写入(`TRANSFER_WRITE`)之后要让片元着色器采样(`FRAGMENT_SHADER` + `SHADER_READ`).
+
+Vulkan 1.3 的 **Synchronization2** 把这些字段合并到 `VkDependencyInfo`, 并引入了更清晰的 `NONE` 语义; 1.3 起新代码建议直接使用 `vkCmdPipelineBarrier2`.
+
+WARNING: 用 `TOP_OF_PIPE` 表示"等前面所有工作完成"是一种常见误解. 它只表示"管线最开始的阶段", 并不会等待此前提交的传输或绘制. 依赖写不清楚时, 优先使用 Sync2 的语义化写法.
+
+=== 一个完整的帧循环
+
+一个能稳定运行的 Vulkan 程序, 每帧大致要做这些事:
+
+. 等待上一帧的 fence 触发(限制 in-flight 帧数, 通常是 2~3).
+
+. 从交换链 acquire 一张可用图像, 同时得到对应的 semaphore.
+
+. 重置命令缓冲, 录制本帧命令(可能包含布局转换、绘制、拷贝).
+
+. 提交到图形队列: 等待 acquire 信号量, 完成后 signal 渲染完成信号量, 并绑定 fence.
+
+. 把图像 present 到窗口: 等待渲染完成信号量.
+
+. 推进帧索引(环形缓冲).
+
+[source,cpp]
+----
+vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+
+uint32_t imageIndex = 0;
+vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
+                      imageAvailableSemaphores[currentFrame],
+                      VK_NULL_HANDLE, &imageIndex);
+
+vkResetFences(device, 1, &inFlightFences[currentFrame]);
+vkResetCommandBuffer(commandBuffers[currentFrame], 0);
+recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
+
+VkSemaphore waitSemaphores[]   = { imageAvailableSemaphores[currentFrame] };
+VkSemaphore signalSemaphores[] = { renderFinishedSemaphores[currentFrame] };
+VkPipelineStageFlags waitStages[] = {
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+};
+
+VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+submit.waitSemaphoreCount   = 1;
+submit.pWaitSemaphores      = waitSemaphores;
+submit.pWaitDstStageMask    = waitStages;
+submit.commandBufferCount   = 1;
+submit.pCommandBuffers      = &commandBuffers[currentFrame];
+submit.signalSemaphoreCount = 1;
+submit.pSignalSemaphores    = signalSemaphores;
+
+vkQueueSubmit(graphicsQueue, 1, &submit, inFlightFences[currentFrame]);
+
+VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+present.waitSemaphoreCount = 1;
+present.pWaitSemaphores    = signalSemaphores;
+present.swapchainCount     = 1;
+present.pSwapchains        = &swapchain;
+present.pImageIndices      = &imageIndex;
+vkQueuePresentKHR(presentQueue, &present);
+
+currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+----
+
+其中有三处容易踩坑:
+
+* **acquire 与 present 要用不同的信号量**, 且每个 in-flight 帧各有一套, 否则多帧并行时会出现复用未完成的信号量.
+
+* **窗口大小变化会让交换链失效**(`VK_ERROR_OUT_OF_DATE_KHR`), 必须重建交换链、图像视图与相关帧缓冲.
+
+* **present 队列与图形队列可能不是同一个族**, 需要处理队列族所有权转移(`VK_SHARING_MODE_CONCURRENT` 或屏障中的 family 索引).
+
+NOTE: 一个"Hello Triangle"级别的 Vulkan 程序通常需要创建 20 多个对象、700~1000 行 C++, 这也是 Vulkan 被诟病"啰嗦"的直接原因. 实际项目一般用 **vk-bootstrap**、**VMA**、**volk** 或引擎封装来摊薄这部分样板代码.
+
+=== 多线程渲染
+
+Vulkan 是少数从设计之初就考虑多线程的图形 API:
+
+* **命令池按线程隔离:** 每个线程用自己的 pool 与 command buffer, 录制过程几乎无锁.
+
+* **二级命令缓冲:** 主线程在外面录制渲染通道, 工作线程并行录制各自的 draw call, 最后 `vkCmdExecuteCommands` 合并.
+
+* **队列提交线程安全:** `vkQueueSubmit` 本身可由多线程调用, 但同一队列的访问需要应用自行加锁.
+
+* **渲染图(Render Graph):** 现代引擎把"资源读写"声明成图, 由框架自动推导屏障与队列划分, 这是大型项目控制同步复杂度的主流做法.
+
+=== 版本演进与扩展机制
+
+Vulkan 通过**扩展(Extension)** 持续演进, 成熟后被提升为核心版本:
+
+[cols="2,3,10"]
+|===
+|版本 |发布时间 |主要变化
+
+|1.0
+|2016-02
+|初始版本: 图形/计算/传输队列、SPIR-V 1.0、显式内存与同步
+
+|1.1
+|2018-03
+|子组操作、多视图、保护内存、YCbCr 转换、设备组、SPIR-V 1.3
+
+|1.2
+|2019-12
+|时间线信号量、描述符索引、缓冲区设备地址、SPIR-V 1.5
+
+|1.3
+|2021-12
+|动态渲染、Synchronization2、扩展动态状态、子组大小控制、SPIR-V 1.6
+
+|1.4
+|2024-12
+|维护类扩展转正、推送描述符、更细的着色器控制流、更省的上传与映射路径
+
+|===
+
+几个值得关注的方向:
+
+* **动态渲染(Dynamic Rendering):** 不再需要预先创建 `VkRenderPass` 与 `VkFramebuffer`, 直接在命令缓冲里指定附件, 大幅简化代码(1.3 核心).
+
+* **光线追踪:** `VK_KHR_acceleration_structure`、`VK_KHR_ray_tracing_pipeline`、`VK_KHR_ray_query` 提供硬件光追与混合渲染.
+
+* **Mesh Shader:** 用计算式的网格着色取代传统顶点装配, 适合 GPU 驱动渲染与大规模几何.
+
+* **Vulkan Video:** 把硬件编解码纳入统一 API, 减少对平台私有接口的依赖.
+
+* **Profiles / Roadmap:** 用"功能集合"定义可移植的子集(如 Roadmap 2022/2024), 缓解"扩展太多、设备差异太大"的问题; 面向功能安全的 **Vulkan SC** 则是独立规范.
+
+=== 生态与工具
+
+[cols="3,6"]
+|===
+|工具 |用途
+
+|`VK_LAYER_KHRONOS_validation`
+|参数/对象/同步校验, 支持 GPU 辅助校验, 开发期必开
+
+|Vulkan Configurator(`vkconfig`)
+|图形化配置层与校验项
+
+|RenderDoc
+|帧捕获与逐 draw call 检查, 最常用的调试入口
+
+|NVIDIA Nsight Graphics
+|N 卡侧性能剖析, 管线状态与耗时分析
+
+|AMD Radeon GPU Profiler
+|A 卡侧 wave/occupancy 级分析
+
+|Arm Streamline / AGI
+|移动端 GPU 性能分析
+
+|SPIR-V Tools(`spirv-val` / `spirv-opt`)
+|着色器校验与优化
+
+|glslang / DXC / shaderc / Slang
+|把 GLSL、HLSL、Slang 编译为 SPIR-V
+
+|SPIRV-Cross
+|把 SPIR-V 反编译为 GLSL、HLSL、MSL
+
+|VMA
+|显存子分配器, 事实标准
+
+|volk / vk-bootstrap / vulkan-hpp
+|函数指针加载、初始化封装、官方 C++ 绑定
+
+|===
+
+兼容与翻译层让 Vulkan 的覆盖面进一步扩大:
+
+* **MoltenVK:** 把 Vulkan 翻译成 Metal, 使 macOS/iOS 可以运行 Vulkan 应用.
+
+* **DXVK / VKD3D-Proton:** 分别把 D3D9/10/11 与 D3D12 翻译到 Vulkan, 是 Proton 兼容层的核心.
+
+* **Zink:** 在 Vulkan 之上实现 OpenGL, 让老程序也能享受新驱动的统一架构.
+
+* **wgpu / Dawn:** WebGPU 的开源实现, 后端可选用 Vulkan.
+
+主流引擎均已支持 Vulkan 后端, 包括 Unreal Engine、Unity、Godot 4、Filament 与 bgfx.
+
+=== 与 OpenGL 的概念对照
+
+[cols="3,4,4"]
+|===
+|OpenGL |Vulkan |说明
+
+|`glGenBuffers` + `glBufferData`
+|`VkBuffer` + `VkDeviceMemory`
+|分配与上传被拆成显式步骤
+
+|VAO
+|`VkPipeline` 的顶点输入状态
+|属性格式被烘焙进管线
+
+|纹理对象
+|`VkImage` + `VkImageView` + `VkSampler`
+|数据、视图、采样状态三者分离
+
+|FBO
+|`VkRenderPass` + `VkFramebuffer`(或动态渲染)
+|附件与子通道显式声明
+
+|Uniform
+|Descriptor Set / Push Constant
+|绑定结构与数据分离
+
+|GLSL 源码
+|SPIR-V 二进制
+|编译移到构建期
+
+|`glDrawElements`
+|`vkCmdDrawIndexed`
+|录制进命令缓冲后统一提交
+
+|`glFinish`
+|`VkFence` / `vkQueueWaitIdle`
+|可精确控制等待范围
+
+|Context
+|`VkDevice` + `VkQueue`
+|无全局上下文, 全部显式传递
+
+|===
+
+=== 与其他现代图形 API 的对比
+
+[cols="2,4,4,4,4"]
+|===
+|维度 |Vulkan |Direct3D 12 |Metal |WebGPU
+
+|**平台**
+|Windows / Linux / Android / Switch
+|Windows / Xbox
+|Apple 全平台
+|浏览器与原生
+
+|**着色器**
+|SPIR-V
+|DXIL
+|Metal AIR
+|WGSL
+
+|**资源绑定**
+|Descriptor Set
+|Descriptor Heap
+|Argument Buffer
+|Bind Group
+
+|**同步**
+|Fence / Semaphore / Barrier
+|Fence / Resource Barrier
+|Fence / Event
+|Fence / 隐式依赖更多
+
+|**抽象层级**
+|最低
+|低
+|低到中
+|中
+
+|**样板代码**
+|最多
+|多
+|较少
+|较少
+
+|===
+
+=== 如何选型
+
+**适合 Vulkan 的场景:**
+
+* 自研渲染器或引擎, 需要榨干 CPU 提交性能与多核能力.
+
+* 需要跨 Windows、Linux、Android、Switch 等多个平台且希望共享渲染后端.
+
+* 对帧时间稳定性要求高(VR、竞技游戏、模拟器).
+
+* 需要 GPU 计算与图形深度耦合(如后处理、粒子、AI 推理).
+
+**不适合 Vulkan 的场景:**
+
+* 工具类小应用、教学原型: OpenGL 或 raylib、SDL 的抽象层成本更低.
+
+* 纯 Web 应用: 直接用 WebGPU 更合适.
+
+* 只面向 macOS: Metal 原生支持更好, 用 Vulkan 需要额外引入 MoltenVK.
+
+* 团队缺少图形调试经验: Vulkan 把正确性责任完全交给应用, 排查成本显著高于 OpenGL.
+
+=== 常见坑
+
+[cols="4,6,6"]
+|===
+|现象 |原因 |处理
+
+|黑屏但没有任何报错
+|未启用校验层, 真正的错误被静默吞掉
+|开发期始终开启 `VK_LAYER_KHRONOS_validation`
+
+|画面花屏、闪烁
+|缺少屏障、图像布局错误、访问掩码不匹配
+|用 Sync2 语义检查读写依赖, 必要时借助校验层同步校验
+
+|随机 `VK_ERROR_DEVICE_LOST`
+|越界写入、释放仍在使用的内存、未等待 fence
+|开启 GPU 辅助校验, 检查资源生命周期与 in-flight 帧
+
+|窗口缩放后崩溃或黑屏
+|交换链失效未重建
+|处理 `VK_ERROR_OUT_OF_DATE_KHR` 与 `VK_SUBOPTIMAL_KHR`
+
+|在某些 GPU 上找不到 present 队列
+|把队列族索引写死
+|按队列族能力查询并做设备评分
+
+|图像上下颠倒
+|沿用 OpenGL 的投影矩阵(Y 向上、深度 -1~1), 与 Vulkan 的 Y 向下、深度 0~1 不一致
+|翻转投影矩阵或使用负高度 viewport
+
+|创建资源时报显存分配失败
+|每个资源单独分配, 超过 `maxMemoryAllocationCount`
+|用 VMA 做子分配
+
+|帧率周期性抖动
+|运行期反复创建管线或描述符
+|预创建管线、使用管线缓存与描述符池
+
+|macOS 上无法创建实例
+|缺少 portability 枚举扩展, 且未链接 MoltenVK
+|启用 `VK_KHR_portability_enumeration` 与相关标志
+
+|开启校验层后性能骤降
+|层本身带来开销
+|仅在开发/CI 构建中启用, 发布版本关闭
+
+|===
+
+=== 学习路径
+
+. 先用 **Vulkan Tutorial** 走一遍创建实例、交换链、三角形、纹理的完整流程, 建立对象之间的依赖直觉.
+
+. 用 **vkguide.dev** 学习现代写法(动态渲染、Sync2、VMA、描述符索引), 避免学到已过时的模式.
+
+. 对照 **Vulkan Samples** 与官方规范, 逐个理解同步、内存、管线的边界条件.
+
+. 用 **RenderDoc** 抓一帧, 观察每个 draw call 的管线状态、描述符与屏障, 这是从"能跑"到"能调"的关键一步.
+
+=== 总结
+
+* **Vulkan 的本质**是把驱动里的隐式工作显式化: 内存、同步、状态、生命周期全部由应用负责.
+
+* **收益**是更低的 CPU 开销、可预测的帧时间、真正的多线程录制, 以及对移动端与桌面端的统一抽象.
+
+* **代价**是极长的样板代码与陡峭的正确性门槛, 黑屏往往没有任何错误提示.
+
+* **核心心智模型:** 对象显式创建与销毁 -> 命令先录制后提交 -> 依赖必须用信号量/屏障声明 -> 资源状态(尤其是图像布局)必须显式转换.
+
+* **现代 Vulkan** 正在通过动态渲染、Synchronization2、描述符缓冲与 Profiles 逐步降低样板代码与可移植性负担.
+
+* **落地建议:** 个人项目从 vk-bootstrap + VMA + RenderDoc 起步; 工程化项目则应尽早引入渲染图与管线缓存.

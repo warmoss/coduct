@@ -24,6 +24,8 @@ include::缓存/index.adoc[]
 
 include::网络/index.adoc[]
 
+include::图形学/index.adoc[]
+
 include::操作系统/index.adoc[]
 
 include::业务/index.adoc[]
