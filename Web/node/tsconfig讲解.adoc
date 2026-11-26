@@ -28,7 +28,7 @@ tsconfig.json 是 TypeScript 项目的配置文件, 用于指定编译选项、�
 
 |target
 |string
-|编译目标 JS 版本, 如 "ES5", "ES6", "ES2020", "ESNext"
+|编译目标 JS 版本, 如 "ES6", "ESNext"
 
 |module
 |string
@@ -112,7 +112,7 @@ tsconfig.json 是 TypeScript 项目的配置文件, 用于指定编译选项、�
 
 |moduleResolution
 |string
-|模块解析策略, "node" 或 "classic"
+|模块解析策略, "Bundler" 或 "NodeNext"
 
 |baseUrl
 |string
@@ -562,6 +562,169 @@ import express from 'express';  // 而不是 import * as express from 'express'
 }
 ----
 
+==== Q5: module和moduleResolution参数讲解
+
+module 参数用于指定 **输出的JS模块用什么模块格式**, moduleResolution 用于指定 **寻找被导入的文件在磁盘上的位置** 的方式. 两个参数的配置只需要根据运行环境二选一.
+
+**场景一: 用 Vite / webpack 等打包工具**
+
+[source]
+----
+"module": "ESNext",
+"moduleResolution": "Bundler"
+----
+
+module: "ESNext" 会保留你写的 import / export 语句原样输出, 交给打包工具去处理.
+
+**场景二: 代码直接在 Node.js 里跑**
+
+[source]
+----
+"module": "NodeNext",
+"moduleResolution": "NodeNext"
+----
+
+NodeNext 会让 TypeScript 根据文件后缀和 package.json 里的 type 字段, 自动决定输出 CommonJS 还是 ES Module, 和 Node 的实际行为保持一致.
+
+**一个容易忽略的点**
+
+如果你只是开发应用(最终有打包器兜底), 用 ESNext + Bundler 没问题. 但如果你在写库发布到 npm, 官方建议用 NodeNext 来检查, 因为"能在 Node 里跑的代码, 几乎也能在打包器里跑"; 反过来则不一定.
+
+**其他选项**
+
+像 CommonJS、AMD、UMD、System 这些, 都是旧时代的格式. 除非你在维护老项目, 否则新项目不需要考虑. preserve 是较新的选项, 主要给 Bun 或某些需要混用 import 和 require 的现代打包场景用, 日常开发也基本碰不到.
+
+==== Q6: target参数讲解
+target 用于指定输出的JS代码的语法版本, 通常可以指定为ES6或ESNext. 现代浏览器支持ES6的所有语法.
+
+==== Q7: lib参数讲解
+
+lib 管的是另一件事: **你的代码里能直接用哪些"内置功能", 而不需要自己定义或安装类型包.**
+
+**它到底在做什么**
+
+你在代码里写 document.querySelector 或 Promise.all, TypeScript 之所以认识它们, 是因为背后有一份"说明书"(类型声明文件)告诉它这些名字存在、怎么用.
+
+lib 就是决定加载哪几份说明书的参数. 它不改变你输出的代码, 只影响类型检查时"你认识哪些全局变量".
+
+**怎么选: 看你的代码跑在哪**
+
+**浏览器项目:** 需要 ["ES2024", "DOM"] 或更高. DOM 让你认识 window、document 这些浏览器专属的东西.
+
+**纯 Node.js 项目(不碰浏览器):** 只需要 ["ES2024"], 不需要 DOM. 加了 DOM 反而可能让你误用浏览器 API, 而 Node 里根本没有.
+
+**打包器项目:** 同浏览器项目, 按你的目标环境选 ES 版本 + DOM.
+
+**一个常见场景**
+
+如果你在 Node.js 里写代码, 却忘了排除 DOM, TypeScript 会允许你写 localStorage.setItem(...), 类型检查一路绿灯, 但运行时直接报错——Node 里没有 localStorage. 把 lib 设成只包含 ES 版本, 就能在编译阶段拦住这种错误.
+
+**一句话总结**
+
+lib = 你允许代码使用哪些内置全局功能的类型说明. 浏览器项目加 DOM, 纯 Node 项目别加.
+
+==== Q8: isolatedModules参数讲解
+
+isolatedModules 管的是另一件事: **确保你的每个 .ts 文件都能被"单独"编译, 而不依赖其他文件的信息.**
+
+**它到底在做什么**
+
+平时 tsc 编译时, 会通读你所有的文件, 理解它们之间的关联后再输出代码. 但像 esbuild、SWC、Babel 这类工具, 为了追求速度, 是**一个文件一个文件单独处理**的, 它们不会(也无法)去查看别的文件来搞清楚某个名字是"类型"还是"值".
+
+isolatedModules 开启后, TypeScript 会提前检查你的代码, **禁止那些"必须跨文件分析才能正确编译"的写法**, 逼你改成单文件就能安全编译的形式.
+
+**什么情况下需要开**
+
+只要你用了**非 tsc 的编译器**(esbuild、SWC、Babel、Vite 内置的 esbuild 等), 就应该打开它.
+
+实际收益也很直接: Angular 官方在启用该选项后, 生产构建速度提升了最高 10%.
+
+**它禁止哪些写法**
+
+最典型的一个例子是**重新导出类型时没加 type 关键字**:
+
+[source, typescript]
+----
+// 会被 isolatedModules 报错
+export { SomeType } from './types';
+
+// 正确写法
+export type { SomeType } from './types';
+----
+
+因为单文件编译器不知道 SomeType 是类型还是值. 不加 type, 它可能会生成一个运行时会报错的 import 语句. 加了 type, 编译器就知道这个导入在编译后可以安全删除.
+
+另外, const enum 和 export = 这类需要跨文件信息才能处理的语法也会被限制.
+
+**一句话总结**
+
+用 Vite / webpack(底层是 esbuild/SWC)这类打包器 -> 在 tsconfig.json 里加上 "isolatedModules": true, 让 TypeScript 提前拦住那些打包器处理不了的写法.
+
+==== Q9: isolatedModules参数讲解
+
+moduleDetection 管的是: **TypeScript 如何判断一个文件是"模块"还是"全局脚本".**
+
+这听起来很抽象, 但它直接影响一个很实际的问题: **你文件里定义的变量、函数, 会不会莫名其妙地"泄漏"到其他文件里, 变成全局变量.**
+
+**默认行为为什么可能出问题**
+
+默认情况下(auto 模式), TypeScript 主要看文件里有没有 import 或 export 语句. 有, 就是模块, 作用域隔离; 没有, 就当作全局脚本, 里面定义的东西别的文件也能直接访问.
+
+问题在于: 如果你新建一个工具文件, 只是写了个函数, 还没写 export, 它里面的变量就可能变成全局的. 另一个文件里同名变量就会直接冲突报错, 让人摸不着头脑.
+
+**三个选项的区别**
+
+[cols="1,5"]
+|===
+|选项|行为
+
+|auto(默认)|看有没有 import/export, 同时结合 module 和 jsx 的设置综合判断
+|legacy|只看有没有 import/export, 和 TypeScript 4.6 之前一样
+|force|强制把所有非声明文件都当作模块, 不管有没有 import/export
+|===
+
+**实际建议**
+
+**直接设成 "force".**
+
+理由很简单: 现代项目几乎都是模块化开发, 每个文件本来就该有自己的作用域. force 让你新建文件时不用担心"忘了写 export 导致变量泄漏"这种低级问题. Total TypeScript 的作者也把它列入了推荐配置, 认为它更贴近你实际编码的环境.
+
+[source, json]
+----
+"moduleDetection": "force"
+----
+
+一句话总结: moduleDetection: "force" 让每个文件都自动成为独立模块, 避免意外产生的全局变量冲突.
+
+==== Q10: noEmit参数讲解
+
+noEmit 管的是: **TypeScript 只做类型检查, 不生成任何 JS 文件.**
+
+**它到底在做什么**
+
+通常 tsc 编译后, 会在你旁边生成一堆 .js 文件(可能还有 .d.ts、.js.map). noEmit: true 会关掉这个输出行为, tsc 跑完只告诉你**有没有类型错误**, 磁盘上什么都不多出来.
+
+**什么时候用**
+
+用打包器时(Vite、webpack、esbuild 等), 就应该开:
+
+[source, json]
+----
+"noEmit": true
+----
+
+因为真正的 JS 输出由打包器负责, tsc 再生成一份 .js 是多余的, 甚至会和新产物冲突. 这时 tsc 的角色纯粹是"类型检查器".
+
+直接靠 tsc 编译时(比如写 npm 库、Node 后端), 就不能开, 否则没有 JS 可运行.
+
+**一个容易踩的坑**
+
+如果你用 Vite 的模板, 有时会看到 tsconfig.json 里有 noEmit, 但 npm run build 却能生成产物--那是因为 build 脚本先跑 tsc(只检查类型), 再跑 vite build(真正打包). 两个工具各司其职, 不矛盾.
+
+**一句话总结**
+
+有打包器负责生成 JS -> noEmit: true, 让 tsc 只当检查员; 靠 tsc 自己出 JS -> 不要开.
+
 === 总结
 
 [cols="1,5"]
@@ -569,13 +732,13 @@ import express from 'express';  // 而不是 import * as express from 'express'
 |场景 |推荐配置
 
 |Node.js 后端
-|target: "ES2020", module: "CommonJS", strict: true
+|target: "ESNext", module: "NodeNext", strict: true
 
 |React 前端
-|target: "ES2020", jsx: "react-jsx", strict: true
+|target: "ESNext", jsx: "react-jsx", strict: true
 
 |库/包开发
-|declaration: true, target: "ES2015"
+|declaration: true, target: "ESNext"
 
 |Next.js 项目
 |使用框架自带配置, 补充自定义 paths
