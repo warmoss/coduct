@@ -825,6 +825,10 @@ Vulkan 通过**扩展(Extension)** 持续演进, 成熟后被提升为核心版�
 
 . 用 **RenderDoc** 抓一帧, 观察每个 draw call 的管线状态、描述符与屏障, 这是从"能跑"到"能调"的关键一步.
 
+=== 学习资料
+
+* **Vulkan教程:** https://zeromake.github.io/VulkanTutorialCN/
+
 === 总结
 
 * **Vulkan 的本质**是把驱动里的隐式工作显式化: 内存、同步、状态、生命周期全部由应用负责.
