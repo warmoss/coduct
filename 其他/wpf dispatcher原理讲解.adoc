@@ -1,0 +1,514 @@
+== WPF Dispatcher 原理讲解
+
+WPF 的 UI 不是线程安全的: 每个 `DependencyObject` 都"属于"创建它的那个线程, 其他线程碰它就会抛异常. 这条约束换来的是**无锁的 UI 代码**——布局、输入、渲染可以放心地读写同一棵视觉树, 无需为每个控件加锁.
+
+代价是: 后台线程算出来的结果不能直接塞给控件. 于是 WPF 引入 **Dispatcher**, 它是**线程的消息循环 + 按优先级排序的工作项队列**.
+
+Dispatcher:: 与某个线程一一绑定的调度器, 负责在该线程上按优先级顺序执行工作项, 同时泵送该线程的 Win32 消息.
+
+因此"把结果送回 UI 线程"本质上是"把委托塞进 UI 线程的 Dispatcher 队列, 由它在 UI 线程上执行". 理解 WPF 的 Dispatcher, 等价于理解四件事: **谁是 UI 线程、工作项怎么排队、消息泵怎么转、异步怎么回到 UI 线程**.
+
+一句话概括: **Dispatcher 是 WPF 版的 `PostMessage` 加优先级队列, 是单线程 UI 模型的调度中枢.**
+
+=== 核心概念
+
+Dispatcher:: 线程级调度器, 每线程最多一个. `Dispatcher.CurrentDispatcher` 取当前线程的实例(没有则创建), `Dispatcher.FromThread(thread)` 取指定线程的实例(没有则返回 `null`).
+
+DispatcherObject:: 所有需要线程亲和性的 WPF 对象的基类(`DependencyObject` 继承它). 它记录自己所属的 `Dispatcher`, 并用 `CheckAccess` / `VerifyAccess` 校验访问者线程.
+
+DispatcherOperation:: 一个已入队的工作项, 持有委托、参数、优先级、状态与结果. `InvokeAsync` / `BeginInvoke` 返回它, 可 `Abort` / `Wait` / `await`.
+
+DispatcherFrame:: 一次"消息泵的生命周期". `PushFrame` 让当前线程进入消息循环, 直到 `frame.Continue = false`, 支持嵌套.
+
+DispatcherPriority:: 工作项的优先级(数值越大越优先), 同一优先级内 FIFO.
+
+DispatcherSynchronizationContext:: `SynchronizationContext` 的 WPF 实现, 把 `Post` 转成 `BeginInvoke`, 是 `async/await` 能回到 UI 线程的桥梁.
+
+消息窗口:: Dispatcher 依赖一个隐藏的 message-only 窗口与 Win32 消息循环(`GetMessage` / `TranslateMessage` / `DispatchMessage`).
+
+=== 线程亲和性: DispatcherObject
+
+`DispatcherObject` 在构造时把当前线程的 Dispatcher 记录在字段中, 之后任何访问都要过 `CheckAccess()`:
+
+[source,csharp]
+----
+// 源码的简化示意
+public abstract class DispatcherObject
+{
+    private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;   // <1>
+
+    public Dispatcher Dispatcher => _dispatcher;
+
+    public bool CheckAccess() => _dispatcher.CheckAccess();                   // <2>
+
+    public void VerifyAccess() => _dispatcher.VerifyAccess();                 // <3>
+}
+----
+<1> 对象在哪个线程创建, 就绑定哪个线程的 Dispatcher
+<2> 返回"当前线程是否就是 Dispatcher 所在线程", 用于分支判断
+<3> 不是则抛 `InvalidOperationException`: 调用线程无法访问此对象, 因为另一个线程拥有该对象
+
+典型的跨线程冲突:
+
+[source,csharp]
+----
+var textBox = new TextBox();          // UI 线程创建, 属于 UI 线程
+
+await Task.Run(() =>
+{
+    textBox.Text = "hello";           // InvalidOperationException
+});
+----
+
+例外是 `Freezable`(`Brush` / `Geometry` / `Transform` 等): 调用 `Freeze()` 后可跨线程只读共享, 因为它不再是"会变的状态". 数据绑定集合同理, 跨线程更新 `ObservableCollection` 需配合 `BindingOperations.EnableCollectionSynchronization`.
+
+=== Dispatcher 的内部结构
+
+==== 与线程一一绑定
+
+Dispatcher 不是单例, 而是"每线程一个":
+
+* `Dispatcher.CurrentDispatcher`: 当前线程的实例, 首次访问时创建并绑定该线程
+* `DispatcherObject.Dispatcher`: 对象自己所属的 Dispatcher, 跨线程时用它把工作送回去
+* `Application.Current.Dispatcher`: WPF 应用的 UI 线程 Dispatcher(`Application.Run()` 内部就是 `Dispatcher.Run()`)
+* `Dispatcher.FromThread(thread)`: 查询某线程的 Dispatcher, 没有则返回 `null`
+
+在非 UI 线程上调用 `Dispatcher.CurrentDispatcher` 会**为它创建一个新的 Dispatcher**, 而这个 Dispatcher 没有任何消息泵在跑, 入队的工作永远不执行, 是常见的陷阱(后文详述).
+
+==== 优先级队列
+
+Dispatcher 内部维护 **11 条队列**, 下标即优先级数值(0 到 10):
+
+[cols="1,1,2"]
+|===
+| 优先级 | 数值 | 典型用途
+
+| `Inactive` | 0 | 不会被自动处理, 仅占位
+| `SystemIdle` | 1 | 系统空闲时才处理
+| `ApplicationIdle` | 2 | 应用空闲时才处理
+| `ContextIdle` | 3 | 在更高优先级的工作全部完成后的空闲期处理
+| `Background` | 4 | 后台任务; `DispatcherTimer` 默认优先级
+| `Input` | 5 | 与输入同级的延迟工作
+| `Loaded` | 6 | 布局/渲染完成后(`Loaded` 事件)
+| `Render` | 7 | 渲染相关(`CompositionTarget.Rendering`)
+| `DataBind` | 8 | 绑定更新
+| `Normal` | 9 | 一般工作; `BeginInvoke` / `SynchronizationContext.Post` 默认
+| `Send` | 10 | 最高; `Invoke` 默认
+|===
+
+出队算法简单粗暴: **从 `Send` 往下扫, 找到第一条非空队列就取队首**, 开销固定为 11 次比较:
+
+[source,csharp]
+----
+// 简化示意: PriorityQueue 内部就是 Queue<DispatcherOperation>[11]
+internal DispatcherOperation Dequeue()
+{
+    for (int i = _queues.Length - 1; i >= 0; i--)      // Send(10) -> Inactive(0)
+    {
+        if (_queues[i].Count > 0)
+            return _queues[i].Dequeue();
+    }
+    return null;
+}
+----
+
+由此得到两个直接推论:
+
+* **同级 FIFO, 跨级严格优先**: 只要 `Normal` 队列一直非空, `Background` / `Render` 就永远排不上, 界面表现就是"卡住不动"
+* **数值越大越急**: `Normal`(9) 高于 `Render`(7), 所以在 UI 线程持续灌入 `Normal` 工作会推迟渲染, 表现为"线程很忙但界面不刷新"
+
+[plantuml, "Dispatcher 内部结构", format=png]
+----
+@startuml
+rectangle "UI 线程 (STA)" {
+  rectangle "Win32 消息队列" as MQ
+  rectangle "消息循环\nGetMessage / TranslateMessage / DispatchMessage" as PUMP
+  rectangle "Dispatcher" as D {
+    queue "PriorityQueue\nInactive(0) ... Send(10) 共 11 条" as PQ
+    rectangle "Hooks\nOperationPosted / Started / Completed" as HK
+  }
+  rectangle "隐藏消息窗口\n(message-only window)" as HWND
+  rectangle "DispatcherFrame" as FRAME
+}
+
+PUMP --> MQ : 取消息
+FRAME --> PUMP : PushFrame 驱动
+HWND --> D : WndProc 收到注册消息
+D --> PQ : Enqueue / Dequeue
+D --> HK : 触发钩子
+@enduml
+----
+
+==== 隐藏消息窗口与唤醒机制
+
+工作项入队后必须让线程的 `GetMessage` 醒来, 否则队列没人处理. Dispatcher 的做法是:
+
+. 创建一个 **message-only 窗口**(父窗口为 `HWND_MESSAGE`), 只用于收发消息, 不显示
+. 通过 `RegisterWindowMessage("DispatcherProcessQueue")` 注册一条私有消息
+. 入队后 `PostMessage` 这条消息给自己的隐藏窗口
+. 消息循环取到该消息, WndProc 中调用 `ProcessQueue()`, 逐个执行工作项
+
+这也解释了为什么**阻塞 UI 线程会让 `InvokeAsync` 的委托永不执行**: 线程卡在同步代码里, 消息循环转不动, 队列里的工作项发不出去.
+
+=== 工作项: DispatcherOperation
+
+==== 三种投递方式
+
+[cols="1,1,2"]
+|===
+| API | 是否等待 | 说明
+
+| `Invoke(...)` | 是(同步) | 默认 `Send` 优先级; 若已在 UI 线程则**直接内联执行**, 不入队
+| `BeginInvoke(...)` | 否 | 旧 API, 委托参数非泛型; 默认 `Normal`
+| `InvokeAsync(...)` | 否 | 推荐; 默认 `Normal`, 返回 `DispatcherOperation` / `DispatcherOperation<T>`(带 `Task`)
+|===
+
+[source,csharp]
+----
+Dispatcher.Invoke(() => listBox.Items.Add("sync"));                      // 阻塞到执行完
+
+DispatcherOperation op = Dispatcher.InvokeAsync(
+    () => listBox.Items.Add("async"),
+    DispatcherPriority.Background);
+
+int count = await Dispatcher.InvokeAsync(() => listBox.Items.Count);     // 泛型版本可直接 await
+----
+
+==== 状态机与取消
+
+每个工作项都会经历 `Pending -> Executing -> Completed`(或被 `Abort` 打断), 状态通过 `Status` 暴露, 生命周期上有 `Completed` / `Aborted` 事件:
+
+[source,csharp]
+----
+var op = Dispatcher.InvokeAsync(DoHeavyWork, DispatcherPriority.Background);
+
+if (op.Status == DispatcherOperationStatus.Pending)      // <1>
+    op.Abort();                                          // <2>
+
+await op.Task;                                           // <3>
+----
+<1> 只有尚未开始执行时才可能取消成功
+<2> `Abort` 只是"不再执行", 已经在执行的工作项无法中断
+<3> `DispatcherOperation.Task` 把结果与异常包装成 `Task`, 异常不会丢失
+
+[NOTE]
+====
+`Invoke` 在 UI 线程上调用时是**内联执行**而非入队, 因此它不会"排在队列后面". 想强制走队列并保持顺序, 用 `InvokeAsync` + `await`.
+====
+
+==== 一个工作项的完整旅程
+
+[plantuml, "工作项投递与执行流程", format=png]
+----
+@startuml
+participant "调用方" as C
+participant "Dispatcher" as D
+participant "PriorityQueue" as Q
+participant "隐藏消息窗口" as H
+participant "目标线程" as T
+
+C -> D: InvokeAsync(delegate, Normal)
+D -> Q: Enqueue(Normal, operation)
+D -> H: PostMessage(DispatcherProcessQueue)
+C --> C: 立即返回 DispatcherOperation
+H -> T: GetMessage 取到注册消息
+T -> Q: Dequeue(): Send -> Inactive 扫描
+Q --> T: 弹出 Normal 工作项
+T -> T: 执行 delegate, 记录结果/异常
+T --> C: 置 Completed, 完成 Task
+@enduml
+----
+
+=== 消息泵与 DispatcherFrame
+
+==== PushFrame: 一次可嵌套的消息循环
+
+`Dispatcher.Run()` 的实现就是"推一个永不结束的帧":
+
+[source,csharp]
+----
+public static void Run()
+{
+    PushFrame(new DispatcherFrame());     // Continue 恒为 true, 直到 InvokeShutdown
+}
+----
+
+`DispatcherFrame` 用 `Continue` 控制循环是否继续, 因此带来两个重要能力:
+
+* **嵌套消息泵**: 在消息处理函数里再开一个循环, 内层退出后外层从原处继续
+* **有条件地等待**: 等某个条件成立再退出, 期间界面依然响应
+
+WPF 的 `Window.ShowDialog()` 就是典型用法: 它 `PushFrame` 出一个内层循环, 用户关窗时把 `Continue` 置为 `false`, 于是方法"看似同步返回", 但期间界面完全响应.
+
+[plantuml, "嵌套消息泵", format=png]
+----
+@startuml
+rectangle "Frame A: Dispatcher.Run()" as A {
+  rectangle "Button.Click 处理" as H {
+    rectangle "Frame B: ShowDialog()" as B {
+      rectangle "Frame C: 手动 PushFrame\n(等待条件, 类似 DoEvents)" as C
+    }
+  }
+}
+note bottom of B : 内层循环退出后\n外层从原处继续执行
+@enduml
+----
+
+手写一个 `DoEvents` 式的"把消息泵转一圈":
+
+[source,csharp]
+----
+public static void DoEvents()
+{
+    var frame = new DispatcherFrame();
+    Dispatcher.CurrentDispatcher.InvokeAsync(
+        () => frame.Continue = false, DispatcherPriority.Background);   // <1>
+    Dispatcher.PushFrame(frame);                                        // <2>
+}
+----
+<1> 队列里排一个"停止帧"的工作项, 保证循环至少转一圈
+<2> 期间所有消息(点击、重绘)都会被处理
+
+[WARNING]
+====
+`DoEvents` 让"当前处理的逻辑"与"新到达的输入"交错执行, 即可重入. 绝大多数"按钮点两次、业务扣两次"的 bug 都源于此. 现代写法应优先 `await`, 让编译器生成状态机, 而不是手搓消息泵.
+====
+
+==== 防止重入: DisableProcessing
+
+需要"这段代码执行期间不接受新的消息派发"时, 可以用 `Dispatcher.DisableProcessing()`:
+
+[source,csharp]
+----
+using (Dispatcher.DisableProcessing())
+{
+    // 期间 Dispatcher 不会取出新的消息或工作项
+    UpdateInconsistentState();       // 保证中间状态不被外部观察到
+}
+----
+
+它属于"框架内部也在使用"的高级工具, 业务代码不应依赖它来掩盖设计问题.
+
+==== Yield: 主动让出
+
+长循环中想让 UI 喘口气, 用 `Dispatcher.Yield` 把控制权交回消息循环:
+
+[source,csharp]
+----
+for (int i = 0; i < items.Count; i++)
+{
+    Process(items[i]);
+    if (i % 100 == 0)
+        await Dispatcher.Yield(DispatcherPriority.Background);   // <1>
+}
+----
+<1> 让渲染与输入有机会插进来, 避免整个循环"独吞"UI 线程
+
+=== 与 async/await 的协作
+
+==== SynchronizationContext 是桥
+
+Dispatcher 创建时, 若当前线程还没有 `SynchronizationContext`, 会安装一个 `DispatcherSynchronizationContext`:
+
+[source,csharp]
+----
+public sealed class DispatcherSynchronizationContext : SynchronizationContext
+{
+    public override void Post(SendOrPostCallback d, object state)
+        => _dispatcher.BeginInvoke(_priority, d, state);        // 投递, 不等待
+
+    public override void Send(SendOrPostCallback d, object state)
+        => _dispatcher.Invoke(_priority, d, state);             // 同步执行
+}
+----
+
+`await` 的本质就是: 捕获当前 `SynchronizationContext`, 在线程池完成异步操作后, 让 await 之后的续体通过 `Post` 回到该上下文. 所以 **UI 线程上的 `await` 天然回到 UI 线程**, 不需要 `Invoke`.
+
+[plantuml, "await 在 UI 线程上的往返", format=png]
+----
+@startuml
+participant "UI 线程" as UI
+participant "DispatcherSynchronizationContext" as SC
+participant "线程池 / IO" as TP
+
+UI -> TP: await 一个异步操作 (不阻塞)
+note over UI : 消息泵继续处理输入与渲染
+TP -> SC: 操作完成, 调度续体
+SC -> UI: BeginInvoke(Normal, continuation)
+UI -> UI: 继续执行 await 之后的代码
+@enduml
+----
+
+[source,csharp]
+----
+private async void OnRefresh(object sender, RoutedEventArgs e)
+{
+    statusText.Text = "加载中...";                              // UI 线程
+
+    var data = await _service.LoadAsync();                      // 不阻塞 UI
+    listBox.ItemsSource = data;                                // await 之后仍在 UI 线程
+
+    await Task.Delay(1000);                                    // 定时器在后台, 续体回 UI 线程
+    statusText.Text = "完成";
+}
+----
+
+==== ConfigureAwait(false) 的代价
+
+库代码里 `ConfigureAwait(false)` 避免回到 UI 线程, 是性能与死锁规避的常规手段; 但**在 UI 代码里**它会让你"悄悄跑到线程池上", 之后的控件访问就抛 `InvalidOperationException`:
+
+[source,csharp]
+----
+var data = await _service.LoadAsync().ConfigureAwait(false);
+listBox.ItemsSource = data;      // 可能在非 UI 线程上执行 -> 抛异常
+----
+
+规则: **需要访问 UI 的地方不要 `ConfigureAwait(false)`**; 不需要碰 UI 的底层库代码则应该加上.
+
+==== 后台线程如何回到 UI 线程
+
+三种正确姿势, 从推荐到次选:
+
+[source,csharp]
+----
+// 1. 首选: 让 await 帮你回来
+var result = await Task.Run(() => Compute());
+
+// 2. 已有后台线程时, 显式投递
+await Dispatcher.InvokeAsync(() => progress.Value = 50);
+
+// 3. 需要"要不要投递"的判断时
+if (Dispatcher.CheckAccess()) UpdateUi();
+else Dispatcher.InvokeAsync(UpdateUi);
+----
+
+=== 常见场景
+
+==== 进度与状态更新
+
+`IProgress<T>` 在 UI 线程创建时会自动捕获当前 `SynchronizationContext`, 因此 `Report` 天然回到 UI 线程:
+
+[source,csharp]
+----
+var progress = new Progress<int>(p => progressBar.Value = p);   // UI 线程创建
+
+await Task.Run(() => Compute(progress));                        // 回调在 UI 线程执行
+----
+
+==== 定时器
+
+`DispatcherTimer` 的 `Tick` 在 UI 线程执行, 可以安全访问控件; 默认优先级是 `Background`:
+
+[source,csharp]
+----
+var timer = new DispatcherTimer(DispatcherPriority.Background)
+{
+    Interval = TimeSpan.FromMilliseconds(500)
+};
+timer.Tick += (s, e) => clockText.Text = DateTime.Now.ToString("HH:mm:ss");
+timer.Start();
+----
+
+若不需要碰控件, 用 `System.Threading.Timer` / `PeriodicTimer` 更轻; 若要精确到帧, 用 `CompositionTarget.Rendering`.
+
+==== 批量合并高频更新
+
+后台高频产生数据时, 逐个 `InvokeAsync` 会把队列灌满并挤掉渲染. 常见做法是"脏标记 + 合并":
+
+[source,csharp]
+----
+private bool _refreshQueued;
+
+private void RequestRefresh()
+{
+    if (_refreshQueued) return;
+    _refreshQueued = true;
+
+    Dispatcher.InvokeAsync(() =>
+    {
+        _refreshQueued = false;
+        chart.Update();                  // 一批更新只刷一次
+    }, DispatcherPriority.Background);
+}
+----
+
+=== 常见误区
+
+**在非 UI 线程调用 `Dispatcher.CurrentDispatcher`.** 它会为该线程创建一个 Dispatcher, 但没有人泵送它, 入队的工作永不执行, 且工作项被 Dispatcher 强引用而泄漏:
+
+[source,csharp]
+----
+// 错误: 线程池线程上新建的 Dispatcher 永远不会运行
+ThreadPool.QueueUserWorkItem(_ =>
+{
+    Dispatcher.CurrentDispatcher.BeginInvoke(() => Console.WriteLine("永不输出"));
+});
+----
+
+需要跨线程投递时, 应持有 **UI 线程的** Dispatcher 引用(或控件自身的 `Dispatcher`).
+
+**`Invoke` 造成的死锁.** 后台线程 `Invoke`, 而 UI 线程正同步等待该后台线程, 就会互相等待:
+
+[source,csharp]
+----
+var task = Task.Run(() => Dispatcher.Invoke(() => UpdateUi()));
+task.Wait();          // UI 线程阻塞等待 -> 死锁
+----
+
+在 UI 线程上等待(`.Result` / `.Wait()` / `Thread.Sleep`)是 WPF 卡顿与死锁的头号来源, 一律换成 `await`.
+
+**同线程 `Invoke` 的隐式重入.** `Invoke` 在 UI 线程上会直接执行, 若它在一个事件处理中被调用, 可能打断"正在进行的半成品状态":
+
+[source,csharp]
+----
+void OnClick(object sender, RoutedEventArgs e)
+{
+    _inProgress = true;
+    Dispatcher.Invoke(() => _inProgress = false);   // 立刻执行, 不是排队
+}
+----
+
+要排队, 用 `InvokeAsync`.
+
+**用 `Thread.Sleep` 做"等待".** 它让消息循环停摆, 界面冻住且不再重绘:
+
+[source,csharp]
+----
+Thread.Sleep(2000);                  // 界面完全冻结
+await Task.Delay(2000);              // 正确: 消息泵继续运行
+----
+
+**`async void` 吞异常.** 除事件处理函数外一律用 `async Task`; `async void` 中抛出的异常直接落到 `Dispatcher.UnhandledException`, 调用方无法捕获.
+
+**持续灌入高优先级工作导致饥饿.** 只要 `Normal` 队列非空, `Render` / `Background` 就排不上, 表现为"CPU 不高但界面不动". 后台类工作应显式降到 `Background`, 大任务切片并配合 `Dispatcher.Yield`.
+
+**误以为 Dispatcher 就是渲染线程.** 渲染由独立的合成线程完成, UI 线程只负责构建视觉树并提交指令. UI 线程一旦阻塞就停止提交, 动画与滚动随之停滞.
+
+=== 与其他 UI 框架的对照
+
+[cols="1,2,2"]
+|===
+| 能力 | WPF | 对照
+
+| 调度器 | `Dispatcher` | WinForms 依赖 `Control.BeginInvoke`(内部走窗口句柄), 无独立队列类型
+| 消息循环 | `DispatcherFrame` / `PushFrame` | WinForms 的 `Application.DoEvents`
+| 同步上下文 | `DispatcherSynchronizationContext` | WinForms 的 `WindowsFormsSynchronizationContext`
+| 定时器 | `DispatcherTimer` | 同为消息驱动的 UI 定时器
+|===
+
+=== 总结
+
+* WPF 是**单线程 UI 模型**: `DispatcherObject` 通过 `CheckAccess` 强制线程亲和性, 换来无锁的 UI 代码
+* **Dispatcher 是线程级调度器**: 11 条优先级队列加 Win32 消息泵, 入队后靠 `PostMessage` 唤醒隐藏消息窗口
+* **`Invoke` 同步、`InvokeAsync` 异步**: UI 线程上调用 `Invoke` 会内联执行, 优先用 `InvokeAsync` + `await`
+* **`SynchronizationContext` 是 `await` 回到 UI 线程的机制**, UI 代码不要滥用 `ConfigureAwait(false)`
+* **`PushFrame` 支持嵌套消息泵**, 也是 `ShowDialog` 与 `DoEvents` 可重入问题的根源
+* **阻塞 UI 线程等于冻结一切**: 长任务丢给后台, 高频更新合并投递, 大循环用 `Dispatcher.Yield` 切片
+
+=== 参考资料
+
+WPF 源码 (Dispatcher / DispatcherOperation / PriorityQueue): https://github.com/dotnet/wpf/blob/main/src/Microsoft.DotNet.Wpf/src/WindowsBase/System/Windows/Threading/Dispatcher.cs
+
+官方文档 - WPF 线程模型: https://learn.microsoft.com/dotnet/desktop/wpf/advanced/threading-model
+
+官方文档 - DispatcherPriority: https://learn.microsoft.com/dotnet/api/system.windows.threading.dispatcherpriority

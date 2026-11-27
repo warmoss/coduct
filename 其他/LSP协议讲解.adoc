@@ -1,0 +1,524 @@
+== LSP协议讲解
+
+现代编辑器需要为每种语言提供补全, 跳转, 诊断等能力. 若每个编辑器各自实现全部语言, 集成成本是 M 个编辑器 × N 种语言; 引入统一协议后, 成本降为 M 个客户端 + N 个服务器. LSP (Language Server Protocol) 正是这一层标准: 它由 Microsoft 于 2016 年为 VS Code 设计, 现已成为编辑器与语言工具之间的事实标准. 当前稳定版本为 3.18, 3.19 正在制定中.
+
+=== 什么是 LSP
+
+LSP (Language Server Protocol):: 基于 JSON-RPC 2.0 的**双向通信协议**, 规定编辑器(客户端)如何请求补全, 悬停, 跳转, 诊断等语言功能, 以及语言服务器如何反向通知客户端刷新状态.
+
+它把**语言智能**与**编辑器 UI** 彻底解耦:
+
+* **语言服务器**: 由语言社区或厂商实现, 负责解析, 类型检查, 建索引, 不关心编辑器界面
+* **编辑器客户端**: 负责触发请求, 渲染结果, 管理服务器进程, 不关心语言语义
+* **协议**: 只约定消息格式与能力声明, 不限定实现语言与进程模型
+
+[cols="2,5"]
+|===
+| 阶段 | 集成方式
+
+| LSP 之前
+| 每个编辑器为每种语言编写插件, 集成成本为 M × N
+| LSP 之后
+| 每种语言实现一个服务器, 每个编辑器实现一个客户端, 成本降为 M + N
+|===
+
+=== 核心架构
+
+LSP 采用客户端-服务器模型, 双方通常运行在**独立进程**中:
+
+Language Client:: 内置于编辑器, 负责启动与重启服务器, 同步文档, 路由请求. 典型实现有 VS Code 的 `vscode-languageclient`, Neovim 的 `vim.lsp`.
+
+Language Server:: 独立进程, 持有文档镜像与项目索引, 对外提供语言能力. 典型实现有 clangd, gopls, rust-analyzer, pyright, Eclipse JDT LS.
+
+Transport:: 承载 JSON-RPC 消息的通道, 支持标准输入输出 (stdio), 命名管道, Socket, Node.js IPC. stdio 最常用, 服务器无需监听端口.
+
+[[lsp-architecture]]
+[plantuml, "LSP 架构概览", format=png]
+----
+@startuml
+actor 用户 as User
+
+package "编辑器 (Language Client)" {
+  [编辑器 UI] as UI
+  [LSP Client] as Client
+}
+
+package "语言服务器 (Language Server)" {
+  [文档同步] as Sync
+  [解析与语义分析] as Analysis
+  [项目索引] as Index
+}
+
+database "项目文件" as FS
+
+User --> UI: 编辑, 触发语言功能
+UI --> Client: 请求补全, 跳转, 悬停
+Client <--> Sync: JSON-RPC (stdio / socket)
+Sync --> Analysis: 提供最新文档
+Analysis --> Index: 查询符号与引用
+Index --> FS: 读取项目文件
+Analysis --> Client: 诊断, 进度, 日志
+@enduml
+----
+
+NOTE: LSP 只规定消息格式, 不规定服务器实现. 服务器可以用任意语言编写, 只要能与客户端收发 JSON-RPC 消息.
+
+=== 协议基础
+
+==== 消息类型
+
+LSP 复用 JSON-RPC 2.0 的三种消息:
+
+[cols="2,4,4"]
+|===
+| 类型 | 结构 | 用途
+
+| 请求 (Request)
+| `id`, `method`, `params`
+| 需要结果的双向调用, 如 `textDocument/hover`; 响应必须携带 `result` 或 `error`
+| 通知 (Notification)
+| `method`, `params`, 无 `id`
+| 单向消息, 不需响应, 如 `textDocument/didChange`, `initialized`
+| 响应 (Response)
+| `id`, `result` 或 `error`
+| 与请求按 `id` 配对, 允许乱序返回
+|===
+
+消息可以由客户端发起, 也可以由服务器发起, 例如服务器通过 `workspace/applyEdit` 请求客户端应用编辑, 通过 `workspace/configuration` 读取配置, 通过 `client/registerCapability` 动态注册能力.
+
+==== 报文格式
+
+基础协议采用 `Content-Length` 头部帧格式, 不使用 HTTP 语义:
+
+[source,text]
+----
+Content-Length: 137\r\n
+Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n
+\r\n
+{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{...}}
+----
+
+* 头部为 ASCII, 每行以 `\r\n` 结束, 空行后为消息体
+* `Content-Length` 是消息体的**字节数**, 不是字符数, 示例中的数值仅作占位
+* 消息体为 UTF-8 编码的 JSON 文本
+
+一次完整的悬停交互:
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "textDocument/hover",
+  "params": {
+    "textDocument": { "uri": "file:///d%3A/demo/main.ts" },
+    "position": { "line": 3, "character": 7 }
+  }
+}
+----
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "contents": {
+      "kind": "markdown",
+      "value": "`greet`: (name: string) => string"
+    }
+  }
+}
+----
+
+==== 位置与文档模型
+
+LSP 不传输整个 AST, 只传输**位置**与**编辑**, 因此位置语义必须精确:
+
+Position:: `line` 与 `character`, 均从 **0 开始**; `line` 按行计, `character` 按 **UTF-16 码元**计.
+
+Range:: 由 `start` 与 `end` 组成, `end` **不包含**在内.
+
+Location:: `uri` 加 `Range`, 用于表示定义, 引用等跳转目标.
+
+TextEdit:: `range` 加 `newText`, 表示对文档区间的一次替换.
+
+VersionedTextDocumentIdentifier:: `uri` 加 `version`, 用于增量同步时校验文档版本.
+
+[WARNING]
+====
+`character` 的默认编码是 **UTF-16**, 一个 emoji 占 2 个码元. 若服务器按 UTF-8 字节或 Unicode 码点计算偏移, 补全与跳转的位置会整体错位.
+
+LSP 3.17 起, 客户端可通过 `general.positionEncodings` 声明支持的编码 (utf-8, utf-16, utf-32), 服务器在 `InitializeResult.positionEncoding` 中选定一种.
+====
+
+==== 能力协商
+
+初始化阶段双方交换能力声明, 之后只使用**双方都支持**的特性:
+
+[cols="2,4,4"]
+|===
+| 能力 | 客户端声明 | 服务器声明
+
+| 补全
+| `textDocument.completion.completionItem.snippetSupport`
+| `completionProvider.triggerCharacters`
+| 文档同步
+| `textDocument.synchronization.dynamicRegistration`
+| `textDocumentSync.change` (0 不同步 / 1 全量 / 2 增量)
+| 诊断
+| `textDocument.publishDiagnostics.relatedInformation`
+| `diagnosticProvider` (拉取模式)
+| 语义高亮
+| `textDocument.semanticTokens.tokenTypes`
+| `semanticTokensProvider.legend`
+| 工作区
+| `workspace.workspaceFolders`
+| `workspace.workspaceFolders.supported`
+|===
+
+能力可以**静态声明**, 也可以在运行期通过 `client/registerCapability` 动态注册, 例如服务器按需注册文件监听 `workspace/didChangeWatchedFiles`.
+
+[[lsp-lifecycle]]
+=== 生命周期
+
+[plantuml, "LSP 生命周期", format=png]
+----
+@startuml
+participant "编辑器 (Client)" as C
+participant "语言服务器 (Server)" as S
+
+C -> S: initialize(id=1, capabilities, workspaceFolders)
+S --> C: InitializeResult(serverCapabilities, positionEncoding)
+C -> S: initialized (通知)
+|||
+C -> S: textDocument/didOpen (通知)
+C -> S: textDocument/hover (请求, id=2)
+S --> C: Hover 结果
+S -> C: textDocument/publishDiagnostics (通知)
+|||
+C -> S: shutdown (请求)
+S --> C: null
+C -> S: exit (通知)
+@enduml
+----
+
+[cols="2,2,5"]
+|===
+| 消息 | 方向 | 规则
+
+| `initialize`
+| Client → Server
+| 必须是客户端发出的第一个请求, 携带客户端能力, 根 URI, 初始化选项
+| `InitializeResult`
+| Server → Client
+| 返回服务器能力, `positionEncoding`, `serverInfo`
+| `initialized`
+| Client → Server
+| 通知; 在此之前服务器只能发送 `window/logMessage` 等有限消息
+| `shutdown`
+| Client → Server
+| 请求优雅退出, 服务器返回 `null`, 之后不再接受请求
+| `exit`
+| Client → Server
+| 通知退出; 收到过 `shutdown` 则以状态码 0 退出, 否则以 1 退出
+|===
+
+[IMPORTANT]
+====
+初始化完成前, 双方都不得发送业务请求. 客户端的每个文档通知都必须先于针对该文档的请求, 否则服务器看到的是过期内容.
+====
+
+=== 文档同步
+
+服务器不直接读取编辑器缓冲区, 它维护的是客户端**推送的文本镜像**. 客户端通过通知保持镜像一致:
+
+[cols="3,2,4"]
+|===
+| 通知 | 触发时机 | 载荷
+
+| `textDocument/didOpen`
+| 打开文档
+| `uri`, `languageId`, `version`, 全文
+| `textDocument/didChange`
+| 内容变化
+| `uri`, 新 `version`, 变更数组
+| `textDocument/willSave`
+| 保存前
+| `reason` (手动 / 延迟 / 失焦)
+| `textDocument/didSave`
+| 保存后
+| `uri`, 可选全文
+| `textDocument/didClose`
+| 关闭文档
+| `uri`
+|===
+
+同步模式由服务器在 `textDocumentSync.change` 中声明:
+
+* `None (0)`: 服务器自己读文件, 不使用推送内容
+* `Full (1)`: 每次发送全文, 实现简单但开销大
+* `Incremental (2)`: 只发送变更区间, 大文件下开销最小
+
+增量变更的关键规则:
+
+. 每个 `contentChanges` 项要么带 `range`, 要么是全文替换
+. `range` 基于**应用该变更之前**的文档状态计算
+. 多项变更按数组顺序**依次应用**
+. `version` 单调递增, 服务器应拒绝或忽略回退的版本
+
+[source,json]
+----
+{
+  "jsonrpc": "2.0",
+  "method": "textDocument/didChange",
+  "params": {
+    "textDocument": { "uri": "file:///d%3A/demo/main.ts", "version": 8 },
+    "contentChanges": [
+      {
+        "range": { "start": { "line": 3, "character": 7 }, "end": { "line": 3, "character": 9 } },
+        "text": "user"
+      }
+    ]
+  }
+}
+----
+
+=== 语言特性
+
+LSP 将语言能力拆成独立的请求方法, 客户端按用户操作触发:
+
+[cols="2,4,5"]
+|===
+| 功能 | 方法 | 说明
+
+| 代码补全
+| `textDocument/completion`
+| 返回 `CompletionItem[]` 或 `CompletionList`; `isIncomplete` 表示需重新请求
+| 悬停提示
+| `textDocument/hover`
+| 返回 Markdown 或纯文本, 可附范围
+| 跳转定义
+| `textDocument/definition`
+| 另有 `declaration`, `typeDefinition`, `implementation`
+| 查找引用
+| `textDocument/references`
+| 可指定是否包含声明
+| 重命名
+| `textDocument/rename`
+| 返回 `WorkspaceEdit`, 由客户端统一应用
+| 文档符号
+| `textDocument/documentSymbol`
+| 层次化 `DocumentSymbol` 或扁平 `SymbolInformation`
+| 工作区符号
+| `workspace/symbol`
+| 按名称模糊检索整个项目
+| 代码操作
+| `textDocument/codeAction`
+| 快速修复, 重构建议; 支持 `codeAction/resolve` 延迟计算
+| 格式化
+| `textDocument/formatting`
+| 另有 `rangeFormatting`, `onTypeFormatting`
+| 签名帮助
+| `textDocument/signatureHelp`
+| 参数提示, 需声明触发字符
+| 折叠范围
+| `textDocument/foldingRange`
+| 返回可折叠区间
+| 语义高亮
+| `textDocument/semanticTokens/full`
+| 返回整数数组, 用于精确着色
+| 内联提示
+| `textDocument/inlayHint`
+| 显示推断类型, 参数名等
+| 调用层次
+| `textDocument/prepareCallHierarchy`
+| 配合 `callHierarchy/incomingCalls` 等使用
+|===
+
+==== 诊断: 推送与拉取
+
+诊断有两种模式, 服务器通常二选一:
+
+* **推送 (Push)**: 服务器在分析完成后主动发送 `textDocument/publishDiagnostics`, 携带 `uri`, `diagnostics`, 可选 `version`
+* **拉取 (Pull)**: 客户端按需发送 `textDocument/diagnostic`, 携带 `previousResultId`; 服务器返回 `kind: "full"` 的完整报告或 `kind: "unchanged"` 表示无变化
+
+[cols="2,3,3"]
+|===
+| 维度 | 推送 | 拉取
+
+| 触发方
+| 服务器
+| 客户端
+| 增量能力
+| 每次发送全量诊断
+| 通过 `resultId` 支持未变更结果
+| 适用场景
+| 兼容性最好, 老客户端均可
+| 大型项目, 需要按需计算
+|===
+
+==== 语义令牌
+
+语法高亮依赖 TextMate 语法时, 只能做正则匹配, 无法区分同名符号. **语义令牌**由语言服务器基于真实语义生成:
+
+* 服务器在 `semanticTokensProvider.legend` 中声明 `tokenTypes` 与 `tokenModifiers`
+* 客户端请求 `textDocument/semanticTokens/full` 或 `textDocument/semanticTokens/range`
+* 响应是整数数组, 每 5 个一组: `deltaLine`, `deltaStartChar`, `length`, `tokenType`, `tokenModifiers`
+* 支持 `full/delta` 增量返回, 只需发送与上次结果的差异
+
+=== 一次补全请求的完整流程
+
+[plantuml, "补全请求流程", format=png]
+----
+@startuml
+actor 用户 as User
+participant "LSP Client" as C
+participant "LSP Server" as S
+
+User -> C: 输入 "obj."
+C -> S: textDocument/didChange (version=9)
+C -> S: textDocument/completion(id=7, triggerKind=2, triggerCharacter=".")
+S -> S: 解析上下文, 计算候选
+S --> C: CompletionList(items)
+C --> User: 弹出补全列表
+User -> C: 继续输入
+C -> S: $/cancelRequest(id=7)
+S --> C: error -32800 (RequestCancelled)
+@enduml
+----
+
+关键交互点:
+
+. **触发方式**: 自动触发时 `triggerKind` 为 2 并带 `triggerCharacter`; 手动触发为 1; 补全未完成时再次触发为 3
+. **取消**: 用户继续输入后客户端发送 `$/cancelRequest`, 服务器应尽快中止并返回 `-32800`
+. **进度**: 长任务通过 `workDoneToken` 上报 `$/progress`, 避免界面假死
+. **部分结果**: 通过 `partialResultToken` 流式返回, 先显示高置信度候选
+. **版本校验**: 服务器返回结果前应确认文档版本未变, 否则返回 `ContentModified (-32801)`
+
+=== 实现一个最小语言服务器
+
+使用最新稳定版 `vscode-languageserver` 11.x 实现一个提供悬停与补全的服务端:
+
+[source,typescript]
+----
+import {
+  createConnection, ProposedFeatures, TextDocuments,
+  TextDocumentSyncKind, InitializeResult,
+} from 'vscode-languageserver/node';   // <1>
+import { TextDocument } from 'vscode-languageserver-textdocument';
+
+const connection = createConnection(ProposedFeatures.all);   // <2>
+const documents = new TextDocuments(TextDocument);           // <3>
+
+connection.onInitialize((): InitializeResult => ({
+  capabilities: {
+    textDocumentSync: TextDocumentSyncKind.Incremental,      // <4>
+    hoverProvider: true,
+    completionProvider: { triggerCharacters: ['.'] },
+  },
+  serverInfo: { name: 'demo-language-server', version: '1.0.0' },
+}));
+
+connection.onHover(({ textDocument, position }) => {
+  const doc = documents.get(textDocument.uri);
+  const range = doc?.getWordRangeAtPosition(position);
+  if (!doc || !range) {
+    return null;
+  }
+  return { contents: { kind: 'markdown', value: `**${doc.getText(range)}**` } };
+});
+
+documents.listen(connection);   // <5>
+connection.listen();            // <6>
+----
+<1> 同时支持 Node.js 与浏览器环境
+<2> 按启动参数选择 stdio, IPC 或 Socket 传输, `ProposedFeatures.all` 启用草案特性
+<3> 文档管理器, 自动维护客户端同步过来的文本镜像
+<4> 声明使用增量同步, 客户端只发送变更区间
+<5> 将文档事件接入连接
+<6> 开始监听消息, 直到连接关闭
+
+客户端侧 (VS Code 扩展) 用 `vscode-languageclient` 启动并托管服务器进程:
+
+[source,typescript]
+----
+import {
+  LanguageClient, LanguageClientOptions, ServerOptions, TransportKind,
+} from 'vscode-languageclient/node';
+
+const serverModule = context.asAbsolutePath('out/server.js');
+
+const serverOptions: ServerOptions = {
+  run: { module: serverModule, transport: TransportKind.ipc },
+  debug: {
+    module: serverModule,
+    transport: TransportKind.ipc,
+    options: { execArgv: ['--nolazy', '--inspect=6009'] },
+  },
+};
+
+const clientOptions: LanguageClientOptions = {
+  documentSelector: [{ scheme: 'file', language: 'plaintext' }],
+};
+
+const client = new LanguageClient('demo', 'Demo Language Server', serverOptions, clientOptions);
+await client.start();
+----
+
+=== 实现生态
+
+[cols="2,5"]
+|===
+| 角色 | 代表实现
+
+| 客户端
+| VS Code (`vscode-languageclient`), Neovim (`vim.lsp`, 0.5 起内置), Emacs (Eglot, 29 起内置), Vim (vim-lsp, coc.nvim), Eclipse (LSP4J), JetBrains (2023.2 起提供 LSP API)
+| 服务器
+| clangd (C/C++), gopls (Go), rust-analyzer (Rust), pyright (Python), TypeScript Language Server (TypeScript), Eclipse JDT LS (Java), OmniSharp (C#)
+|===
+
+=== 设计要点与常见误区
+
+* **UTF-16 偏移**: 位置计算必须按 UTF-16 码元, 处理代理对时尤其容易出错
+* **增量区间基准**: 变更区间基于旧版本, 多项变更需按序应用, 不能一次性合并后再计算
+* **URI 而非路径**: Windows 盘符需转成 `file:///d%3A/...`, 直接拼接 `D:\` 会导致无法打开的 URI
+* **必须支持取消**: 忽略 `$/cancelRequest` 会让编辑器在快速输入时堆积大量过期请求
+* **诊断防抖与版本**: 输入过程中频繁全量诊断会拖慢编辑器; 携带 `version` 可避免旧结果覆盖新结果
+* **按能力降级**: 客户端可能不支持语义令牌, 拉取诊断等新特性, 服务器必须回退到基础能力
+* **服务器可重建**: 索引应可从工作区重建, 崩溃重启后客户端只需重发 `didOpen`
+* **安全边界**: 语言服务器能读取工作区并执行命令, 只应安装可信来源的服务器
+
+=== 与相关协议对比
+
+[cols="2,3,3,3"]
+|===
+| 维度 | LSP | DAP | MCP
+
+| 解决问题
+| 编辑器与语言智能
+| 编辑器与调试器
+| AI 应用与工具, 数据源
+| 消息格式
+| JSON-RPC 2.0
+| 自定义 JSON 消息加 `Content-Length` 帧
+| JSON-RPC 2.0
+| 通信方向
+| 双向, 双方均可发起请求
+| 双向
+| 双向
+| 传输方式
+| stdio, Socket, 管道
+| stdio, Socket
+| stdio, HTTP
+|===
+
+=== 总结
+
+LSP 的价值不在协议本身多复杂, 而在于把**语言能力**从**编辑器实现**中剥离出来, 用统一的消息契约连接两端. 理解以下三点即可掌握其全貌:
+
+. 一切交互都是 JSON-RPC 请求或通知, 能力在初始化时协商
+. 服务器操作的是客户端推送的文档镜像, 位置以 UTF-16 码元计
+. 长任务必须支持取消与进度, 诊断与索引需与文档版本保持一致
+
+TIP: 新实现优先基于 `vscode-languageserver` 11.x 与服务端协议 3.18, 可直接复用成熟的连接层, 文档管理与能力协商逻辑.

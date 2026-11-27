@@ -1,0 +1,451 @@
+== uniapp讲解
+
+同一套业务往往需要同时交付 iOS, Android, H5 与多个小程序平台. 各端原生技术栈 (UIKit, Android View, 各家小程序 DSL) 互不通用, 独立开发意味着业务逻辑重复实现与多份回归成本. **uni-app** 的思路是: 用 Vue 语法写一份代码, 由编译器在构建期为每个目标平台产出对应的产物, 再由注入的运行时把统一组件与 API 映射为平台能力. 本文基于最新稳定版 uni-app 5.3.3 (HBuilderX 5.3.3) 与 Vue 3.5, 讲解其编译期与运行期原理, 条件编译, 页面模型与性能约束.
+
+参考: <<Web/node/vite原理讲解.adoc#, vite原理讲解>>, <<Web/Flex布局讲解.adoc#, Flex布局讲解>>
+
+[[uniapp-what]]
+=== uni-app 是什么?
+
+**uni-app**:: DCloud 推出的跨端应用框架, 以 Vue 语法编写, 编译后可运行于 iOS, Android, 鸿蒙 Next, Web 以及微信, 支付宝, 抖音, 百度, 飞书等主流小程序平台.
+**运行时 (runtime)**:: 随包注入目标平台的适配层, 负责把 `<view>`, `<text>` 等内置组件和 `uni.*` API 翻译为平台真实能力, 并抹平各端差异.
+**条件编译**:: 以 `#ifdef` 注释指令在**编译期**裁剪代码, 让同一份源码容纳平台专属逻辑, 产物中不残留其他平台的分支.
+**nvue**:: App 端的原生渲染页面类型, 基于 Weex 引擎渲染为原生控件, 不使用 WebView.
+**uni-app x**:: uni-app 的原生渲染产品线, 使用 UTS 编写, 直接编译为 Kotlin, Swift, ArkTS, 运行期无 JS 引擎与 WebView 的通信开销.
+**UTS (uni type script)**:: uni-app x 的编程语言, TypeScript 的超集, 编译为目标平台的原生语言.
+
+选择它的根本原因是**归一化**: 组件, API, 路由, 生命周期, 工程配置都提供统一的抽象层, 平台差异被压缩到少数适配点.
+
+* **一套代码多端产出:** 业务代码与 UI 代码复用, 仅平台差异部分需要条件编译
+* **语法成本低:** 直接使用 Vue 3 与 CSS, 前端团队无需学习新的 DSL
+* **生态完善:** 插件市场, `uni_modules` 规范, 官方 uni-ui 组件库覆盖常见业务场景
+* **渐进式:** 可只用于小程序, 也可只用于 App, 不强制全平台
+
+NOTE: uni-app 与 uni-app x 是两条独立产品线. 前者基于 WebView 与 JS 引擎渲染, 生态与插件丰富; 后者为原生渲染, 性能接近原生但生态尚在完善. 二者语法接近, 项目形态却不通用, 选型时需明确.
+
+[[uniapp-arch]]
+=== 整体架构
+
+uni-app 的架构可以概括为**一次编译, 三层协作**:
+
+[plantuml,"uni-app 整体架构",format=png]
+----
+@startuml
+package "源码层" {
+  [Vue 单文件组件] as SFC
+  [pages.json / manifest.json] as CONF
+}
+package "编译层 (uni-cli + Vite)" {
+  [条件编译裁剪] as PRE
+  [平台代码转换] as TRANS
+  [资源与配置生成] as GEN
+}
+package "平台产物" {
+  [小程序包 wxml/wxss/js/json] as MP
+  [H5 站点 HTML/CSS/JS] as H5
+  [App 资源 app-service.js 与页面] as APP
+}
+package "运行时层" {
+  [逻辑层 JS 引擎] as LOGIC
+  [视图层 WebView 或原生渲染器] as VIEW
+  [原生桥 组件与 API 映射] as BRIDGE
+}
+
+SFC --> PRE
+CONF --> GEN
+PRE --> TRANS
+TRANS --> MP
+TRANS --> H5
+TRANS --> APP
+GEN --> MP
+GEN --> APP
+MP --> LOGIC
+H5 --> VIEW
+APP --> LOGIC
+LOGIC --> BRIDGE
+BRIDGE --> VIEW
+@enduml
+----
+
+三层职责划分:
+
+* **语法层:** Vue 3 单文件组件, 内置组件与 `uni.*` API, 只面向统一抽象编程, 不感知目标平台
+* **编译层:** 依据 `process.env.UNI_PLATFORM` 裁剪条件编译分支, 把模板转换为目标平台语法, 并生成各端配置 (如 `app.json`, 分包信息)
+* **运行时层:** 逻辑层运行 JS 业务代码, 视图层负责渲染, 二者通过原生桥通信, 由运行时把统一调用翻译为平台 API
+
+[[uniapp-compile]]
+=== 跨端原理
+
+==== 编译期: 一份源码的多种产物
+
+不同平台的产物形态与渲染方式差异很大, 这是"一套代码"必须依赖编译期转换的根本原因:
+
+[cols="2,3,2,2"]
+|===
+| 平台 | 产物形态 | 视图层 | 逻辑层
+
+| H5 | HTML + CSS + JS | 浏览器 DOM | 与视图层同线程
+| 小程序 | wxml / wxss / js / json | WebView | 独立 JSCore (双线程)
+| App (vue 页面) | app-service.js + WebView 页面资源 | WebView | 独立 JS 引擎
+| App (nvue 页面) | JS bundle | Weex 原生控件 | 独立 JS 引擎
+| 鸿蒙 Next | 页面模板 + JS | ArkUI 原生组件 | ArkTS 运行时
+| uni-app x | Kotlin / Swift / ArkTS | 原生控件 | 原生线程
+|===
+
+小程序方向的转换最为直接: Vue 模板被编译为 `wxml`, 样式被编译为 `wxss`, `uni.*` API 被映射为 `wx.*` 等平台 API. H5 方向则输出标准 SPA, 由 Vite 打包, 见 <<Web/node/vite原理讲解.adoc#, vite原理讲解>>. App 方向的 `vue` 页面把业务代码打包为 `app-service.js`, 在独立 JS 引擎中执行, 页面本身仍是 WebView; 需要原生性能的页面改用 `nvue`, 由 Weex 引擎渲染为原生控件.
+
+==== 运行期: 逻辑层与视图层
+
+除 H5 外, uni-app 沿用了小程序的**双线程模型**: 业务代码运行在逻辑层, 渲染运行在视图层, 二者不共享内存.
+
+[plantuml,"一次数据更新的跨线程流程",format=png]
+----
+@startuml
+participant "视图层 (WebView)" as View
+participant "原生桥 (Native)" as Bridge
+participant "逻辑层 (JS 引擎)" as Logic
+
+View -> Bridge: 触摸事件
+Bridge -> Logic: 派发事件到处理函数
+Logic -> Logic: 执行逻辑, 计算出新状态
+Logic -> Bridge: 传输差异数据 (序列化)
+Bridge -> View: 应用差异并重绘
+@enduml
+----
+
+由此产生三个必须理解的结论:
+
+* **不能直接操作 DOM:** 视图层不可被业务代码触碰, 一切更新都是声明式数据驱动
+* **通信有成本:** 每次更新都要跨线程序列化并传输, 数据量越大, 频率越高, 卡顿越明显
+* **H5 是例外:** 逻辑与视图同线程, 无跨线程开销, 因此同一份代码在 H5 上往往比小程序与 App 更流畅
+
+[[uniapp-conditional]]
+=== 条件编译
+
+平台差异不可能完全抹平, 条件编译是官方给出的收口手段. 它在**编译期**生效, 不满足条件的分支不会进入产物.
+
+[source,javascript]
+----
+const info = uni.getSystemInfoSync()
+console.log(info.uniPlatform)          // <1>
+
+// #ifdef MP-WEIXIN
+uni.login({ provider: 'weixin' })       // <2>
+// #endif
+
+// #ifndef MP-WEIXIN
+uni.showToast({ title: '请使用微信小程序登录' })  // <3>
+// #endif
+----
+<1> 运行时判断, 代码在所有平台都存在
+<2> 仅微信小程序产物保留
+<3> 除微信小程序外的产物保留
+
+模板与样式同样支持:
+
+[source,html]
+----
+<template>
+  <view class="page">
+    <!-- #ifdef MP-WEIXIN -->
+    <official-account />
+    <!-- #endif -->
+    <!-- #ifdef APP-PLUS -->
+    <view class="safe-area-bottom" />
+    <!-- #endif -->
+  </view>
+</template>
+----
+
+[source,css]
+----
+/* #ifdef H5 */
+.page {
+  max-width: 750px;
+  margin: 0 auto;
+}
+/* #endif */
+----
+
+常用平台常量:
+
+[cols="2,3"]
+|===
+| 常量 | 覆盖范围
+
+| `APP-PLUS` | 全部 App 平台
+| `APP-ANDROID`, `APP-IOS` | Android, iOS 单独分支
+| `APP-HARMONY` | 鸿蒙 Next
+| `H5` | H5 与 Web 端
+| `MP` | 全部小程序
+| `MP-WEIXIN`, `MP-ALIPAY`, `MP-TOUTIAO`, `MP-BAIDU`, `MP-QQ`, `MP-LARK`, `MP-KUAISHOU` | 各具体小程序平台
+| `QUICKAPP-WEBVIEW` | 快应用
+| `VUE3` | Vue 3 编译环境
+| `UNI-APP-X` | uni-app x 编译环境
+|===
+
+TIP: 需要区分"编译期决定"与"运行时决定": 依赖不同插件, 不同组件或影响产物体积的差异用条件编译; 仅影响个别参数或文案的差异用 `uni.getSystemInfoSync().uniPlatform` 判断即可, 避免条件编译碎片化.
+
+[[uniapp-project]]
+=== 工程结构
+
+Vue 3 + Vite 的 CLI 工程结构如下:
+
+[source,text]
+----
+project/
+  src/
+    pages/index/index.vue        页面, 需在 pages.json 中注册
+    components/                  全局组件, 可被 easycom 自动引入
+    static/                      原样拷贝的静态资源
+    stores/                      Pinia store
+    uni_modules/                 插件市场安装的模块
+    App.vue                      应用入口组件, 仅承载应用级生命周期
+    main.js                      创建应用实例
+    manifest.json                应用标识, 权限, 各端专有配置
+    pages.json                   页面路由, 窗口样式, tabBar, 分包
+  vite.config.js                 注入 @dcloudio/vite-plugin-uni
+  package.json
+----
+
+`pages.json` 是路由与窗口的唯一配置源, 其核心字段:
+
+[cols="2,3"]
+|===
+| 字段 | 作用
+
+| `pages` | 页面路径与窗口样式, 数组第一项为启动页
+| `globalStyle` | 全局窗口样式, 如导航栏, 背景色, 下拉刷新
+| `tabBar` | 底部标签栏, 声明后对应页面只能用 `switchTab` 跳转
+| `subPackages` | 分包配置, 小程序端降低主包体积, App 端减少启动加载
+| `preloadRule` | 分包预下载规则, 进入指定页面时提前拉取分包
+| `easycom` | 组件自动引入规则, 免去手工 `import`
+| `condition` | 开发期启动模式, 便于直接调试指定页面
+|===
+
+`manifest.json` 承载应用元信息与各端专有能力开关: `appid` 决定云打包与小程序账号关联, `app-plus` 下配置 App 权限, 启动图, 原生插件, `mp-weixin` 等节点配置小程序专有项.
+
+`easycom` 默认规则为 `components/组件名/组件名.vue`, 符合约定的组件直接在模板中使用, 无需 import:
+
+[source,json]
+----
+{
+  "easycom": {
+    "autoscan": true,
+    "custom": {
+      "^uni-(.*)": "@dcloudio/uni-ui/lib/uni-$1/uni-$1.vue"
+    }
+  }
+}
+----
+
+[[uniapp-router]]
+=== 页面与路由
+
+uni-app 用**页面栈**管理导航, 所有跳转都是栈操作, 不使用 URL 路由表. `pages.json` 中注册的路径即页面标识.
+
+[cols="2,4,2"]
+|===
+| API | 语义 | 页面栈变化
+
+| `uni.navigateTo` | 打开新页面, 可回退 | 入栈, 上限 10 层
+| `uni.redirectTo` | 替换当前页面, 不可回退 | 替换栈顶
+| `uni.reLaunch` | 关闭所有页面后打开 | 清空后入栈
+| `uni.switchTab` | 切换到 tabBar 页面 | 清空非 tabBar 页面
+| `uni.navigateBack` | 返回上一页或多级 | 出栈
+|===
+
+* **栈深限制:** 微信小程序与 App 端页面栈上限均为 10 层, 超过后 `navigateTo` 失败, 深层导航应改用 `redirectTo` 或自定义导航
+* **tabBar 限制:** 已声明为 tabBar 的页面不能用 `navigateTo` 打开, 也不能携带 query, 需要参数时用全局状态或 `uni.setStorageSync`
+* **页面栈读取:** `getCurrentPages()` 返回当前栈, 末项即当前页面实例, 可用于页面间回传数据
+
+[[uniapp-lifecycle]]
+=== 生命周期
+
+uni-app 的生命周期分三类, 应用级与页面级由运行时触发, 组件级即 Vue 自身生命周期:
+
+[cols="2,2,4"]
+|===
+| 级别 | 钩子 | 触发时机
+
+| 应用 | `onLaunch` | 应用初始化完成, 全局仅一次
+| 应用 | `onShow`, `onHide` | 应用切入前台, 退到后台
+| 应用 | `onPageNotFound` | 目标页面不存在
+| 页面 | `onLoad` | 页面加载, 可取得路由参数
+| 页面 | `onShow`, `onHide` | 页面显示, 隐藏
+| 页面 | `onReady` | 首次渲染完成, 可安全获取节点尺寸
+| 页面 | `onUnload` | 页面销毁 (返回, 重定向或重启时触发)
+| 页面 | `onReachBottom`, `onPullDownRefresh` | 触底, 下拉刷新 (需在 `pages.json` 开启)
+| 页面 | `onBackPress` | 物理返回或导航栏返回, 返回 `true` 可拦截
+| 组件 | `onMounted`, `onUnmounted` | Vue 组件挂载与卸载
+|===
+
+页面生命周期执行顺序为 `onLoad`, `onShow`, `onReady`. 在 `<script setup>` 中通过专用组合式函数注册:
+
+[source,javascript]
+----
+<script setup>
+import { onLoad, onShow, onReachBottom } from '@dcloudio/uni-app'
+
+onLoad((query) => {
+  console.log('路由参数', query.id)
+})
+
+onShow(() => {
+  refreshList()
+})
+
+onReachBottom(() => {
+  loadMore()
+})
+</script>
+----
+
+NOTE: 页面级钩子不能与 Vue 的 `onMounted` 混用. `onMounted` 只保证组件挂载, 不保证页面已显示, 涉及页面可见性的逻辑应放在 `onShow`.
+
+[[uniapp-component-api]]
+=== 组件与 API
+
+内置组件是跨端的公共子集, 编译到各端后映射为平台组件:
+
+[cols="2,4"]
+|===
+| 组件 | 说明
+
+| `view`, `text` | 容器与文本, 文本必须置于 `text` 内才能被小程序正确解析
+| `image` | 图片, 支持 `mode` 裁剪与 `lazy-load`
+| `scroll-view` | 局部滚动容器, 需固定高度
+| `swiper` | 轮播
+| `input`, `textarea` | 输入控件, 键盘与光标行为各端有差异
+| `button` | 按钮, 开放能力 (如 `open-type`) 仅小程序端生效
+| `navigator` | 声明式跳转, 语义等价于 `navigateTo`
+|===
+
+`uni.*` API 统一了各端的底层实现, 同名 API 在不同平台可能落到完全不同的底层:
+
+[source,javascript]
+----
+uni.request({
+  url: 'https://api.example.com/users',
+  method: 'GET',
+  header: { Authorization: `Bearer ${token}` },   // <1>
+  success: (res) => {
+    console.log(res.statusCode, res.data)
+  },
+  fail: (err) => {
+    console.error(err.errMsg)
+  }
+})
+----
+<1> 统一写法, 底层在 H5 为 XHR/fetch, 小程序为平台请求 API, App 为原生 HTTP 模块
+
+* **域名与跨域:** H5 受同源策略约束, 需服务端 CORS; 小程序需在平台后台配置合法域名; App 端无此限制
+* **Promise 化:** 不传 `success`/`fail`/`complete` 时返回 Promise, Vue 3 下 resolve 值为 `[err, res]` 数组形式, 与 Vue 2 的对象形式不同
+* **平台覆盖差异:** 少数 API 仅部分平台可用, 使用前需查文档并用条件编译兜底
+
+[[uniapp-state]]
+=== 状态管理
+
+Vue 3 项目默认使用 **Pinia**. store 是普通 composable, 逻辑与页面代码同构:
+
+[source,javascript]
+----
+// stores/user.js
+import { ref, computed } from 'vue'
+import { defineStore } from 'pinia'
+
+export const useUserStore = defineStore('user', () => {
+  const token = ref(uni.getStorageSync('token') || '')
+  const loggedIn = computed(() => Boolean(token.value))
+
+  function setToken(value) {
+    token.value = value
+    uni.setStorageSync('token', value)
+  }
+
+  return { token, loggedIn, setToken }
+})
+----
+
+`main.js` 中注册后全局可用:
+
+[source,javascript]
+----
+import { createSSRApp } from 'vue'
+import { createPinia } from 'pinia'
+import App from './App.vue'
+
+export function createApp() {
+  const app = createSSRApp(App)
+  app.use(createPinia())
+  return { app }
+}
+----
+
+WARNING: 小程序端进程可能被系统回收, 内存中的 store 并非持久状态. 登录态, 草稿等关键数据必须落 `uni.setStorageSync`, 并在 `onShow` 或启动时回填.
+
+[[uniapp-build]]
+=== 构建与发布
+
+CLI 工程的构建命令按平台区分, 产物位于 `dist/`:
+
+[source,shell]
+----
+npm run dev:h5          # H5 开发服务
+npm run build:h5        # H5 生产构建
+npm run dev:mp-weixin   # 微信小程序开发构建
+npm run build:mp-weixin # 微信小程序生产构建
+npm run dev:app         # App 调试 (需配合 HBuilderX 运行到真机)
+----
+
+两种工程形态的差异:
+
+[cols="2,3,3"]
+|===
+| 维度 | CLI 工程 | HBuilderX 工程
+
+| 依赖管理 | npm / pnpm, 版本可锁 | 内置编译器, 版本随 IDE
+| 构建能力 | 可接入 CI, 自定义 Vite 插件 | 一键运行与云打包
+| 适用场景 | 团队协作, 自动化流水线 | 快速验证, App 云打包
+|===
+
+发布路径: H5 产物直接部署静态服务器; 小程序产物用对应平台开发者工具上传审核; App 可用 DCloud 云打包或离线打包 (集成原生 SDK), 后者便于接入自有原生模块.
+
+[[uniapp-performance]]
+=== 性能优化
+
+性能瓶颈几乎都来自双线程通信与包体积, 优化围绕这两点展开:
+
+* **缩小 `setData` 数据量:** 只传变更字段, 避免整对象或长列表整体回写; 大数组分页加载
+* **降低更新频率:** 不在 `onPageScroll` 中逐帧更新数据, 滚动相关的动效交给 CSS 或原生组件
+* **长列表:** 使用虚拟列表或 App 端的 `recycle-view`, 避免一次性渲染上千节点
+* **分包:** 用 `subPackages` 拆分非首屏页面, 配合 `preloadRule` 预下载, 控制主包体积
+* **首屏渲染:** 骨架屏与图片懒加载 (`lazy-load`), 减少首屏请求数
+* **高频交互页面:** 改用 `nvue` 或迁移到 uni-app x, 消除跨线程通信开销
+
+[[uniapp-compare]]
+=== 与同类方案对比
+
+[cols="1,2,2,2,3"]
+|===
+| 方案 | 语法 | 渲染方式 | 小程序支持 | 适用场景
+
+| uni-app | Vue 3 | WebView, nvue 原生 | 全平台 | 小程序 + App + H5 同时交付
+| uni-app x | UTS | 原生渲染 | 支持 | 追求原生性能的新项目
+| Taro | React / Vue | 小程序转译, RN | 全平台 | React 技术栈团队
+| React Native | React | 原生控件 | 不支持 | 纯 App, 无需小程序
+| Flutter | Dart | Skia 自绘 | 不支持 | 强 UI 一致性, 纯 App
+|===
+
+选择的关键不在于框架能力对比, 而在于**交付矩阵**: 需要小程序时, 可选范围只剩 uni-app 与 Taro; 只需 App 且追求极致性能时, 原生, Flutter, RN 更合适.
+
+[[uniapp-summary]]
+=== 总结与注意事项
+
+* **跨端不等于零适配:** 平台差异集中在 API 可用性, 样式细节 (安全区, 键盘, 滚动), 权限与审核规则, 需在真机矩阵上回归
+* **双线程模型决定性能上限:** 小程序与 App 的卡顿多源于跨线程传输, H5 无此问题, 因此性能结论不能跨端直接搬运
+* **条件编译是收口手段而非设计手段:** 平台分支越多, 维护成本越高, 应优先抽象到组件或适配层, 再退化为条件编译
+* **注意工程形态:** CLI 工程与 HBuilderX 工程的编译器版本来源不同, 排查构建差异时先确认编译器版本
+* **选型看生态与产线:** uni-app 生态成熟, 适合当下交付; uni-app x 性能更好但插件与社区仍在建设, 新项目可评估但不建议与既有 uni-app 项目混用
+
+WARNING: Vue 2 分支已停止新特性演进, 新项目应直接使用 Vue 3 与组合式 API. 存量 Vue 2 项目迁移时需同步检查 `easycom`, 生命周期写法与依赖的插件版本.

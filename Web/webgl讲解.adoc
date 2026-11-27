@@ -1,0 +1,697 @@
+== webgl讲解
+
+浏览器长期只能渲染由 CPU 生成的位图, 3D 内容必须依赖 Flash, Unity Web Player 等插件. 2011 年 Khronos 发布 **WebGL 1.0**, 把 OpenGL ES 2.0 裁剪后暴露给 JavaScript, 使 `<canvas>` 成为一块可以直接接收 GPU 指令的绘图表面. 与 Canvas 2D 的"画线, 填充, 贴图"等高层命令不同, WebGL 只提供**着色器, 缓冲区与状态机**三件套, 场景图, 相机, 材质, 光照全部由应用自己实现, 这既是它的门槛, 也是 Three.js 等引擎存在的理由.
+
+本文基于当前最新稳定版本 **WebGL 2.0**(对应 OpenGL ES 3.0), 讲解渲染管线的各阶段, JavaScript 与 GPU 之间的数据契约, 以及那些"不报错却什么都不显示"的经典问题.
+
+参考: <<图形学/vulkan讲解.adoc#, Vulkan讲解>>, <<Web/JavaScript数据类型.adoc#, JavaScript数据类型>>
+
+[[webgl-what]]
+=== WebGL 是什么
+
+WebGL:: 一套运行在浏览器中的 **JavaScript 图形 API**, 基于 OpenGL ES 规范, 通过 `<canvas>` 的绘图上下文把顶点与纹理数据交给 GPU 渲染.
+着色器 (Shader):: 用 GLSL ES 编写, 在 GPU 上并行执行的小程序. 顶点着色器负责确定顶点位置, 片元着色器负责确定每个像素的颜色.
+上下文 (Context):: 由 `canvas.getContext('webgl2')` 创建的对象, 所有资源与状态都挂在它上面, 是应用访问 GPU 的唯一入口.
+
+WebGL 本身**不是渲染引擎**: 它不提供场景图, 相机, 模型加载器, 也不管理资源生命周期. 它的定位与 OpenGL ES 一致, 是一个**全局状态机 + 可编程管线**. 需要理解的第一个事实是: 驱动程序(Windows 上通常是 ANGLE, 底层翻译为 Direct3D 11)只负责把当前状态翻译成 GPU 命令, 状态设置错了不会报错, 只会得到一张空画布.
+
+与 Canvas 2D 的差异可以概括为下表:
+
+[options="header",cols="2,4,4"]
+|===
+|维度 |Canvas 2D |WebGL
+
+|编程模型
+|立即模式绘图 API(`fillRect`, `drawImage`)
+|着色器 + 顶点缓冲区 + 全局状态机
+
+|执行单元
+|CPU 生成位图, 部分路径由 GPU 加速
+|顶点与片元着色器在 GPU 上并行执行
+
+|3D 能力
+|无, 只有 2D 变换矩阵
+|完整可编程的 3D 管线
+
+|坐标约定
+|左上角为原点, y 轴向下
+|NDC 中心为原点, y 轴向上, z 轴范围为 stem:[-1, 1]
+
+|典型用途
+|图表, 海报, 图片裁剪
+|3D 可视化, 大规模粒子, 视频特效, 地图
+|===
+
+[[webgl-version]]
+=== 版本与能力边界
+
+WebGL 1.0 与 2.0 的差异不是"多一点特性", 而是着色器语言与核心能力整体升级到 OpenGL ES 3.0 水平:
+
+[options="header",cols="2,4,4"]
+|===
+|能力 |WebGL 1.0 |WebGL 2.0
+
+|对应标准
+|OpenGL ES 2.0
+|OpenGL ES 3.0
+
+|着色器语言
+|GLSL ES 1.00
+|GLSL ES 3.00(`#version 300 es`), 兼容 1.00
+
+|顶点数组对象 VAO
+|扩展 `OES_vertex_array_object`
+|核心支持
+
+|实例化绘制
+|扩展 `ANGLE_instanced_arrays`
+|核心 `drawArraysInstanced`
+
+|32 位索引
+|扩展 `OES_element_index_uint`
+|核心 `UNSIGNED_INT`
+
+|非 2 的幂纹理
+|不能生成 mipmap, 且只能 `CLAMP_TO_EDGE`
+|与普通纹理一致
+
+|多渲染目标 MRT
+|不支持
+|`drawBuffers`
+
+|3D 纹理, 纹理数组
+|不支持
+|支持
+
+|变换反馈, 遮挡查询
+|不支持
+|支持
+
+|浏览器覆盖
+|全部现代浏览器
+|Chrome, Edge, Firefox, Safari 15 及以上
+|===
+
+TIP: WebGL 2.0 上下文可以编译 GLSL ES 1.00 着色器, 因此存量代码可以先用 `webgl2` 上下文跑起来, 再逐步迁移到 `#version 300 es`, 以获得 VAO, 实例化与 MRT 等核心能力.
+
+WebGL 1.0 的核心限制可以归纳为三条, 它们决定了大量工程决策:
+
+* **能力靠扩展探测:** 浮点纹理, 各向异性过滤, 实例化都需要 `getExtension`, 必须在使用前判空.
+* **资源规模受限:** 顶点属性最少 8 个, 片元纹理单元最少 8 个, 实际值以 `getParameter` 查询为准.
+* **无通用计算:** 只有顶点与片元两个可编程阶段, 没有计算着色器, 通用并行计算只能借道"渲染到纹理"实现.
+
+[[webgl-pipeline]]
+=== 渲染管线的组成
+
+WebGL 的管线在硬件层面是固定的, 应用只能替换其中两个阶段. 数据从缓冲区出发, 最终写入帧缓冲:
+
+[plantuml, "WebGL 渲染管线", format=png]
+----
+@startuml
+left to right direction
+rectangle "顶点数据\nARRAY_BUFFER" as VB
+rectangle "顶点着色器\n可编程 GLSL" as VS
+rectangle "图元装配\nTRIANGLES 等" as PA
+rectangle "裁剪与透视除法\n得到 NDC" as CLIP
+rectangle "光栅化\n生成片元" as RS
+rectangle "片元着色器\n可编程 GLSL" as FS
+rectangle "逐片元操作\n深度/模板/混合" as OM
+rectangle "帧缓冲\n默认帧缓冲或 FBO" as FB
+
+VB --> VS
+VS --> PA
+PA --> CLIP
+CLIP --> RS
+RS --> FS
+FS --> OM
+OM --> FB
+@enduml
+----
+
+各阶段职责如下:
+
+. **顶点获取:** 按 `vertexAttribPointer` 描述的步长与偏移, 从缓冲区中为每个顶点组装属性.
+. **顶点着色器:** 逐顶点执行, 至少输出 `gl_Position`(裁剪空间坐标), 还可输出供片元阶段插值的 varying 变量.
+. **图元装配:** 按 `gl.drawArrays`/`gl.drawElements` 指定的模式(点, 线, 三角形)把顶点组装为图元.
+. **裁剪与透视除法:** 位于视锥外的图元被裁剪, 齐次坐标除以 `w` 得到 NDC.
+. **光栅化:** 把图元离散为片元, 同时把 varying 变量按重心坐标插值.
+. **片元着色器:** 逐片元执行, 输出颜色(WebGL 1 中写入 `gl_FragColor`).
+. **逐片元操作:** 依次进行裁剪测试, 深度测试, 模板测试与混合, 决定片元是否写入帧缓冲.
+
+管线中只有 **顶点着色器** 与 **片元着色器** 可编程, 其余阶段的开关与参数通过状态函数配置. WebGL 2.0 相比 1.0 增加了变换反馈(把顶点着色器的输出写回缓冲区), 实例化属性与 MRT, 但**没有几何着色器与曲面细分着色器**, 这是它与桌面 OpenGL 4.x 的关键差异.
+
+[[webgl-hello]]
+=== 最小可运行示例
+
+一个三角形的完整流程只包含四步: 编译链接着色器, 上传顶点, 绑定属性, 发起绘制. 下面的代码可以直接保存为 HTML 运行:
+
+[source,html]
+----
+<canvas id="gl" width="640" height="480"></canvas>
+<script>
+  const canvas = document.getElementById('gl');
+  const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');   // <1>
+  if (!gl) throw new Error('当前浏览器不支持 WebGL');
+
+  const VS = `
+    attribute vec4 a_position;
+    void main() {
+      gl_Position = a_position;         // <2>
+    }
+  `;
+  const FS = `
+    precision mediump float;
+    void main() {
+      gl_FragColor = vec4(0.2, 0.6, 1.0, 1.0);   // <3>
+    }
+  `;
+
+  function compile(type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(shader));   // <4>
+    }
+    return shader;
+  }
+
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program));
+  }
+
+  const positions = new Float32Array([
+     0.0,  0.5,
+    -0.5, -0.5,
+     0.5, -0.5,
+  ]);                                   // <5>
+  const buffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+  gl.useProgram(program);
+  const loc = gl.getAttribLocation(program, 'a_position');
+  gl.enableVertexAttribArray(loc);      // <6>
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.08, 0.09, 0.12, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);    // <7>
+</script>
+----
+<1> 优先申请 WebGL 2.0 上下文, 失败时回退到 WebGL 1.0; 两者返回的对象互不兼容, 不能混用方法.
+<2> 顶点着色器没有矩阵变换, 直接把顶点当作裁剪空间坐标使用, 因此坐标范围必须在 stem:[-1, 1].
+<3> 片元着色器必须声明浮点精度, GLSL ES 没有默认精度, 缺少 `precision` 会编译失败.
+<4> 编译错误只能通过 `getShaderInfoLog` 读取, 不检查状态的代码会在后续步骤静默失败.
+<5> 顶点按 x, y 交替存放, 每顶点 2 个 float, 共 3 个顶点.
+<6> 属性数组默认关闭, 忘记 `enableVertexAttribArray` 是"画面全黑但无报错"的最常见原因.
+<7> 从第 0 个顶点开始绘制 3 个顶点, 组成一个三角形.
+
+绘制调用返回后 GPU 才开始执行, JavaScript 不会阻塞. 真正需要保证的是**在这次调用之前所有相关状态都已设置正确**, 因为 GPU 拿到的是当时的快照.
+
+[[webgl-coords]]
+=== 坐标系统与矩阵
+
+WebGL 本身不提供矩阵运算, 也不存在 `glPushMatrix` 之类的矩阵栈, 所有变换矩阵都由应用计算后以 `uniform` 形式传入. 一个顶点到达屏幕要经过若干坐标系:
+
+[plantuml, "顶点坐标变换流程", format=png]
+----
+@startuml
+start
+:模型坐标 (Model);
+:世界坐标 (World)\n乘 modelMatrix;
+:观察坐标 (View)\n乘 viewMatrix;
+:裁剪坐标 (Clip)\n乘 projectionMatrix;
+:NDC\n除以 w;
+:窗口坐标\ngl.viewport 变换;
+stop
+@enduml
+----
+
+[options="header",cols="2,3,4"]
+|===
+|阶段 |坐标系 |使用的矩阵或参数
+
+|模型变换
+|模型坐标到世界坐标
+|`modelMatrix`
+|视图变换
+|世界坐标到观察坐标
+|`viewMatrix`(由 `lookAt` 生成)
+|投影变换
+|观察坐标到裁剪坐标
+|`projectionMatrix`(透视或正交)
+|透视除法
+|裁剪坐标到 NDC
+|除以 `w`, 由硬件完成
+|视口变换
+|NDC 到窗口坐标
+|`gl.viewport(x, y, width, height)`
+|===
+
+变换关系可以写成:
+
+stem:[ p_"clip" = P * V * M * p_"model" ]
+
+stem:[ x_"ndc" = x_"clip" / w_"clip" ]
+
+stem:[ y_"ndc" = y_"clip" / w_"clip" ]
+
+窗口坐标由视口参数决定, 注意 `gl_FragCoord` 的原点在**左下角**:
+
+stem:[ x_"win" = (x_"ndc" + 1) / 2 * "width" + x ]
+
+stem:[ y_"win" = (y_"ndc" + 1) / 2 * "height" + y ]
+
+实际工程中直接使用 `gl-matrix` 计算, 避免手写矩阵出错:
+
+[source,javascript]
+----
+import { mat4 } from 'gl-matrix';
+
+const model = mat4.create();
+const view = mat4.lookAt(mat4.create(), [0, 0, 5], [0, 0, 0], [0, 1, 0]);
+const proj = mat4.perspective(mat4.create(), Math.PI / 3, canvas.width / canvas.height, 0.1, 100);
+
+const mvp = mat4.create();
+mat4.multiply(mvp, proj, view);
+mat4.multiply(mvp, mvp, model);
+
+const uMvp = gl.getUniformLocation(program, 'u_mvp');
+gl.uniformMatrix4fv(uMvp, false, mvp);   // false 表示不转置, gl-matrix 已是列主序
+----
+
+对应的顶点着色器只需一行乘法:
+
+[source,glsl]
+----
+attribute vec4 a_position;
+uniform mat4 u_mvp;
+void main() {
+  gl_Position = u_mvp * a_position;
+}
+----
+
+有三个容易出错的细节:
+
+* **乘法顺序:** 矩阵乘法不可交换, 必须是 stem:[P * V * M], 写成 stem:[M * V * P] 会得到完全错误的结果.
+* **列主序:** WebGL 的 `uniformMatrix4fv` 默认按列主序读取 16 个 float, `gl-matrix` 正好采用列主序, 因此 `transpose` 传 `false`.
+* **深度精度:** 透视投影的深度值在近平面附近精度高, 远端精度低, `near` 设置得过小(如 0.001)会导致远处出现 z-fighting, 应按场景尺度取尽可能大的值.
+
+NOTE: WebGL 的裁剪空间 z 范围是 stem:[-1, 1], 而 Direct3D, Metal 与 WebGPU 使用 stem:[0, 1]. 移植着色器或复用投影矩阵时必须修改投影矩阵, 否则近处物体会被裁掉.
+
+[[webgl-data]]
+=== 数据契约: 属性, 常量与插值
+
+着色器与 JavaScript 之间只有三条数据通道, 理解它们的更新频率是性能优化的前提:
+
+顶点属性 (attribute):: 每个顶点一份的数据, 来自 `ARRAY_BUFFER`, 只能用于顶点着色器.
+常量 (uniform):: 每次绘制调用内所有顶点与片元共享的值, 如矩阵, 光照参数, 时间, 采样器.
+插值变量 (varying):: 顶点着色器输出, 片元着色器输入的变量, 光栅化阶段按重心坐标插值.
+
+[options="header",cols="2,3,3,4"]
+|===
+|限定符 |可见阶段 |更新频率 |典型用途
+
+|`attribute`(WebGL 2 写作 `in`)
+|顶点着色器
+|每个顶点
+|位置, 法线, UV, 顶点色
+|`uniform`
+|所有着色器
+|每次绘制调用
+|MVP 矩阵, 光照参数, 时间, 采样器
+|`varying`(WebGL 2 写作 `out` / `in`)
+|顶点输出, 片元输入
+|逐片元插值
+|UV, 法线, 世界坐标
+|`const`
+|编译期
+|不变
+|常量, 数组长度
+|===
+
+`vertexAttribPointer` 的参数决定了如何从缓冲区中"切"出每个顶点的属性:
+
+[source,javascript]
+----
+const stride = 5 * 4;                    // 位置 xyz + UV, float 占 4 字节
+gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, stride, 0);
+gl.vertexAttribPointer(uvLoc,  2, gl.FLOAT, false, stride, 3 * 4);   // 偏移量为字节数
+----
+
+交错存放(interleaved)比多个独立缓冲区更利于缓存命中, 一次 `bufferData` 即可上传整块数据. 几何体复用顶点时配合索引缓冲可以减少顶点处理开销:
+
+[source,javascript]
+----
+const quad = new Float32Array([
+  -0.5, -0.5,   0.5, -0.5,
+   0.5,  0.5,  -0.5,  0.5,
+]);
+const indices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);   // <1>
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+
+gl.drawElements(gl.TRIANGLES, indices.length, gl.UNSIGNED_SHORT, 0);   // <2>
+----
+<1> 索引缓冲的绑定属于 VAO 状态, 切换 VAO 时会被一并恢复.
+<2> WebGL 1 的 `UNSIGNED_SHORT` 上限为 65535 个顶点, 超出需要扩展 `OES_element_index_uint` 或改用 WebGL 2 的 `UNSIGNED_INT`.
+
+缓冲区的用途提示决定驱动的内存策略, 选错会带来每帧的隐式拷贝:
+
+* `STATIC_DRAW`: 上传一次, 多次绘制, 如静态模型.
+* `DYNAMIC_DRAW`: 频繁修改, 多次绘制, 如每帧更新的粒子位置.
+* `STREAM_DRAW`: 几乎每帧重写一次, 如视频帧, 点云流.
+
+WebGL 2.0 的 VAO 把"绑定哪个缓冲区 + 属性指针 + 启用的属性数组"打包成一个对象, 绘制前只需一次 `bindVertexArray`:
+
+[source,javascript]
+----
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, stride, 0);
+gl.bindVertexArray(null);
+
+// 绘制时
+gl.bindVertexArray(vao);
+gl.drawArrays(gl.TRIANGLES, 0, 3);
+----
+
+WARNING: `getAttribLocation` 可能返回 `-1`(变量被优化掉或拼写错误). 直接把它传给 `enableVertexAttribArray` 会产生 `INVALID_VALUE`, 而绘制仍会继续, 结果是没有几何体. 属性名建议用常量集中管理, 或在链接前用 `bindAttribLocation` 固定位置.
+
+[[webgl-texture]]
+=== 纹理
+
+纹理:: GPU 上的一块一维, 二维或三维数据, 常见用途是颜色贴图, 法线贴图, 查找表与渲染目标.
+
+创建一个可采样的纹理只需四步: 创建对象, 绑定目标, 上传像素, 设置采样参数:
+
+[source,javascript]
+----
+function createTexture(gl, image) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);    // <1>
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+  gl.generateMipmap(gl.TEXTURE_2D);                // <2>
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);   // <3>
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+----
+<1> 图片原点在左上角, 纹理坐标原点在左下角, 不翻转会得到上下颠倒的画面.
+<2> `TEXTURE_MIN_FILTER` 使用 mipmap 模式时必须生成各级纹理, 否则采样不完整, 纹理呈黑色.
+<3> WebGL 1 的非 2 的幂纹理只能用 `CLAMP_TO_EDGE`, 且不能生成 mipmap; WebGL 2 已解除该限制.
+
+在着色器中通过采样器读取纹理, 采样器本身是一个 `uniform`, 其值是**纹理单元编号**而不是纹理对象:
+
+[source,javascript]
+----
+gl.activeTexture(gl.TEXTURE0);
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.uniform1i(uSampler, 0);   // 告诉着色器从 0 号纹理单元采样
+----
+
+[source,glsl]
+----
+// GLSL ES 1.00
+uniform sampler2D u_sampler;
+varying vec2 v_uv;
+void main() {
+  gl_FragColor = texture2D(u_sampler, v_uv);
+}
+----
+
+纹理相关的高频问题:
+
+* **跨域污染:** 跨域图片默认不能作为纹理, 需服务端返回 CORS 头并设置 `image.crossOrigin = 'anonymous'`, 否则 `texImage2D` 抛 `SECURITY_ERR`.
+* **局部更新:** 大纹理每帧整张上传代价高, 应先用 `texImage2D(..., null)` 分配空间, 再用 `texSubImage2D` 只更新变化区域.
+* **Mipmap 与远处闪烁:** 缩小采样时若没有 mipmap, 会出现摩尔纹与闪烁; 生成 mipmap 后用 `LINEAR_MIPMAP_LINEAR` 可获得三线性过滤.
+* **各向异性过滤:** 斜视地面纹理会被过度模糊, 启用扩展 `EXT_texture_filter_anisotropic` 并把 `TEXTURE_MAX_ANISOTROPY_EXT` 设为设备上限可显著改善.
+* **颜色空间:** 图片像素通常处于 sRGB 编码空间, WebGL 1 不会自动解码; 参与光照计算前需在着色器中转线性, 否则暗部过暗, 亮部发灰.
+
+压缩纹理能显著降低显存占用与带宽, 但格式依赖平台, 需要按 `WEBGL_compressed_texture_s3tc`, `WEBGL_compressed_texture_etc`, `WEBGL_compressed_texture_astc` 等扩展分别提供资源.
+
+[[webgl-state]]
+=== 状态机与资源生命周期
+
+WebGL 函数的执行模式是"修改状态"与"发起绘制"分离, 绘制调用读取的是当时的状态快照. 需要重点关注的状态组有:
+
+* **当前程序:** `useProgram`, 每次切换材质都要重新设置.
+* **绑定目标:** `bindBuffer`, `bindTexture`, `bindFramebuffer`, 同名目标同时只能绑定一个对象.
+* **顶点状态:** 属性数组是否启用, 属性指针, VAO(WebGL 2).
+* **光栅化状态:** `viewport`, `cullFace`, `frontFace`, `depthFunc`, `depthMask`, `blendFunc`.
+* **像素存储:** `pixelStorei`, 影响 `texImage2D` 与 `readPixels` 的排列方式.
+
+GPU 资源由 `create*` 系列函数创建, 由 `delete*` 释放. 仅依赖垃圾回收并不安全: 显存何时归还完全不可控, 频繁切换场景时应显式删除, 并在删除后清空引用, 避免把已失效的 handle 传给下一帧.
+
+调试阶段可以在初始化末尾与关键路径上调用 `gl.getError()`, 但它会**清除错误码**, 放在每帧循环中既掩盖问题又拖慢性能:
+
+[source,javascript]
+----
+function checkError(gl, label) {
+  const error = gl.getError();
+  if (error !== gl.NO_ERROR) {
+    throw new Error(`${label} 失败, 错误码 0x${error.toString(16)}`);
+  }
+}
+----
+
+`WEBGL_debug_renderer_info` 扩展可读取真实 GPU 型号, 便于按设备分级设置画质; 复杂场景的问题定位则更适合用 Spector.js 抓取单帧, 查看每次绘制调用时的完整状态, 着色器与纹理.
+
+上下文丢失是 WebGL 与原生 OpenGL 最大的差异之一: GPU 重置, 驱动更新, 内存压力都可能导致上下文失效, 必须处理:
+
+[source,javascript]
+----
+canvas.addEventListener('webglcontextlost', (event) => {
+  event.preventDefault();      // <1>
+  cancelAnimationFrame(rafId);
+});
+
+canvas.addEventListener('webglcontextrestored', () => {
+  init();                      // <2>
+});
+----
+<1> 不调用 `preventDefault`, 浏览器不会尝试恢复上下文.
+<2> 丢失后所有缓冲区, 纹理, 着色器句柄全部失效, 只能整体重建.
+
+画布尺寸需要区分 CSS 尺寸与绘图缓冲尺寸, 否则在高 DPI 屏幕上会模糊:
+
+[source,javascript]
+----
+function resize(canvas, gl) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.floor(canvas.clientWidth * dpr);
+  const height = Math.floor(canvas.clientHeight * dpr);
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;      // 修改 width/height 会重置绘图缓冲
+    canvas.height = height;
+  }
+  gl.viewport(0, 0, width, height);   // 视口不会随画布尺寸自动更新
+}
+----
+
+[[webgl-fbo]]
+=== 离屏渲染与帧缓冲
+
+帧缓冲 (Framebuffer):: 一组附件的集合, 决定绘制结果的写入位置. 默认帧缓冲对应画布, 自定义帧缓冲可以把结果渲染到纹理, 用于后处理, 阴影贴图与 VR 双目渲染.
+
+[source,javascript]
+----
+function createTarget(gl, width, height) {
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+
+  const color = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, color);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0,
+                gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+
+  const depth = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, width, height);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+    throw new Error('帧缓冲不完整');
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fbo, color };
+}
+----
+
+使用时 `bindFramebuffer(gl.FRAMEBUFFER, target.fbo)` 渲染, 完成后切回 `null` 再全屏绘制该纹理. 三个约束必须遵守:
+
+* **完整性检查:** 附件尺寸不一致, 格式不受支持都会导致不完整, 不检查会得到全黑结果.
+* **避免读写同一纹理:** 同一纹理同时作为采样输入与颜色附件属于未定义行为, 需要两张纹理交替使用.
+* **谨慎使用 `readPixels`:** 它是同步调用, 会强制等待 GPU 完成并打断流水线, 截图类需求应做节流.
+
+WebGL 2.0 支持多渲染目标, 一次绘制可写入多张纹理, 常用于延迟着色中的位置, 法线, 颜色缓冲:
+
+[source,javascript]
+----
+gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+----
+
+对应着色器需使用 `#version 300 es` 并声明多个输出:
+
+[source,glsl]
+----
+#version 300 es
+precision highp float;
+layout(location = 0) out vec4 outColor;
+layout(location = 1) out vec4 outNormal;
+----
+
+[[webgl-depth]]
+=== 深度测试, 面剔除与混合
+
+三项固定功能状态决定了"看不见的像素如何处理":
+
+[source,javascript]
+----
+gl.enable(gl.DEPTH_TEST);
+gl.depthFunc(gl.LESS);          // 通过深度测试才写入
+gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+gl.enable(gl.CULL_FACE);
+gl.cullFace(gl.BACK);
+gl.frontFace(gl.CCW);           // 默认逆时针为正面
+
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+----
+
+* **深度测试:** 深度缓冲的精度与 `near`/`far` 的比值强相关, 场景跨度大时应使用对数深度或多级视锥. 忘记清除深度缓冲会让上一帧的遮挡关系残留在新帧中.
+* **面剔除:** 剔除依赖顶点绕序, 与 `frontFace` 必须一致. 使用负缩放做镜像时绕序会翻转, 需要同步调整 `cullFace`.
+* **透明混合:** 混合结果与绘制顺序相关, 正确做法是先绘制不透明物体(开启深度写入), 再按由远及近的顺序绘制透明物体, 并在此期间 `gl.depthMask(false)` 关闭深度写入.
+* **预乘 Alpha:** 若纹理像素已预乘, 应使用 `gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)`; 上下文属性 `premultipliedAlpha` 则决定画布与页面合成时的处理方式.
+
+TIP: 大量重叠的透明粒子无法通过排序彻底解决, 可改用预乘 Alpha 的加法混合(`gl.ONE, gl.ONE`)或加权混合(weighted blended OIT), 在视觉可接受的范围内绕开排序.
+
+[[webgl-perf]]
+=== 性能实践
+
+GPU 的算力通常不是瓶颈, **提交开销**才是. 每次绘制都要经过状态校验, 参数转换与驱动翻译, 优化优先级如下:
+
+. **合并绘制:** 按材质与纹理把静态几何合并为少数大缓冲区, 显著减少 draw call.
+. **实例化:** 相同网格的重复出现改用实例化, 一次调用提交全部副本.
+. **收敛状态:** 用 VAO 预录属性绑定, 按纹理与着色器排序绘制, 减少冗余切换.
+. **减少同步:** 避免在每帧调用 `readPixels`, `getError`, `getParameter`, 它们会打断 CPU 与 GPU 的并行.
+
+实例化在 WebGL 2.0 中是一等能力, 只需为每个实例声明一个按实例步进的属性:
+
+[source,javascript]
+----
+gl.bindVertexArray(vao);
+gl.vertexAttribDivisor(offsetLoc, 1);                  // 每实例前进一次, 而非每顶点
+gl.drawArraysInstanced(gl.TRIANGLES, 0, 3, 10000);     // 绘制 10000 个实例
+----
+
+其余值得落实的实践:
+
+* **局部更新缓冲:** 用 `bufferSubData` 替换变化的区间, 而不是每帧 `bufferData` 重传整块.
+* **控制精度:** 片元着色器默认 `mediump`, 需要 `highp` 时先用 `getShaderPrecisionFormat` 确认设备支持; 移动端 `mediump` 往往更快.
+* **预热着色器:** 首次链接与使用会触发编译, 造成帧时间尖刺; 可在加载阶段预编译, 或用 `KHR_parallel_shader_compile` 轮询 `COMPLETION_STATUS_KHR` 异步等待.
+* **限制像素密度:** `devicePixelRatio` 上限取 2, 后处理链路可在半分辨率执行, 画质损失远小于开销收益.
+* **移出主线程:** 使用 `OffscreenCanvas` 与 Worker 把渲染循环从主线程剥离, 避免布局与事件处理干扰帧率.
+* **避免 GC 抖动:** 复用 `Float32Array` 与向量对象, 不要在渲染循环中创建缓冲区, 纹理或闭包.
+
+[[webgl-pitfalls]]
+=== 常见问题排查
+
+以下现象的共同点是**不抛异常**, 只能靠逐项排查:
+
+[options="header",cols="3,4,3"]
+|===
+|现象 |常见原因 |处理
+
+|画面全黑, 控制台无错误
+|未 `clear`, 未 `useProgram`, 属性数组未启用, 视口尺寸为 0
+|按绘制顺序逐项核对状态
+
+|几何体不显示但无报错
+|顶点超出裁剪空间, 被背面剔除, 深度测试未通过, 属性位置为 `-1`
+|临时关闭剔除与深度测试, 输出 `gl_Position` 调试
+
+|表面闪烁, 条纹
+|深度精度不足导致 z-fighting
+|增大 `near`, 收紧 `far`, 或改用对数深度
+
+|纹理全黑
+|图片未加载完成, 跨域未授权, 使用 mipmap 过滤但未生成 mipmap, 采样器未绑定纹理单元
+|在 `img.onload` 后上传, 检查 CORS 与采样参数
+
+|纹理上下颠倒
+|图片原点与纹理坐标原点不一致
+|设置 `UNPACK_FLIP_Y_WEBGL`, 或翻转 UV
+
+|画面模糊
+|绘图缓冲尺寸未按 `devicePixelRatio` 放大
+|按 `clientWidth * dpr` 设置 `canvas.width`
+
+|`toDataURL` 得到空白图
+|`preserveDrawingBuffer` 为 `false` 且画布已完成合成
+|在绘制后立即读取, 或开启 `preserveDrawingBuffer`
+
+|`INVALID_OPERATION`
+|索引超出缓冲区顶点数, 或对未启用及越界的属性数组发起绘制
+|校验索引最大值与缓冲区大小, 确认属性已启用
+
+|帧缓冲渲染结果全黑
+|附件尺寸或格式不匹配
+|调用 `checkFramebufferStatus` 校验
+
+|切到后台后动画异常
+|`requestAnimationFrame` 被节流, 恢复时时间差过大
+|按时间差推进动画并限制单帧步长
+|===
+
+按时间差驱动的渲染循环是避免"切回标签页后物体瞬移"的标准写法:
+
+[source,javascript]
+----
+let last = performance.now();
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);   // 限制单帧步长
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+----
+
+[[webgl-ecosystem]]
+=== 与引擎, WebGPU 的关系
+
+* **直接使用 WebGL:** 适合需求固定, 体积敏感, 需要精确控制 GPU 资源的场景, 如地图瓦片, 粒子系统, 视频滤镜.
+* **使用引擎:** Three.js 覆盖大多数通用 3D 场景与后处理, Babylon.js 提供更完整的材质体系与工具链, PixiJS 专注 2D 批量渲染. 引擎的价值在于场景图, 资源管理与跨平台一致行为, 代价是包体积与调试时的抽象层.
+* **WebGPU 的定位:** 提供显式管线, 计算着色器与更低的驱动开销, 是 WebGL 的长期继任者. 其兼容性与工具链成熟度尚不及 WebGL, 需要覆盖旧设备时通常以 WebGL 2.0 作为基线, 在能力检测通过后再启用 WebGPU 后端.
+* **与 Vulkan 的关系:** 二者处于不同抽象层. WebGL 通常由 ANGLE 翻译到 D3D11, Metal 或 GLES, 而 WebGPU 更接近 Vulkan/Metal/D3D12 的显式模型. 需要理解显式资源管理与同步时, 可参考 <<图形学/vulkan讲解.adoc#, Vulkan讲解>>.
+
+=== 总结
+
+* WebGL 是**状态机 + 可编程管线**, 只有顶点与片元两个阶段可编程, 不提供场景图与矩阵栈.
+* 顶点依次经过模型, 视图, 投影与透视除法进入 NDC, 再由 `gl.viewport` 映射到窗口坐标, 裁剪空间 z 范围为 stem:[-1, 1].
+* 数据通道只有 `attribute`, `uniform` 与 `varying` 三类, 分别对应每顶点, 每次绘制与逐片元插值.
+* 深度测试, 面剔除与混合是固定功能状态, 透明物体必须最后绘制且关闭深度写入.
+* 上下文可能随时丢失, 所有 GPU 资源都要具备重建能力; 画布尺寸需按 `devicePixelRatio` 设置并同步视口.
+* 性能瓶颈通常来自 draw call 数量, 状态切换与同步读取, 而非 JavaScript 的计算量.
+* WebGL 2.0 已覆盖主流浏览器, WebGPU 是长期方向, 但现阶段 WebGL 仍是兼容性最好的图形方案.

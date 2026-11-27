@@ -1,0 +1,435 @@
+== antora讲解
+
+文档一旦与代码同步演进, 就会自然分裂: 主产品一个仓库, SDK 一个仓库, 插件又是另一个仓库, 每条产品线还各自保留多条版本分支. 传统静态站点生成器以"一个目录"为输入, 只能先把这些仓库的内容复制到一处, 再手工维护版本目录与跨仓库链接; 仓库一改名, 域名一更换, 链接便大面积失效. **Antora** 换了个思路: 把文档当作可组装的资源, 由一份 playbook 声明"取哪些仓库, 哪些分支, 套哪套 UI", 构建时从 git 中收集 AsciiDoc 源文件, 归类成带版本的组件, 产出一个具备版本切换与可移植交叉引用的静态站点. 本文以当前最新稳定版 3.2.3 为例, 讲解其概念模型, 资源寻址, 版本管理与内部构建流程.
+
+=== Antora 是什么
+
+**Antora**:: 用 Node.js 实现的开源文档站点生成器, 以 AsciiDoc 为书写格式, 能从多个 git 仓库, 分支, 标签聚合内容, 生成带版本切换的静态站点.
+**Docs as Code**:: 把文档与代码同等对待的工程实践: 文档以纯文本存储, 走 git 版本控制, 用 CI/CD 构建发布, 可评审, 可回溯.
+
+它与几种常见方案的定位差异:
+
+* **Hugo / MkDocs / VitePress:** 输入是单个内容目录, 版本靠复制目录或插件模拟, 交叉引用绑定具体 URL. 适合单仓库, 单版本文档.
+* **Asciidoctor 单独使用:** 只解决"adoc 转 HTML", 不解决多仓库聚合, 版本并存, 导航组装与交叉引用.
+* **Antora:** 输入是多仓库, 多分支的 git 引用, **版本是一等公民**, 交叉引用在构建期按资源 ID 解析, 与最终 URL 无关.
+
+三个决定性设计取舍:
+
+* **内容与外观分离:** 内容仓库只存放 adoc 源文件, 外观来自可独立版本化的 UI 包
+* **站点与部署位置解耦:** 交叉引用在构建期解析为相对当前页面的 URL, 换域名或部署到子路径都不影响链接
+* **约定优于配置:** 文件放在哪个目录就决定它是什么角色, 遵循标准目录集即可, 几乎无需额外配置
+
+=== 核心概念
+
+**内容源 (Content Source)**:: playbook 中声明的一个 git 仓库条目, 可限定分支, 标签与内容源根目录. Antora 只读取匹配到的引用, 其余分支不参与构建.
+**内容源根 (Content Source Root)**:: 存放 `antora.yml` 的目录. 它可以位于仓库根, 也可以是仓库中的某个子目录, 因此文档可以与代码共处一仓.
+**Playbook**:: 站点的编排清单, 用 YAML, JSON 或 TOML 书写, 声明站点信息, 内容源, UI 包与输出位置.
+**组件 (Component)**:: 同一 `name` 下所有组件版本的集合. 组件不是独立文件, 有至少一个组件版本即存在.
+**组件版本 (Component Version)**:: 由 `antora.yml` 声明的 `name` + `version` 组合, 是内容归类与版本切换的基本单位.
+**模块 (Module)**:: 组件版本内部的内容分组, 对应 `modules/` 下的一级子目录, 默认模块名为 `ROOT`.
+**资源族 (Family)**:: 模块内按用途划分的五类资源目录: `pages`, `partials`, `examples`, `images`, `attachments`.
+**资源 ID (Resource ID)**:: 描述"某个组件版本中某个模块的某个文件"的坐标串, 是交叉引用的统一寻址方式.
+**UI 包 (UI Bundle)**:: 控制页面布局, 样式与交互的前端产物, 通常是一个 UI 项目构建出的 zip 包, 与内容完全解耦.
+
+=== 内容布局与版本声明
+
+Antora 依靠固定的目录约定识别文件角色. 一个完整的组件版本目录如下:
+
+[source,text]
+----
+repository/                     <- git 仓库根
+  antora.yml                    <- 组件版本描述符, 缺失则不收集任何内容
+  modules/
+    ROOT/                       <- 默认模块, 名称必须全大写
+      pages/                    <- 发布为页面
+      partials/                 <- 可被 include 的片段, 不单独发布
+      examples/                 <- 可被 include 的示例代码, 不单独发布
+      images/                   <- 图片, 随页面发布
+      attachments/              <- 附件 (PDF, zip 等), 以链接形式提供下载
+      nav.adoc                  <- 导航文件
+    api/                        <- 命名模块, 结构同上
+      pages/
+  packages/                     <- modules 之外的目录, Antora 直接忽略
+----
+
+`antora.yml` 必填 `name`, `version` 可在此声明或由 playbook 提供回退值, 其余按需添加:
+
+[source,yaml]
+----
+name: acme                     # 组件名, 作为资源 ID 与 URL 中的组件段
+version: '2.0'                 # 版本; 也可写 ~ (无版本) 或 true (取分支/标签名)
+title: Acme 平台                # 展示名, 默认等于 name
+display_version: 2.0 LTS       # 版本选择器中显示的文本
+prerelease: true               # 标记预发布版本, 影响"最新稳定版"的判定
+nav:                           # 导航文件, 路径相对内容源根
+- modules/ROOT/nav.adoc
+- modules/api/nav.adoc
+asciidoc:
+  attributes:                  # 组件级 AsciiDoc 属性, 随内容生效
+    toc: left
+    page-pagination: ''
+  extensions:                  # 组件级 Asciidoctor 扩展
+  - asciidoctor-kroki
+----
+
+NOTE: 3.2 起若内容源根下没有 `modules/` 目录, 根目录下的 `pages/` 等目录会被当作**隐式 ROOT 模块**, 便于轻量仓库快速起步. 多人协作的项目仍建议保留显式 `modules/` 结构.
+
+模块与族共同决定文件的可引用方式:
+
+[cols="1,1,2,2"]
+|===
+| 模块 | 族 | 引用方式 | 是否发布
+
+| ROOT | pages | `xref:` | 是
+| ROOT | partials | `include::partial$` | 否
+| ROOT | examples | `include::example$` | 否
+| ROOT | images | `image::` | 是
+| ROOT | attachments | `xref:attachment$` | 是
+|===
+
+=== 资源 ID 与交叉引用
+
+资源 ID 由五个坐标组成, 书写顺序固定:
+
+[cols="2,1,4"]
+|===
+| 坐标 | 分隔符 | 说明
+
+| 版本 (version) | `@` | 必须位于最前; 省略时取该组件的**最新版本**; `_` 指向无版本组件
+| 组件 (component) | `:` | 仅跨组件时需要
+| 模块 (module) | `:` | 仅跨模块时需要, 省略即 `ROOT`
+| 族 (family) | `$` | `page$`, `image$`, `partial$`, `example$`, `attachment$`, 由所用宏决定是否必写
+| 文件 (file) | `#` | 族目录下的相对路径; `#` 之后为页内锚点
+|===
+
+最完整的形态是 `version@component:module:family$path#fragment`, 实际书写时按"当前页面与目标资源的关系"逐级省略:
+
+[source,adoc]
+----
+xref:install.adoc[]                                   # 同模块, page$ 可省略
+xref:ROOT:install.adoc[]                              # 同组件, 跨模块
+xref:sdk:install.adoc[]                               # 跨组件, 取最新版本
+xref:1.0@acme:ROOT:install.adoc#prereq[]              # 全限定: 版本 + 组件 + 模块 + 锚点
+xref:attachment$release-notes.pdf[发行说明]            # 附件必须写 attachment$
+include::partial$common-attributes.adoc[]             # 片段
+include::example$Sample.java[tag=core]                # 示例, 支持按 tag 截取
+image::architecture.png[]                             # 同模块图片
+image::shared:logo.svg[]                              # 跨模块图片
+----
+
+要点:
+
+* **`page$` 可不写, 其余族在 xref 中必须写.** xref 默认把目标当作页面, 因此引用附件或图片时必须显式给出 `attachment$` / `image$`.
+* **include 应只用于 `partial$` 与 `example$`.** 直接 include 一个页面会绕过导航与搜索索引, 跨页复用内容应先抽到 partial.
+* **锚点缺失不会中断构建.** 指向不存在的页面会输出警告并在页面中留下断链, 建议把警告视为错误.
+* **文件名含 `+`, `#` 等保留字符时用 URI 编码**, 例如 `c%2B%2B.adoc`.
+
+每个页面在渲染前都会被注入一组以 `page-` 开头的属性, 可直接用于模板与正文:
+
+[cols="2,3"]
+|===
+| 属性 | 含义
+
+| `page-component-name` | 组件名
+| `page-component-version` | 版本号
+| `page-component-display-version` | 展示版本 (`display_version`)
+| `page-module` | 模块名
+| `page-relative-src-path` | 页面相对 `pages` 目录的路径
+| `page-origin-refname` / `page-origin-refhash` | 内容来源分支 / 提交
+| `page-origin-url` | 内容源仓库地址
+| `page-edit-url` | 由 `edit_url` 生成的"编辑此页"链接
+| `page-navtitle` | 导航与面包屑中显示的标题
+| `page-description` / `page-keywords` | 页面元数据, 供搜索与 SEO 使用
+| `page-layout` | UI 布局名, 默认 `default`, 404 页使用 `404`
+| `page-aliases` | 旧地址重定向列表, 逗号分隔
+| `page-toclevels` | 目录深度
+| `page-pagination` | 是否渲染上一页 / 下一页
+|===
+
+其中 `page-aliases` 是文档重构的实用工具: 页面迁移后, 在**新页面**上声明旧资源 ID, Antora 会生成跳转页, 保住外部链接.
+
+[source,adoc]
+----
+= 安装指南
+:page-aliases: 1.0@acme:ROOT:getting-started.adoc, acme:ROOT:old-install.adoc
+----
+
+=== Playbook: 站点编排
+
+Playbook 只描述"用哪些内容, 配什么外观, 输出到哪", 不含任何正文. 一个可直接运行的例子:
+
+[source,yaml]
+----
+site:
+  title: Acme 文档
+  url: https://docs.example.com        # 用于 canonical 链接与 sitemap
+  start_page: acme::index.adoc         # 站点首页, 格式 component:module:page
+content:
+  sources:
+  - url: https://git.example.com/acme/docs.git
+    branches: [v2.0, main]             # 分支名可写通配: [v*, '!v1.*']
+    start_path: docs                   # 内容源根在仓库中的位置
+  - url: https://git.example.com/acme/sdk-docs.git
+    branches: [main]
+    edit_url: '{web_url}/-/blob/{refname}/{path}'   # 生成"编辑此页"链接
+ui:
+  bundle:
+    url: https://git.example.com/acme/ui-bundle.zip  # 也可用 path 指向本地 zip 或目录
+  supplemental_files: ./ui-supplemental              # 覆盖个别模板与样式
+output:
+  dir: ./build/site
+urls:
+  html_extension_style: indexify       # default / drop / indexify
+asciidoc:
+  attributes:
+    experimental: ''
+    source-highlighter: highlight.js
+  extensions:
+  - asciidoctor-diagram
+antora:
+  extensions:
+  - '@antora/lunr-extension'           # 全文搜索
+runtime:
+  fetch: true                          # 等价于 CLI 的 --fetch
+  log:
+    level: info
+    failure_level: warn
+----
+
+常用的顶层键:
+
+[cols="2,3"]
+|===
+| 键 | 作用
+
+| `site.title` / `site.url` | 站点标题与对外地址
+| `site.start_page` | 站点根页面, 决定访问 `/` 时的内容
+| `site.keys` | 自定义键值, 在 UI 中通过 `site.keys.*` 读取
+| `content.sources` | 内容源列表, 每项可覆盖 `branches`, `tags`, `start_path`, `edit_url`
+| `content.branches` / `content.tags` | 为所有内容源提供默认的分支 / 标签匹配规则
+| `ui.bundle` / `ui.supplemental_files` | UI 包位置与增量覆盖目录
+| `output.dir` / `output.destinations` | 输出目录, 或推送到多个发布目标
+| `urls.html_extension_style` | URL 形态: `default` 保留 `.html`, `drop` 去掉扩展名, `indexify` 生成 `page/index.html`
+| `urls.latest_version_segment` | 最新版使用固定 URL 段 (如 `latest`), 而非具体版本号
+| `asciidoc.attributes` / `asciidoc.extensions` | 全站 AsciiDoc 属性与 Asciidoctor 扩展
+| `antora.extensions` | Antora 扩展模块 (搜索, 收集器, PDF 等)
+| `runtime.fetch` / `runtime.cache_dir` / `runtime.log` | 抓取策略, 缓存位置, 日志级别
+| `git.fetch_concurrency` / `git.fetch_depth` | 并发抓取数, 浅克隆深度
+|===
+
+相对路径默认基于**当前工作目录**; 以 `./` 开头时改为相对 playbook 文件所在目录, 这样 playbook 可以放在任意位置执行.
+
+=== 版本管理
+
+Antora 直接把 git 引用映射为文档版本, 因此"给旧版本打补丁"与"发布新版本"都复用既有分支流程:
+
+[plantuml,"多仓库多分支组装为带版本的站点",format=png]
+----
+@startuml
+skinparam defaultTextAlignment left
+
+package "产品仓库 docs.git" {
+  [分支 v2.0] as P20
+  [分支 v3.0] as P30
+}
+package "SDK 仓库 sdk-docs.git" {
+  [分支 v3.0] as S30
+}
+
+node "Antora" as A
+package "站点" {
+  [acme 2.0] as C20
+  [acme 3.0] as C30
+  [sdk 3.0] as D30
+}
+
+P20 --> A
+P30 --> A
+S30 --> A
+A --> C20 : acme 2.0
+A --> C30 : acme 3.0
+A --> D30 : sdk 3.0
+C20 -[hidden]-> C30
+@enduml
+----
+
+未出现在 playbook `branches` / `tags` 中的分支会被直接忽略, 因此 feature 分支不会污染站点.
+
+版本取值有三层来源, 优先级从高到低:
+
+. `antora.yml` 的 `version` 键, 组件自己声明
+. playbook 内容源上的 `version` 键, 作为回退值, 便于由 CI 统一控制
+. 由 refname 推导, 使用短分支名或标签名, 分支名中的 `/` 会替换为 `-`
+
+`version` 支持几种特殊写法:
+
+* `'2.0'`: 固定版本, 适合"一条分支一个版本"的场景
+* `~`: 无版本组件, URL 中不出现版本段, 并被当作最新版
+* `true`: 直接使用 refname 作为版本
+* `v(*): $1`: 投影映射, 从 `v2.0` 这类分支名中抽取 `2.0`
+
+版本排序遵循 semver 语义, 前缀 `v` 在排序时被忽略; **最新版本**是排序最高者, 无版本组件排在最前. xref 不写版本坐标时解析到最新版本, 这意味着文档内容可能随新版本发布而改变指向; 需要固定语义时应显式写出版本坐标.
+
+=== UI 包与扩展
+
+UI 包是一个独立的前端项目产物, 结构固定:
+
+[source,text]
+----
+ui-bundle.zip
+  ui.yml                 <- 声明默认布局, 例如 layout: default
+  layouts/               <- 页面骨架, default.hbs, 404.hbs
+  partials/              <- 可复用片段, header, footer, nav
+  helpers/               <- 模板辅助函数
+  css/ js/ img/ fonts/   <- 静态资源
+----
+
+三种定制方式, 侵入性递增:
+
+* **更换 UI 包版本:** 内容与外观同时升级, 适合跟随社区维护的 UI
+* **supplemental_files:** 用少量文件覆盖 UI 包中的同名模板或样式, 升级 UI 包时冲突面最小
+* **自建 UI 项目:** 完整控制布局与交互, 需要配套的构建与发布流水线
+
+扩展分为两层, 用途不同:
+
+* **Asciidoctor 扩展** (`asciidoc.extensions`): 作用于单篇文档的转换阶段, 如 `asciidoctor-diagram` 渲染 PlantUML, `asciidoctor-kroki` 走远程渲染服务
+* **Antora 扩展** (`antora.extensions`): 作用于整站构建阶段, 可读写内容目录, 注入文件, 修改站点模型. 常用扩展:
+
+[cols="2,1,3"]
+|===
+| 扩展 | 版本 | 作用
+
+| `@antora/lunr-extension` | 1.0.0-alpha.13 | 基于 Lunr 的离线全文搜索, 生成搜索索引与 UI
+| `@antora/collector-extension` | 1.0.3 | 把非 git 的外部文件 (如 OpenAPI, 生成的文档) 收集进内容目录
+| `@antora/pdf-extension` | 1.0.1 | 依据同一份内容额外产出 PDF
+|===
+
+=== 构建流程
+
+一次 `antora` 调用内部串起七个阶段:
+
+[plantuml,"Antora 构建流水线",format=png]
+----
+@startuml
+skinparam defaultTextAlignment left
+
+actor "作者" as Author
+database "git 内容源" as Git
+file "antora-playbook.yml" as PB
+node "内容聚合器\n(content aggregator)" as Agg
+node "内容分类器\n(content classifier)" as Cls
+node "内容目录\n(content catalog)" as Cat
+node "导航构建器\n(navigation builder)" as Nav
+node "页面合成器\n(page composer)" as Comp
+node "站点组装器\n(site assembler)" as Asm
+node "站点发布器\n(site publisher)" as Pub
+folder "build/site" as Out
+
+Author --> Git : 提交 / 打标签
+Author --> PB : 声明站点
+PB --> Agg
+Git --> Agg : 按分支/标签抓取
+Agg --> Cls : 原始文件
+Cls --> Cat : 带资源 ID 的文件
+Cat --> Nav
+Cat --> Comp
+Nav --> Comp : 导航树
+Comp --> Asm : HTML 与静态资源
+Asm --> Pub
+Pub --> Out
+@enduml
+----
+
+各阶段职责:
+
+. **内容聚合**: 按 playbook 克隆或更新仓库, 检出匹配的分支与标签, 定位内容源根. 本地缓存复用已有克隆, `--fetch` 才拉取远端更新.
+. **内容分类**: 读取 `antora.yml`, 把 `modules/` 下的文件映射为"模块 + 族 + 路径", 并分配资源 ID 与发布路径; 以 `_` 开头的文件默认标记为私有, 不发布.
+. **内容目录**: 汇总所有组件版本, 形成可查询的内存目录, 是后续所有寻址的唯一事实源.
+. **导航构建**: 解析 `nav.adoc` 中的 xref, 生成导航树, 同时处理版本选择器所需的组件与版本清单.
+. **页面合成**: 逐页执行 Asciidoctor 转换, 解析资源 ID, 把 xref 重写为相对 URL, 注入 `page-*` 属性, 套用 UI 布局.
+. **站点组装**: 汇总页面与静态资源, 计算发布路径, 生成 sitemap (需配置 `site.url`) 与 404 页.
+. **站点发布**: 把内存中的文件写入输出目录, 或交给 `output.destinations` 声明的发布目标.
+
+常用 CLI 选项:
+
+[cols="2,3"]
+|===
+| 选项 | 作用
+
+| `--fetch` | 抓取内容源更新 (默认只使用本地缓存)
+| `--clean` | 先清空输出目录再构建
+| `--to-dir <dir>` | 覆盖 `output.dir`
+| `--html-url-extension-style <style>` | 覆盖 URL 形态: `default` / `drop` / `indexify`
+| `--log-level <level>` | `all`, `debug`, `info`, `warn`, `error`, `fatal`, `off`
+| `--stacktrace` | 出错时打印完整堆栈
+| `--title "..."` 等 | 以 `--键 值` 形式覆盖任意 playbook 键
+| `--version` / `--help` | 版本与帮助
+|===
+
+=== 快速上手
+
+以"playbook 仓库 + 内容仓库"的典型布局为例:
+
+[source,shell]
+----
+mkdir docs-site && cd docs-site
+npm init -y
+npm install --save-dev @antora/cli@3.2 @antora/site-generator@3.2
+npx antora --fetch antora-playbook.yml
+----
+
+构建完成后, `build/site` 即为可部署的静态站点, 用任意静态服务器即可预览:
+
+[source,shell]
+----
+npx http-server build/site -p 8080
+----
+
+也可以用官方镜像在 CI 中构建, 免去 Node.js 环境准备:
+
+[source,shell]
+----
+docker run --rm -v "$PWD":/antora antora/antora:3.2.3
+----
+
+版本要求:
+
+[cols="2,3"]
+|===
+| 组件 | 要求
+
+| Antora 3.2.x | Node.js >= 20
+| Playbook | 必须包含 `content.sources`, 且至少一个条目带 `url`
+| 内容仓库 | 内容源根下必须有 `antora.yml` 与 `modules/` (或使用隐式 ROOT 布局)
+|===
+
+本地写作时, 把内容源指向工作目录并把分支设为 `HEAD`, 即可预览**未提交**的改动:
+
+[source,yaml]
+----
+content:
+  sources:
+  - url: .                # 或绝对路径
+    branches: HEAD
+    start_path: docs
+----
+
+=== 常见问题与注意事项
+
+* **版本未指定导致链接漂移:** xref 省略版本坐标时指向最新版. 对外发布的稳定文档应显式写版本, 或保留最新版的固定 URL 段.
+* **大小写敏感问题:** Linux 上 `ROOT` 与 `root`, `Pages` 与 `pages` 是不同目录, Windows 与 macOS 默认不区分. 本地能构建, CI 失败往往源于此, 目录与文件名统一使用小写 (模块 `ROOT` 除外).
+* **路径与 URL 的混淆:** 导航文件与正文中一律使用资源 ID, 不要写 `../pages/xxx.html` 之类的相对文件路径; 这类路径不受 Antora 重写, 一旦调整目录即断链.
+* **partials 与 examples 不发布:** 它们只用于 include, 不能被 xref 引用, 也不产生独立 URL.
+* **UI 包缓存:** 使用 URL 形式的 UI 包时, 内容会被缓存到 `runtime.cache_dir`, 修改远端 UI 后需配合 `--fetch` 或删除缓存.
+* **旧地址迁移:** 页面改名或挪动模块后, 用 `page-aliases` 声明旧资源 ID, 不要依赖服务器端重定向规则.
+* **构建告警不等于成功:** xref 未解析, 重复资源 ID 等都以警告形式输出, CI 中应检查日志或提高 `runtime.log.failure_level`.
+
+=== 总结
+
+Antora 解决的不是"把 AsciiDoc 渲染成 HTML", 而是"在多个仓库, 多个版本并存的前提下, 稳定地组装并寻址文档". 理解它只需抓住三点:
+
+* **一切寻址基于资源 ID**: 版本, 组件, 模块, 族, 文件五段坐标, 与部署位置无关
+* **版本来自 git 引用**: 分支与标签即版本, 通过 `antora.yml` 或 playbook 决定如何命名
+* **构建由 playbook 编排**: 内容源, UI 包, 输出目标全部外置, 同一套内容可组装出多个站点
+
+掌握标准目录集与资源 ID 之后, 剩下的工作就是把它接入流水线: 提交触发构建, `--fetch` 拉取最新内容, 产物直接发布到对象存储或静态托管服务.

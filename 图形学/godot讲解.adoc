@@ -1,0 +1,1197 @@
+== Godot讲解
+
+Godot 是一款以 MIT 协议开源的跨平台游戏引擎, 最初由 Juan Linietsky 与 Ariel Manzur 在阿根廷以内部引擎的形式开发, 2014 年 2 月正式开源, 现由社区与 Godot Foundation 共同维护. 它同时覆盖 2D 与 3D, 可导出到 Windows、Linux、macOS、Android、iOS 与 Web, 主机平台则依赖第三方移植方案. 编写本文时的稳定版本为 4.7.2.
+
+Godot 最容易被记住的特征是**"一切皆节点, 场景即类"**: 在编辑器里搭出来的场景本身就是可实例化、可继承、可组合的单元, 与代码里的类没有本质区别. 配合内置的 GDScript、可选的 C# 与 GDExtension 原生扩展, 它把"改一行就要等编译"的循环压缩到接近即时, 也让源码级调试与定制成为默认能力.
+
+与 Unity、Unreal 相比, Godot 的体积、启动速度与源码可及性是主要优势; 代价是 3D 画面上限、资产生态与商业中间件支持仍有差距. 选择引擎应先明确项目类型、团队构成与目标平台, 而不是只对比特性清单.
+
+参考: <<图形学/vulkan讲解.adoc#, Vulkan讲解>>, <<Web/webgpu讲解.adoc#, WebGPU讲解>>
+
+[[godot-what]]
+=== Godot 是什么
+
+节点 (Node):: 引擎中最小的行为单元, 承载变换、绘制、物理、UI 等职责, 通过父子关系组成树.
+场景 (Scene):: 一棵保存下来的节点树, 对应磁盘上的 `.tscn`(文本)或 `.scn`(二进制)文件, 可被实例化任意多次.
+场景树 (SceneTree):: 运行时唯一的节点树, 由主循环驱动, 负责生命周期广播、暂停、定时器与场景切换.
+资源 (Resource):: 与场景解耦、可被多方共享的数据对象, 如纹理、材质、音频、自定义数据类, 通常是 `.tres`/`.res`.
+信号 (Signal):: 节点或对象对外广播的事件, 观察者通过 `Callable` 订阅, 是引擎内建的解耦机制.
+自动加载 (Autoload):: 在项目启动时进入场景树的全局单例, 常用作设置、存档与事件总线.
+GDExtension:: 与引擎二进制解耦的原生扩展接口, 用 C++、Rust 等语言扩展引擎能力, 无需重新编译引擎.
+
+三个渲染后端构成了 Godot 4 的平台覆盖策略: **Forward+** 面向桌面, **Mobile** 面向移动与一体机, **Compatibility** 基于 OpenGL 3.3 / GLES 3.0 覆盖 Web 与老硬件. 三者的场景与脚本代码基本一致, 差异集中在光照、后处理与部分高级特性上.
+
+与其他主流引擎的定位对比:
+
+[options="header",cols="2,4,4,4"]
+|===
+|维度 |Godot |Unity |Unreal Engine
+
+|授权
+|MIT, 无订阅、无分成
+|订阅制商业授权, 无分成
+|源码可申请, 营收超过免税额后按比例分成
+
+|脚本
+|GDScript / C#(.NET 构建) / GDExtension
+|C#
+|C++ / Blueprint
+
+|场景模型
+|节点树 + 可继承的场景
+|GameObject + Prefab
+|Actor + Level + Blueprint
+
+|渲染能力
+|Forward+ / Mobile / Compatibility
+|URP / HDRP 等可编程管线
+|Nanite、Lumen 等高端特性
+
+|体量
+|编辑器约百余 MB, 免安装
+|数 GB 级, 需安装
+|数十 GB 级, 需安装
+
+|源码
+|完全开源, 可任意修改
+|闭源
+|源码可获取, 受许可约束
+
+|生态
+|成长迅速, 插件与资产持续增加
+|资产与中间件最丰富
+|3A 与影视级工具链成熟
+
+|===
+
+[[godot-design]]
+=== 设计哲学: 组合优于继承
+
+Godot 不追求"每个功能都给一个框架", 而是把结构交给开发者:
+
+* **组合优先.** 一个 `BlinkingLight` 场景可以被 `BrokenLantern` 场景实例化, 后者再被关卡批量放置. 修改 `BlinkingLight` 并保存, 所有引用它的场景立即更新, 相当于"嵌套预制体".
+
+* **场景可继承.** 以 `Character` 场景为基础建立继承场景 `Magician`, 在基类中新增节点或调整属性, 子场景自动获得; 也可在子场景里覆盖属性与脚本. 这比多数引擎的 Prefab 变体更接近面向对象的继承.
+
+* **编辑器与代码同权.** `.tscn`、`.tres` 都是纯文本, 既能在编辑器里可视化编辑, 也能手写、diff、合并. 同一套结构既可由美术搭建, 也可由程序生成, 二者可以混用.
+
+* **可读的工程文件.** `project.godot` 是 INI 风格的文本, 场景与资源同样可读, 代码评审与冲突解决比二进制资产友好得多.
+
+* **不强制架构.** 没有内建 ECS、依赖注入或 MVC, 只有节点、场景、信号与资源四种基本元素, 架构由项目自行决定.
+
+NOTE: "组合优于继承"不等于禁止继承. 实践中建议用场景组合表达"拥有"(角色拥有武器), 用场景继承表达"是一种"(法师是一种角色). 对继承场景的 `editable children` 要克制, 否则基类改动会变得难以预测.
+
+[[godot-architecture]]
+=== 运行时架构
+
+Godot 的运行时是"场景层 + 服务器层"的双层结构: 场景节点只描述意图, 真正的绘制、物理与音频由后台服务器执行. 这种拆分让节点数量与渲染开销解耦, 也让资源可以在多线程中准备.
+
+[options="header",cols="2,4,6"]
+|===
+|层次 |组件 |职责
+
+|平台抽象
+|`DisplayServer`、`AudioDriver`、`Input`
+|窗口、输入、音频设备、剪贴板、屏幕信息
+
+|主循环
+|`SceneTree`(继承 `MainLoop`)
+|推进帧、广播通知、管理场景、定时器与暂停
+
+|场景树
+|`Node` 层级
+|生命周期回调、变换、分组、可见性
+
+|服务器
+|`RenderingServer`、`PhysicsServer2D/3D`、`NavigationServer`、`AudioServer`
+|持有底层资源, 接收命令并批量提交
+
+|脚本层
+|GDScript VM、.NET 运行时、GDExtension
+|业务逻辑与编辑器插件
+
+|图形后端
+|Vulkan、Direct3D 12、OpenGL 3.3 / GLES 3.0
+|把服务器层命令翻译为 GPU 工作
+
+|===
+
+==== 主循环与两种帧
+
+一次迭代里, 引擎依次读取输入、执行脚本回调、传播变换, 再让渲染服务器提交绘制. 其中脚本回调分为两条时间线:
+
+[options="header",cols="2,4,4"]
+|===
+|维度 |`_process(delta)` |`_physics_process(delta)`
+
+|触发频率
+|跟随渲染帧, 可变
+|固定步长, 默认 60 Hz
+
+|`delta`
+|上一帧至今的秒数, 会波动
+|恒为 `1 / physics_ticks_per_second`
+
+|典型用途
+|动画插值、UI、相机跟随、输入采样
+|移动、碰撞、力与冲量
+
+|暂停行为
+|受 `process_mode` 与 `SceneTree.paused` 影响
+|同上
+
+|===
+
+原则很简单: **凡是会影响物理结果的写操作, 都放在 `_physics_process` 里**. 在 `_process` 中修改 `velocity` 再 `move_and_slide()`, 会因帧率波动导致移动距离不一致, 高刷新率屏幕上表现为抖动.
+
+[source,gdscript]
+----
+extends Sprite2D
+
+@export var speed: float = 200.0
+
+func _process(delta: float) -> void:
+    position.x += speed * delta
+----
+
+[cols="3,6"]
+|===
+|设置 |作用
+
+|`application/run/max_fps`
+|限制最大帧率, 降低功耗与发热
+
+|`display/window/vsync/vsync_mode`
+|垂直同步, 移动端通常关闭以避免额外延迟
+
+|`physics/common/physics_ticks_per_second`
+|物理步频, 提高会提升精度但增加 CPU 开销
+
+|`physics/common/physics_interpolation`
+|4.3 起支持, 物理帧与渲染帧不一致时平滑插值
+
+|===
+
+[[godot-scene]]
+=== 场景与节点
+
+Godot 用节点类型表达"能力", 用树的形状表达"关系". 常见节点按用途分为几类:
+
+[options="header",cols="2,3,5,3"]
+|===
+|类别 |基类 |典型节点 |用途
+
+|2D 节点
+|`Node2D`
+|`Sprite2D`、`AnimatedSprite2D`、`CollisionShape2D`、`Camera2D`
+|2D 游戏对象
+
+|3D 节点
+|`Node3D`
+|`MeshInstance3D`、`Camera3D`、`CharacterBody3D`、`Light3D`
+|3D 场景对象
+
+|界面
+|`Control`
+|`Button`、`Label`、`VBoxContainer`、`TextureRect`
+|GUI 与 HUD
+
+|逻辑
+|`Node`
+|`Timer`、`AnimationPlayer`、`AudioStreamPlayer`、`Marker2D`
+|无空间语义的行为
+
+|物理
+|`PhysicsBody`、`Area`
+|`RigidBody3D`、`StaticBody3D`、`Area3D`
+|碰撞、触发与查询
+
+|资源
+|`Resource`
+|`Texture2D`、`PackedScene`、`Material`、`Theme`
+|可序列化资产
+
+|===
+
+NOTE: Godot 的 2D 不是"3D 的正交投影", 而是独立的 `CanvasItem` 渲染管线. 因此 2D 有专门的像素对齐、图块地图与 2D 光照, 不需要与 3D 相机参数纠缠.
+
+场景文件是纯文本, 结构一目了然:
+
+[source,ini]
+----
+[gd_scene load_steps=3 format=3 uid="uid://bq1p2x3y4z5a"]
+
+[ext_resource type="Script" path="res://scripts/player.gd" id="1_player"]
+[ext_resource type="Texture2D" path="res://art/player.png" id="2_tex"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_1"]
+size = Vector2(24, 32)
+
+[node name="Player" type="CharacterBody2D"]
+script = ExtResource("1_player")
+
+[node name="Sprite2D" type="Sprite2D" parent="."]
+texture = ExtResource("2_tex")
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="."]
+shape = SubResource("RectangleShape2D_1")
+----
+
+实例化场景就是把"类"变成"对象":
+
+[source,gdscript]
+----
+const BULLET := preload("res://scenes/bullet.tscn")
+
+func shoot() -> void:
+    var bullet: Node2D = BULLET.instantiate()
+    bullet.global_position = $Muzzle.global_position
+    get_tree().current_scene.add_child(bullet)
+----
+
+[cols="2,5"]
+|===
+|操作 |说明
+
+|`PackedScene.instantiate()`
+|创建节点树, 但**尚未加入场景树**, 此时 `_ready` 不会执行
+
+|`add_child(node)`
+|加入树, 触发 `_enter_tree` 与 `_ready`, 开始接收回调
+
+|`remove_child(node)`
+|移出树但对象仍存在, 需自行 `queue_free` 或复用
+
+|`queue_free()`
+|延迟到帧末释放, 同帧内引用仍有效
+
+|`is_instance_valid(obj)`
+|判断对象是否已被释放, 避免访问悬空引用
+
+|===
+
+节点路径有两种写法: 绝对/相对路径(如 `$UI/HUD/ScoreLabel`)与**场景唯一名称**(在节点上右键"访问为唯一名称", 代码里写 `%ScoreLabel`). 后者在调整层级时不会失效, 是替代长路径的首选.
+
+WARNING: 子场景根节点的脚本与其所有者(owner)决定了保存边界. 如果在一个场景里修改了实例化子场景的内部节点, 必须先开启 `editable children`, 并且这些修改只会保存在父场景中, 容易造成"改了没生效"的困惑.
+
+[[godot-script]]
+=== GDScript
+
+GDScript 是为引擎量身设计的脚本语言: 语法接近 Python, 但类型系统、信号、属性访问器与引擎对象深度集成. 4.x 的类型化写法已经能在编译期发现大部分拼写与类型错误:
+
+[source,gdscript]
+----
+class_name Player
+extends CharacterBody2D
+
+@export var speed: float = 300.0
+@export var jump_velocity: float = -400.0
+
+@onready var sprite: Sprite2D = $Sprite2D
+
+var gravity: float = ProjectSettings.get_setting("physics/2d/default_gravity")
+
+func _physics_process(delta: float) -> void:
+    if not is_on_floor():
+        velocity.y += gravity * delta
+
+    if Input.is_action_just_pressed("jump") and is_on_floor():
+        velocity.y = jump_velocity
+
+    var direction := Input.get_axis("move_left", "move_right")
+    velocity.x = direction * speed
+    sprite.flip_h = direction < 0.0
+    move_and_slide()
+----
+
+常用注解:
+
+[options="header",cols="3,6"]
+|===
+|注解 |作用
+
+|`@export`
+|暴露到检查器, 可在编辑器里配置, 值随场景保存
+
+|`@export_range(0, 10, 0.1)`
+|带范围与步长的数值输入
+
+|`@export_enum("Idle", "Run", "Jump")`
+|下拉枚举
+
+|`@export_file("*.json")`
+|文件路径选择器
+
+|`@export_group("Movement")`
+|检查器分组, 让参数面板保持可读
+
+|`@onready`
+|在 `_ready` 之前赋值, 用于缓存子节点引用
+
+|`@tool`
+|脚本在编辑器内也会执行, 用于工具与预览
+
+|`@rpc`
+|声明可被网络同步调用的方法
+
+|`@abstract`
+|抽象类, 不能直接实例化, 只能被继承
+
+|===
+
+语言层面还有几处值得利用:
+
+* **类型化容器:** `Array[int]`、`Array[Enemy]`, 以及 4.4 起的 `Dictionary[String, int]`, 能显著减少运行时类型判断.
+
+* **`await`:** 直接等待信号或协程返回值, 写异步流程不需要回调嵌套.
++
+[source,gdscript]
+----
+func die() -> void:
+    $AnimationPlayer.play("death")
+    await $AnimationPlayer.animation_finished
+    queue_free()
+----
+
+* **属性访问器:** `set`/`get` 语法把校验与副作用写在一起, 修改属性即可触发信号.
++
+[source,gdscript]
+----
+signal health_changed(old_value: int, new_value: int)
+
+@export var max_health: int = 100
+
+var health: int = 100:
+    set(value):
+        var clamped := clampi(value, 0, max_health)
+        if clamped == health:
+            return
+        var old := health
+        health = clamped
+        health_changed.emit(old, health)
+----
+
+* **Lambda 与 Callable:** 一次性回调可以直接内联, 无需为每个事件单独定义方法.
++
+[source,gdscript]
+----
+var tween := create_tween()
+tween.tween_callback(func() -> void: print("done"))
+----
+
+与 C# 的取舍一直有争议, 实际差异集中在工具链而非语法:
+
+[options="header",cols="2,4,4"]
+|===
+|维度 |GDScript |C#
+
+|运行环境
+|引擎内置 VM, 开箱即用
+|需安装 .NET SDK, 并使用 .NET 版编辑器
+
+|性能
+|解释执行字节码, 热点循环较慢
+|JIT 更快, 但每次调用引擎 API 仍有封送开销
+
+|热重载
+|保存即生效, 支持运行时改脚本
+|受限, 通常需要重启运行
+
+|生态
+|仅引擎 API 与插件
+|完整 .NET 生态与第三方库
+
+|适用
+|原型、中小项目、编辑器工具
+|大型项目、已有 C# 团队、需要复用 .NET 库
+
+|===
+
+NOTE: 大多数项目的瓶颈在节点数量、draw call 与物理查询, 而不是脚本语言本身. 先用性能剖析器定位热点, 再决定是否把个别函数下沉到 C# 或 GDExtension, 收益通常比整体换语言更直接.
+
+[[godot-signals]]
+=== 信号: 松耦合的事件机制
+
+信号把"发生了什么"与"谁关心"分开. 发送方只负责 `emit`, 无需知道订阅者是谁:
+
+[source,gdscript]
+----
+# coin.gd
+signal collected(amount: int)
+
+@export var amount: int = 1
+
+func _on_body_entered(body: Node2D) -> void:
+    if body is Player:
+        collected.emit(amount)
+        queue_free()
+----
+
+[source,gdscript]
+----
+# level.gd
+@onready var score_label: Label = %ScoreLabel
+
+func _ready() -> void:
+    for coin in get_tree().get_nodes_in_group("coins"):
+        coin.collected.connect(_on_coin_collected.bind(coin))
+
+func _on_coin_collected(amount: int, coin: Node2D) -> void:
+    GameState.add_score(amount)
+    score_label.text = str(GameState.score)
+----
+
+[cols="4,6"]
+|===
+|连接选项 |含义
+
+|`CONNECT_ONE_SHOT`
+|只触发一次后自动断开
+
+|`CONNECT_DEFERRED`
+|延迟到空闲帧调用, 避免在物理回调中直接改树
+
+|`CONNECT_REFERENCE_COUNTED`
+|按引用计数断开, 适合多个订阅者共享同一连接
+
+|`CONNECT_PERSIST`
+|编辑器里建立的连接, 随场景保存
+
+|===
+
+信号与直接调用的边界可以这样划分:
+
+* **向上通报用信号:** 子节点不关心父节点是谁, 只广播事件.
+
+* **向下配置用属性与接口:** 父节点通过 `@export` 注入依赖或调用子节点方法, 不要靠长路径反查.
+
+* **跨系统通信用自动加载的事件总线:** 例如 `EventBus.damage_taken`、`EventBus.level_loaded`. 但要克制, 全局信号会让调用链难以追踪, 只放真正跨模块的事件.
+
+[[godot-resource]]
+=== 资源系统: 数据与场景分离
+
+资源是可以被多个场景引用的数据对象, 也是 Godot 实现数据驱动的主要手段.
+
+[options="header",cols="3,4,5"]
+|===
+|加载方式 |时机 |适用场景
+
+|`preload("res://...")`
+|解析/编译期, 必须是常量路径
+|确定存在且启动时就需要的小资源
+
+|`load("res://...")`
+|首次调用时同步加载
+|条件加载、路径拼接、编辑器工具
+
+|`ResourceLoader.load_threaded_request()`
+|后台线程加载, 主线程轮询状态
+|大场景、大贴图, 避免卡帧
+
+|`ResourceSaver.save()`
+|运行时写盘
+|存档、用户生成内容
+
+|===
+
+自定义资源让策划数据脱离代码:
+
+[source,gdscript]
+----
+class_name EnemyStats
+extends Resource
+
+@export var display_name: String = ""
+@export var max_health: int = 100
+@export var move_speed: float = 120.0
+@export var sprite: Texture2D
+----
+
+保存为 `.tres` 后即可在检查器里配置, 并在任意场景中通过 `@export var stats: EnemyStats` 引用:
+
+[source,ini]
+----
+[gd_resource type="Resource" script_class="EnemyStats" load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scripts/enemy_stats.gd" id="1"]
+
+[resource]
+script = ExtResource("1")
+display_name = "Slime"
+max_health = 30
+move_speed = 90.0
+----
+
+WARNING: 资源默认是**共享**的. 在运行时修改 `stats.max_health` 会影响所有引用它的敌人. 需要独立副本时用 `stats.duplicate(true)`, 或在资源上开启 `resource_local_to_scene`.
+
+导入流水线也值得理解清楚:
+
+* 把图片、模型、音频拖进 `res://` 时, 引擎会生成导入设置(`*.import`)与导入产物(位于 `.godot/imported/`).
+
+* 4.4 起脚本与资源还会生成 `.uid` 文件, 记录稳定的资源标识; 移动或重命名文件时引用不会断链.
+
+* **提交到版本库:** `project.godot`、`*.tscn`、`*.tres`、`*.import`、`*.uid`、脚本与原始资产. **不要提交** `.godot/` 目录与导出产物.
+
+* 全新克隆或 CI 环境里, 先执行一次导入, 否则导出会缺少资源:
++
+[source,bash]
+----
+godot --headless --import
+----
+
+[[godot-flow]]
+=== 场景切换与全局状态
+
+场景树的根是一个 `Window`, 当前关卡是它的子节点之一. 切换场景的推荐写法:
+
+[source,gdscript]
+----
+func goto_level(path: String) -> void:
+    var err := get_tree().change_scene_to_file(path)
+    if err != OK:
+        push_error("切换场景失败: %s (%s)" % [path, error_string(err)])
+----
+
+* `change_scene_to_file` 在帧末执行, 会释放旧场景, 适合关卡级切换.
+
+* `change_scene_to_packed` 配合 `load_threaded_request` 预加载, 可配合过场动画消除卡顿.
+
+* 游戏内的"菜单暂停"不要切场景, 用 `get_tree().paused = true` 配合 `process_mode` 更轻量.
+
+自动加载单例是跨场景保留状态的常规做法:
+
+[source,gdscript]
+----
+# res://autoload/game_state.gd, 在 项目设置 > 自动加载 中注册为 GameState
+extends Node
+
+signal score_changed(score: int)
+
+var score: int = 0:
+    set(value):
+        score = value
+        score_changed.emit(score)
+
+func add_score(amount: int) -> void:
+    score += amount
+----
+
+NOTE: 自动加载按注册顺序进入树, 因此单例之间不要在建树期互相依赖; 需要初始化顺序时, 在 `_ready` 里做延迟初始化, 或改为显式注入.
+
+[[godot-input]]
+=== 输入
+
+输入先用**动作(action)**抽象, 再由 InputMap 绑定到键位、手柄、触摸与鼠标. 这样键位改动只发生在项目设置里:
+
+[source,gdscript]
+----
+var direction := Input.get_vector("move_left", "move_right", "move_up", "move_down")
+velocity = direction * speed
+----
+
+[cols="3,7"]
+|===
+|接口 |说明
+
+|`Input.is_action_pressed()`
+|持续按住, 适合移动与蓄力
+
+|`Input.is_action_just_pressed()`
+|本帧按下, 适合跳跃与交互
+
+|`Input.get_axis(neg, pos)`
+|返回 `-1.0 ~ 1.0` 的轴值, 自带平滑与死区
+
+|`Input.get_vector(neg_x, pos_x, neg_y, pos_y, deadzone)`
+|归一化的二维向量, 斜向不会超速
+
+|===
+
+事件传播顺序决定了 UI 与游戏的输入边界:
+
+1. `Node._input(event)`: 最早, 适合全局快捷键与调试.
+
+2. `Control._gui_input(event)` / `_shortcut_input(event)`: 焦点控件与快捷键优先消费.
+
+3. `Node._unhandled_key_input(event)`: 未被 UI 处理的键盘事件.
+
+4. `Node._unhandled_input(event)`: 最后兜底, 游戏逻辑通常写在这里.
+
+处理完事件后调用 `get_viewport().set_input_as_handled()`, 避免同一次点击被多层逻辑重复响应. 另外, `is_action_just_pressed` 在 `_physics_process` 中返回的是自上一物理帧以来的按下状态, 与渲染帧的采样时刻并不一致; 对输入精度要求高的场景(连招、快速点按)应在 `_input` 里记录时间戳, 而不是每帧轮询.
+
+[[godot-physics]]
+=== 物理
+
+Godot 的物理由服务器层统一调度, 场景里的物理体只是"配置 + 回调"的载体. 三种常用物理体:
+
+[options="header",cols="2,3,5"]
+|===
+|类型 |受引擎驱动 |典型用途
+
+|`RigidBody`
+|是, 由求解器决定运动
+|箱子、碎石、可推动物体
+
+|`CharacterBody`
+|否, 由代码决定运动
+|玩家、敌人、平台跳跃角色
+
+|`StaticBody`
+|静止
+|地面、墙壁
+
+|`Area`
+|不参与求解, 只检测重叠
+|触发区、伤害区、拾取范围
+
+|===
+
+3D 角色的标准写法(重力需要自己施加):
+
+[source,gdscript]
+----
+extends CharacterBody3D
+
+@export var speed: float = 5.0
+@export var jump_velocity: float = 4.5
+
+func _physics_process(delta: float) -> void:
+    if not is_on_floor():
+        velocity += get_gravity() * delta
+
+    if Input.is_action_just_pressed("jump") and is_on_floor():
+        velocity.y = jump_velocity
+
+    var input_dir := Input.get_vector("left", "right", "forward", "back")
+    var direction := (transform.basis * Vector3(input_dir.x, 0.0, input_dir.y)).normalized()
+    velocity.x = direction.x * speed
+    velocity.z = direction.z * speed
+
+    move_and_slide()
+----
+
+碰撞**层(layer)** 表示"我属于哪些层", **掩码(mask)** 表示"我检测哪些层". 二者都是位掩码, 常见配置:
+
+[options="header",cols="2,4,5"]
+|===
+|层 |归属 |检测对象
+
+|1
+|World(地面、墙体)
+|Player、Enemy、Projectile
+
+|2
+|Player
+|World、Enemy、Pickup
+
+|3
+|Enemy
+|World、Player、Projectile
+
+|4
+|Projectile
+|World、Enemy
+
+|===
+
+关于物理引擎本身:
+
+* 2D 使用内置的 GodotPhysics2D, 稳定且够用.
+
+* 3D 可选 GodotPhysics3D 或 **Jolt**(4.4 起作为内置模块随引擎发布, 在项目设置的 `physics/3d/physics_engine` 中切换). Jolt 在堆叠稳定性、连续碰撞与多线程求解上更好, 新项目建议直接选用.
+
+* 高速物体穿透是离散检测的固有问题, 给小体积弹丸开启连续碰撞检测(`continuous_cd`), 或改用射线/形状投射做命中判定.
+
+* 物理时间步固定, 若渲染帧率与物理帧不一致, 开启物理插值可消除视觉抖动.
+
+WARNING: 非等比缩放会破坏碰撞形状的假设, 在 3D 中尤其容易导致"看起来碰到了却没碰撞". 需要缩放时优先缩放网格资源, 而不是缩放物理体.
+
+[[godot-render2d]]
+=== 2D 渲染
+
+2D 的绘制单元是 `CanvasItem`, 所有 2D 节点都继承自它. 自定义绘制用 `_draw()`:
+
+[source,gdscript]
+----
+extends Node2D
+
+func _draw() -> void:
+    draw_circle(Vector2.ZERO, 32.0, Color.ORANGE)
+    draw_line(Vector2(-40, 0), Vector2(40, 0), Color.WHITE, 2.0)
+
+func _process(delta: float) -> void:
+    rotation += delta
+    queue_redraw()
+----
+
+`_draw()` 只在需要时执行, 修改了绘制内容后必须调用 `queue_redraw()`; 每帧重绘会带来持续开销, 只应在内容确实变化时使用.
+
+2D 侧值得掌握的能力:
+
+* **图块地图:** 4.3 起 `TileMapLayer` 取代 `TileMap`, 每个图层是一个独立节点, 便于分层渲染与碰撞配置.
+
+* **2D 光照:** `PointLight2D` 配合 `LightOccluder2D` 生成阴影, `CanvasModulate` 控制整体环境色, 适合洞穴与夜景.
+
+* **视差:** 4.3 起的 `Parallax2D` 比旧的 `ParallaxBackground`/`ParallaxLayer` 更易组合, 支持重复滚动与自动偏移.
+
+* **相机:** `Camera2D` 的 `position_smoothing_enabled` 与 `limit_*` 可做跟随与边界约束, 比手写插值更省心.
+
+* **像素风:** 把 `rendering/textures/canvas_textures/default_texture_filter` 设为 Nearest, 并让窗口缩放保持整数倍, 否则像素会被插值糊掉.
+
+[[godot-render3d]]
+=== 3D 渲染
+
+3D 的能力边界主要由渲染后端决定:
+
+[options="header",cols="2,3,3,5"]
+|===
+|后端 |API |目标平台 |取舍
+
+|Forward+
+|Vulkan、Direct3D 12
+|桌面
+|集群光照、SDFGI、体积雾、屏幕空间效果齐全
+
+|Mobile
+|Vulkan、Direct3D 12
+|移动、一体机
+|面向 tile GPU 优化, 减少带宽与后处理
+
+|Compatibility
+|OpenGL 3.3 / GLES 3.0
+|Web、老硬件、低端设备
+|特性最少, 但覆盖面最广, 老设备上最稳
+
+|===
+
+全局光照有三条路线, 选择取决于场景是否需要动态变化:
+
+[options="header",cols="2,3,5"]
+|===
+|方案 |预计算 |适用场景
+
+|`LightmapGI`
+|离线烘焙
+|静态场景、室内, 质量最高且运行开销最低
+
+|`VoxelGI`
+|离线烘焙体素
+|中小型动态场景, 支持移动光源与反射
+
+|`SDFGI`
+|运行时逐步收敛(仅 Forward+)
+|大世界、程序化场景, 无烘焙成本但有收敛延迟
+
+|===
+
+场景搭建的常用节点: `Camera3D`、`MeshInstance3D`、`DirectionalLight3D`/`OmniLight3D`/`SpotLight3D`、`WorldEnvironment`(承载 `Environment`)、`ReflectionProbe`、`GPUParticles3D`. 4.7 新增的 `AreaLight3D` 提供矩形面光源, 能做出更柔和的面光源阴影与反射, 适合屏幕、广告牌、天窗这类发光面, 但开销明显高于点光源, 不宜大量堆叠.
+
+材质方面, `StandardMaterial3D` 覆盖绝大多数 PBR 需求; 需要自定义效果时写 `ShaderMaterial`. 性能上的常规手段:
+
+* **遮挡剔除(occlusion culling):** 在编辑器里烘焙, 大场景中能砍掉大量不可见 draw call.
+
+* **可见范围(visibility range):** 按距离切换网格或直接隐藏, 是轻量级 LOD.
+
+* **MultiMesh:** 大量相同网格(草地、石头、子弹)用一个 draw call 提交.
+
+* **导入 LOD:** 引擎可为导入的网格自动生成 LOD 层级, 在远处降面数.
+
+* **阴影预算:** 每盏带阴影的灯都是一次额外渲染, 优先用一盏方向光承担主阴影.
+
+[[godot-animation-ui]]
+=== 动画与界面
+
+动画有三套工具, 按"谁来决定时间"区分:
+
+[options="header",cols="2,4,5"]
+|===
+|工具 |驱动方 |适用场景
+
+|`AnimationPlayer`
+|预先编排的关键帧
+|角色动作、UI 过场、材质参数动画
+
+|`AnimationTree`
+|状态机与混合空间
+|移动、攻击、受击等需要按输入切换的状态
+
+|`Tween`
+|代码创建的补间
+|一次性动效: 弹窗、飘字、相机推拉
+
+|===
+
+[source,gdscript]
+----
+func pop() -> void:
+    var tween := create_tween()
+    tween.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+    tween.tween_property(self, "scale", Vector2.ONE, 0.25).from(Vector2.ZERO)
+----
+
+界面基于 `Control` 的锚点与容器系统, 而不是绝对坐标:
+
+* 用 `VBoxContainer`、`HBoxContainer`、`GridContainer`、`MarginContainer` 组合布局, 让 UI 随分辨率自适应.
+
+* `size_flags_horizontal = Control.SIZE_EXPAND_FILL` 控制子控件是否抢占剩余空间.
+
+* 外观统一交给 `Theme` 资源, 避免在几十个节点上逐个覆盖样式.
+
+* `display/window/stretch/mode = "canvas_items"` 配合 `aspect = "expand"`, 是横版与移动端通用的缩放策略.
+
+* 4.5 起支持把控件的无障碍描述暴露给屏幕阅读器, 做发行版时应顺带补齐.
+
+[[godot-shader]]
+=== 着色器
+
+Godot 有自己的着色语言, 文件后缀 `.gdshader`, 按用途分为几种类型:
+
+[options="header",cols="2,5"]
+|===
+|类型 |作用
+
+|`canvas_item`
+|2D 与 UI, 处理 `COLOR`、`UV`、`TEXTURE`
+
+|`spatial`
+|3D 材质, 处理 `ALBEDO`、`METALLIC`、`ROUGHNESS`、`NORMAL`
+
+|`sky`
+|天空盒与程序化天空
+
+|`fog`
+|体积雾
+
+|`particles`
+|粒子行为与外观
+
+|===
+
+2D 闪白效果:
+
+[source,glsl]
+----
+shader_type canvas_item;
+
+uniform vec4 flash_color : source_color = vec4(1.0);
+uniform float flash_amount : hint_range(0.0, 1.0) = 0.0;
+
+void fragment() {
+    vec4 base = texture(TEXTURE, UV);
+    COLOR = vec4(mix(base.rgb, flash_color.rgb, flash_amount), base.a);
+}
+----
+
+3D 自定义材质的核心输出:
+
+[source,glsl]
+----
+shader_type spatial;
+
+uniform sampler2D albedo_tex : source_color, filter_linear_mipmap;
+
+void fragment() {
+    ALBEDO = texture(albedo_tex, UV).rgb;
+    ROUGHNESS = 0.6;
+    METALLIC = 0.0;
+}
+----
+
+* **uniform 提示符**决定检查器控件: `source_color` 让颜色参与色彩空间转换, `hint_range` 生成滑杆, `filter_linear_mipmap` 指定采样方式.
+
+* **`#include`** 可拆分公共函数, 建议放到 `res://shaders/*.gdshaderinc`.
+
+* **VisualShader** 提供节点式编辑, 适合美术侧微调; 复杂逻辑仍建议写成文本着色器便于审查.
+
+* 4.7 起文本着色器支持**内联预览**, 编辑 `vec2`、`float` 表达式时可直接看到结果, 调参与排错效率明显提升.
+
+[[godot-perf]]
+=== 性能与多线程
+
+需要先接受一条硬约束: **场景树与绝大多数节点 API 只能在主线程调用**. 从工作线程直接 `add_child`、修改 `position` 或访问节点, 都可能引发崩溃或难以复现的竞态.
+
+合法的并行方式有三种:
+
+* **`call_deferred` / `Callable.call_deferred()`:** 把结果回传主线程再操作节点.
+
+* **`WorkerThreadPool`:** 提交纯计算任务, 适合网格生成、寻路预处理、数据解析.
++
+[source,gdscript]
+----
+func _ready() -> void:
+    var task_id := WorkerThreadPool.add_task(_heavy_work)
+    WorkerThreadPool.wait_for_task_completion(task_id)
+
+func _heavy_work() -> void:
+    var total := 0
+    for i in 1_000_000:
+        total += i
+    call_deferred("_apply_result", total)
+
+func _apply_result(total: int) -> void:
+    %ResultLabel.text = str(total)
+----
+
+* **资源后台加载:** `ResourceLoader.load_threaded_request()` + `load_threaded_get_status()` 轮询, 配合加载界面即可避免大场景卡顿.
+
+排查性能问题的顺序应该是:
+
+1. 打开 **Debugger > Profiler** 与 **Visual Profiler**, 确认耗时在脚本、物理还是渲染.
+
+2. 看 **Monitors**: 对象数、节点数、draw call、物理活动对象数与显存占用.
+
+3. 检查是否每帧 `get_node`、频繁 `instantiate`、反复拼接字符串或创建临时数组.
+
+4. 再考虑对象池、`MultiMesh`、批处理与把热点下沉到原生代码.
+
+NOTE: 节点本身不贵, 贵的是每帧回调与不可见仍在绘制的对象. 关闭 `set_process(false)`、隐藏远处节点、减少同时带阴影的光源, 往往比优化脚本语法更有效.
+
+[[godot-export]]
+=== 构建与导出
+
+导出需要先安装**导出模板**(编辑器菜单"管理导出模板"), 然后为每个目标平台创建预设. 命令行导出适合接入 CI:
+
+[source,bash]
+----
+godot --headless --import
+godot --headless --export-release "Windows Desktop" "build/coduct.exe"
+----
+
+[options="header",cols="2,7"]
+|===
+|平台 |注意事项
+
+|Windows
+|可选择单文件内嵌 PCK; 发布前做好代码签名, 减少杀软误报
+
+|Linux
+|注意 glibc 版本与目标发行版一致; Steam 上建议用 Steam Runtime 构建
+
+|macOS
+|需 Universal(arm64 + x86_64) 产物、签名与公证, 否则用户首次打开会被拦截
+
+|Android
+|使用 Gradle 构建, 发布走 AAB; 密钥库与密码不要写进仓库
+
+|iOS
+|导出 Xcode 工程后在 Xcode 内签名; 图形后端为 Metal
+
+|Web
+|只能使用 Compatibility 渲染器, 且需通过 HTTP(S) 访问; 启用线程要正确配置 COOP/COEP 响应头
+
+|主机
+|引擎不直接提供导出模板, 需通过第三方移植与平台授权
+
+|===
+
+Web 导出的两个常见误区: 一是直接双击 `index.html` 打开, 浏览器会因安全策略拒绝加载 wasm; 二是包体过大, 首屏需要等待数十 MB 的资源下载. 前者用本地 HTTP 服务器解决, 后者通过分包、压缩纹理与延迟加载处理.
+
+[[godot-gdextension]]
+=== GDExtension 与生态
+
+GDExtension 是 Godot 4 的原生扩展机制, 取代了 3.x 的 GDNative:
+
+* 扩展以动态库形式提供, 通过 `.gdextension` 文件描述入口与各平台库路径, 无需重新编译引擎.
+
+* 主流语言绑定包括 **C++(godot-cpp)** 与 **Rust(godot-rust/gdext)**, 社区还提供 Swift、Kotlin 等绑定.
+
+* 典型用途: 性能热点、接入中间件 SDK、访问平台原生能力(推送、支付、DRM).
+
+WARNING: GDExtension 与引擎版本存在 ABI 绑定关系, 升级引擎版本后必须重新编译并重新分发各平台产物. 插件作者应明确声明支持的引擎版本范围.
+
+生态方面, 4.7 起编辑器内的 **Asset Store** 取代原 Asset Library 入口, 提供评分、预览缩放与后台线程加载. 社区常用工具包括:
+
+[cols="3,6"]
+|===
+|工具 |用途
+
+|GUT / GdUnit4
+|单元测试框架, 支持无头模式, 可接入 CI
+
+|Dialogic
+|对话与剧情编排
+
+|Terrain3D
+|大规模地形编辑
+
+|Phantom Camera
+|相机行为与镜头切换
+
+|Beehave
+|行为树
+
+|===
+
+[[godot-practice]]
+=== 工程实践
+
+**目录结构.** 按"场景 / 脚本 / 资产 / 全局"分层, 让新人一眼能找到入口:
+
+[source,text]
+----
+res://
+├── project.godot
+├── autoload/        # 全局单例
+├── scenes/          # 关卡、角色、UI 场景
+├── scripts/         # 独立脚本与数据类
+├── assets/          # 原始美术与音频
+├── shaders/
+└── tests/
+----
+
+**命名约定.** 文件与目录用 `snake_case`, 类名用 `PascalCase`, 信号用过去式(`health_changed`), 常量用 `UPPER_SNAKE_CASE`. 与引擎保持一致能减少上下文切换.
+
+**场景粒度.** 一个场景对应一个可复用单元: 玩家、敌人、子弹、HUD、关卡各是一个场景. 关卡通过实例化引用其他场景, 而不是把所有东西塞进一个巨大的 `.tscn`.
+
+**依赖注入.** 用 `@export var target: Node` 在编辑器里指定引用, 或用 `%UniqueName` 取唯一名称; 避免 `get_node("../../../UI/HUD/Bar")` 这种一改层级就崩的写法.
+
+**自动加载要克制.** 只放真正全局的东西: 设置、存档、音频总线、事件总线. 把业务状态塞进单例, 很快会变成难以测试的"上帝对象".
+
+**版本控制.** 提交 `project.godot`、场景与资源、`*.import`、`*.uid`、脚本; 忽略 `.godot/`、`build/`、平台工程目录. 团队统一引擎小版本, 避免资源格式反复转换.
+
+**持续集成.** 最小流水线是"导入 -> 导出 -> 冒烟测试":
+
+[source,bash]
+----
+godot --headless --import
+godot --headless --export-release "Linux" build/game.x86_64
+godot --headless -s addons/gut/gut_cmdln.gd -gdir=res://tests -gexit
+----
+
+**存档设计.** 用 `user://` 目录写入, 格式可选 `ConfigFile`、JSON 或 `ResourceSaver`. 存档必须带版本号与迁移逻辑, 否则上线后加一个字段就可能让老存档损坏.
+
+[[godot-pitfalls]]
+=== 常见问题排查
+
+[options="header",cols="3,4,4"]
+|===
+|现象 |常见原因 |处理方式
+
+|`Cannot call method on a null instance`
+|`@onready` 变量在 `_init` 中使用, 或节点路径写错
+|挪到 `_ready` 之后使用, 改用唯一名称(`%Name`)或 `@export` 注入
+
+|`Node not found`
+|节点被重命名、移动, 或子场景未实例化
+|避免长路径, 用唯一名称; 检查场景是否真的实例化
+
+|同一个回调被执行多次
+|节点重复 `add_child` 或重复 `connect`
+|连接前判断 `is_connected`, 或使用 `CONNECT_ONE_SHOT`
+
+|角色移动抖动、距离不一致
+|在 `_process` 里修改 `velocity` 并 `move_and_slide`
+|移到 `_physics_process`, 并开启物理插值
+
+|物体穿透
+|高速运动 + 离散碰撞
+|开启连续碰撞检测, 或改用射线/形状投射
+
+|改了一个实例的属性, 其他实例也变了
+|`Resource` 默认共享
+|`duplicate(true)` 或 `resource_local_to_scene`
+
+|导出后缺少资源、贴图变黑
+|`.godot/` 未重建, 或资源未导入
+|CI 先跑 `--headless --import`; 本地删除 `.godot/` 重开编辑器
+
+|Web 版黑屏
+|用 `file://` 直接打开, 或使用 Forward+ 后端
+|用本地 HTTP 服务器, 切换 Compatibility 渲染器
+
+|像素图发糊
+|默认线性过滤 + 非整数倍缩放
+|设置 Nearest 过滤, 使用整数缩放
+
+|帧率周期性下跌
+|每帧 `instantiate`、`get_node` 或频繁分配
+|缓存引用、对象池、减少临时对象
+
+|`queue_free` 后引用仍被访问
+|删除是帧末延迟执行
+|置空引用, 或用 `is_instance_valid` 判断
+
+|物理体互相穿过却不报错
+|层/掩码不匹配, 或缺少 `CollisionShape`
+|检查 layer/mask, 确认形状存在且缩放合理
+
+|C# 项目无法导出
+|使用了标准版编辑器, 或缺 .NET SDK
+|改用 .NET 版编辑器并安装对应 SDK
+
+|===
+
+[[godot-versions]]
+=== 版本演进
+
+4.x 大致保持每年两个特性版本的节奏, 下表只列出对写法与工作流影响较大的版本:
+
+[options="header",cols="2,3,7"]
+|===
+|分支 |时间 |关键变化
+
+|3.x
+|2018 起
+|GLES3/GLES2 渲染, 3.6 作为长期维护分支延续
+
+|4.0
+|2023-03
+|Vulkan 渲染器(Forward+/Mobile/Compatibility)、GDScript 2.0 类型化、SDFGI、新 Tween
+
+|4.3
+|2024-08
+|`TileMapLayer`、2D/3D 物理插值、`Parallax2D`、Direct3D 12 后端(实验)
+
+|4.4
+|2025-03
+|类型化字典、资源 UID、内置 Jolt 物理、编辑器内嵌游戏窗口与交互式编辑
+
+|4.5
+|2025-09
+|模板缓冲(Stencil)支持、屏幕阅读器无障碍、平台与工具链打磨
+
+|4.7
+|2026
+|`AreaLight3D` 矩形面光源、文本着色器内联预览、Asset Store
+
+|===
+
+版本选择的建议:
+
+* **新项目**直接用当前稳定版, 享受工具链与性能改进.
+
+* **在研项目**跟随小版本升级(如 4.7.x), 大版本升级前先读迁移指南并跑通导出与冒烟测试.
+
+* **已上线项目**除非有明确收益, 不必为每个特性版本重做验证; 3.x 项目迁移到 4.x 的成本主要在渲染后端、着色器与 GDScript 2.0 的语法差异, 需要单独评估.
+
+[[godot-learning]]
+=== 学习路径
+
+. 跟着官方 **Step by step** 教程与 2D 入门项目(Dodge the Creeps)走一遍, 建立"场景即类、信号解耦"的直觉.
+
+. 精读 **Godot's design philosophy** 与 **best practices**, 理解节点、服务器层与生命周期, 这是后续所有优化的基础.
+
+. 独立完成一个小而完整的项目: 含主菜单、关卡切换、存档、设置与导出, 把工程实践跑通一次.
+
+. 深入一个方向: 3D 渲染(GI、后处理、性能)、2D 像素工作流、UI 与本地化, 或 GDExtension 原生扩展.
+
+. 用 **Profiler + Monitors** 做一次完整的性能优化, 学会区分脚本、物理与渲染瓶颈.
+
+. 需要 C# 或原生库时再引入, 不要一开始就为了"性能"上复杂度.
+
+[[godot-summary]]
+=== 总结
+
+* **核心模型:** 节点表达能力, 场景表达可复用单元, 资源表达共享数据, 信号表达事件. 四者组合即可覆盖绝大多数游戏结构.
+
+* **组合优于继承:** 场景可以实例化、可以继承、可以嵌套, 编辑器与代码对同一份结构拥有同等权力.
+
+* **运行时是双层的:** 场景树描述意图, 服务器层执行绘制与物理; 这决定了节点数量与渲染开销可以解耦.
+
+* **帧有两条时间线:** 影响物理结果的写操作放在 `_physics_process`, 表现层放在 `_process`, 两者不一致时用物理插值抹平.
+
+* **性能优化先定位再动手:** 瓶颈通常是每帧回调、draw call 与物理活动对象, 而不是脚本语言本身.
+
+* **工程化要点:** 提交 `project.godot`、`*.import`、`*.uid`, 忽略 `.godot/`; CI 先导入再导出; 存档带版本与迁移.
+
+* **取舍:** Godot 以开源、轻量与快速迭代见长, 适合 2D、独立游戏与中小团队; 需要顶级 3D 画面或重度商业中间件时, 应评估 Unreal 等方案, 或通过 GDExtension 补齐能力.

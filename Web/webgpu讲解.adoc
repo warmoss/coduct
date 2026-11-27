@@ -1,0 +1,612 @@
+== webgpu讲解
+
+WebGL 停留在 OpenGL ES 3.0 的能力水平上, 既没有计算着色器, 也只能以全局状态机的方式串行提交绘制, 无法利用 D3D12, Metal, Vulkan 这一代显式 GPU API 的特性. **WebGPU** 正是为此重新设计的浏览器图形与计算 API: 它不继承 OpenGL 体系, 而是按现代原生 API 的模型抽象出适配器, 设备, 管线与命令缓冲区, 让同一份 JavaScript 在 Windows(D3D12), Apple 平台(Metal), Android/Linux(Vulkan)上运行.
+
+规范由 W3C GPU for the Web 工作组维护, 目前处于 **Candidate Recommendation Draft** 阶段. 实现方面, Chrome 113 与 Edge 113 起在桌面端默认可用, Chrome for Android 121 跟进, Safari 26 与 Firefox 141 陆续提供, 但各平台与特性覆盖并不一致, 生产环境仍需特性探测与降级.
+
+本文讲解 WebGPU 的对象模型, 渲染与计算两条管线, WGSL 的约束, 以及异步与错误处理这两个最容易踩坑的部分.
+
+参考: <<Web/webgl讲解.adoc#, WebGL讲解>>, <<图形学/vulkan讲解.adoc#, Vulkan讲解>>
+
+[[webgpu-what]]
+=== WebGPU 是什么
+
+WebGPU:: 浏览器暴露的**显式 GPU API**, 提供渲染管线, 计算管线与资源绑定的底层抽象, 是 WebGL 的后继者.
+适配器 (GPUAdapter):: 对一块物理或软件 GPU 的抽象, 由 `navigator.gpu.requestAdapter()` 异步获取, 只描述能力(特性与上限), 不持有资源.
+设备 (GPUDevice):: 逻辑设备, 所有 GPU 资源的工厂与命令提交的入口, 同时是错误隔离与丢失恢复的边界.
+WGSL:: WebGPU Shading Language, 唯一支持的着色器语言, 语法接近 Rust, 类型与内存布局规则远比 GLSL 严格.
+管线 (Pipeline):: 一组不可变的 GPU 状态, 包含着色器入口, 顶点布局, 图元, 深度与混合等全部固定配置, 创建时完成校验.
+绑定组 (GPUBindGroup):: 按布局把着色器中的 `@group`/`@binding` 映射到具体 buffer, texture 与 sampler 的资源集合.
+工作组 (Workgroup):: 计算阶段一次调度内可共享 `var<workgroup>` 内存的一组线程, 大小由 `@workgroup_size` 在着色器中声明.
+
+与 WebGL 的差异不止"多了计算":
+
+[options="header",cols="2,4,4"]
+|===
+|维度 |WebGL 2.0 |WebGPU
+
+|编程模型
+|全局状态机, 设置即生效
+|显式对象 + 命令录制, 提交后才执行
+
+|着色器语言
+|GLSL ES 3.00
+|WGSL
+
+|资源绑定
+|全局 uniform/varying, 按名字查询位置
+|bind group + 布局, 按 `@group`/`@binding` 索引
+
+|管线
+|绘制时由驱动按当前状态拼装
+|预先创建不可变 pipeline, 创建期完成校验
+
+|通用计算
+|无计算着色器, 只能渲染到纹理
+|独立 compute pass, 支持 storage buffer 与共享内存
+
+|多线程
+|上下文只能在主线程操作
+|可在 Worker 中录制命令, 配合 `OffscreenCanvas`
+
+|错误模型
+|`getError` 轮询, 状态错误静默失败
+|提交前校验, 经 error scope 与 `uncapturederror` 异步上报
+
+|底层后端
+|OpenGL ES(Windows 上由 ANGLE 翻译为 D3D11)
+|D3D12, Metal, Vulkan
+|===
+
+代价是样板代码更多: 一个三角形在 WebGL 中约 40 行, 在 WebGPU 中通常 80 行以上. 换来的是可预测的性能与真正的计算能力.
+
+[[webgpu-objects]]
+=== 对象模型与初始化
+
+WebGPU 的对象关系可以概括为"适配器选卡, 设备造资源, 队列执行命令":
+
+[plantuml, "WebGPU 对象模型", format=png]
+----
+@startuml
+left to right direction
+rectangle "navigator.gpu\nGPU" as GPU
+rectangle "GPUAdapter" as AD
+rectangle "GPUDevice" as DEV
+rectangle "GPUBuffer\nGPUTexture\nGPUSampler" as RES
+rectangle "GPUShaderModule" as SM
+rectangle "GPURenderPipeline\nGPUComputePipeline" as PL
+rectangle "GPUBindGroup" as BG
+rectangle "GPUCommandEncoder" as ENC
+rectangle "GPUCommandBuffer" as CB
+rectangle "GPUQueue" as Q
+rectangle "GPUCanvasContext" as CTX
+
+GPU --> AD : requestAdapter()
+AD --> DEV : requestDevice()
+DEV --> RES
+DEV --> SM
+SM --> PL
+RES --> BG
+BG --> PL : 按布局绑定
+DEV --> ENC : createCommandEncoder()
+ENC --> CB : finish()
+Q --> CB : submit()
+DEV --> CTX : configure()
+@enduml
+----
+
+初始化是**全异步**的, 且必须显式声明所需特性与上限:
+
+[source,javascript]
+----
+if (!navigator.gpu) {
+  throw new Error('当前环境不支持 WebGPU');    // <1>
+}
+
+const adapter = await navigator.gpu.requestAdapter({
+  powerPreference: 'high-performance',          // <2>
+});
+
+const requiredFeatures = [];
+if (adapter.features.has('timestamp-query')) {
+  requiredFeatures.push('timestamp-query');    // <3>
+}
+
+const device = await adapter.requestDevice({
+  requiredFeatures,
+  requiredLimits: {
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,   // <4>
+  },
+});
+
+device.addEventListener('uncapturederror', (event) => {
+  console.error('WebGPU 未捕获错误:', event.error.message);
+});
+----
+<1> `navigator.gpu` 只在安全上下文(HTTPS 或 localhost)下存在.
+<2> `powerPreference` 只是偏好, 集成显卡与独立显卡由浏览器决定.
+<3> 特性必须先探测再申请, 申请不支持的项会让 `requestDevice` 直接失败.
+<4> 内置默认上限偏保守(如 `maxStorageBufferBindingSize` 默认 128 MiB), 需要更大值必须显式申请.
+
+有三条规则值得记住:
+
+* **设备是资源的所有者:** 设备丢失后, 由它创建的所有 buffer, texture, pipeline 全部失效.
+* **上限以 `device.limits` 为准:** `adapter.limits` 是硬件能力, `device.limits` 是你申请到的实际值, 二者可能不同.
+* **适配器不产生副作用:** 一个 adapter 可以创建多个 device, 但通常只需要一个.
+
+画布绑定通过 `GPUCanvasContext` 完成, 它把设备与交换链连接起来:
+
+[source,javascript]
+----
+const canvas = document.querySelector('canvas');
+const context = canvas.getContext('webgpu');
+const format = navigator.gpu.getPreferredCanvasFormat();   // <1>
+
+context.configure({
+  device,
+  format,
+  alphaMode: 'opaque',                                     // <2>
+});
+----
+<1> 返回 `bgra8unorm` 或 `rgba8unorm`, 必须与渲染管线的 `targets` 格式一致, 否则绘制报不兼容.
+<2> 不透明的画布可以省去合成时的 alpha 混合, 页面有背景色时优先选它.
+
+[[webgpu-pipeline]]
+=== 渲染管线与 WGSL
+
+管线阶段与 WebGL 基本一致, 区别在于**所有状态在创建管线时一次性确定**, 运行时只切换管线与绑定:
+
+[plantuml, "WebGPU 渲染管线", format=png]
+----
+@startuml
+left to right direction
+rectangle "顶点/索引缓冲区" as VB
+rectangle "顶点着色器\n@vertex" as VS
+rectangle "图元装配与裁剪" as PA
+rectangle "光栅化" as RS
+rectangle "片元着色器\n@fragment" as FS
+rectangle "逐片元操作\n深度/模板/混合" as OM
+rectangle "颜色附件" as RT
+
+VB --> VS
+VS --> PA
+PA --> RS
+RS --> FS
+FS --> OM
+OM --> RT
+@enduml
+----
+
+两个与 WebGL 不同的细节:
+
+* **入口函数是显式的:** 着色器中用 `@vertex`/`@fragment` 标注, 管线里再用 `entryPoint` 指定, 因此一个模块可以放多个入口.
+* **裁剪空间 z 的范围是 stem:[0, 1]:** 与 D3D, Metal, Vulkan 一致, 移植 WebGL 教程中的透视矩阵时必须调整, 否则近处物体被裁掉或深度精度异常. 坐标推导见 <<Web/webgl讲解.adoc#webgl-coords, WebGL 坐标系统与矩阵>>.
+
+[source,wgsl]
+----
+struct Uniforms {
+  mvp: mat4x4f,          // 64 字节, 16 字节对齐
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VertexOut {
+  @builtin(position) position: vec4f,   // 裁剪空间坐标, 取代 gl_Position
+  @location(0) color: vec3f,
+};
+
+@vertex
+fn vs_main(@location(0) position: vec3f, @location(1) color: vec3f) -> VertexOut {
+  var out: VertexOut;
+  out.position = u.mvp * vec4f(position, 1.0);
+  out.color = color;
+  return out;
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4f {
+  return vec4f(in.color, 1.0);
+}
+----
+
+对应的管线描述符把顶点布局, 深度状态与目标格式固定下来:
+
+[source,javascript]
+----
+const module = device.createShaderModule({ code: wgsl });
+
+const pipeline = await device.createRenderPipelineAsync({   // <1>
+  layout: 'auto',                                           // <2>
+  vertex: {
+    module,
+    entryPoint: 'vs_main',
+    buffers: [{
+      arrayStride: 24,                                      // <3>
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x3' },
+        { shaderLocation: 1, offset: 12, format: 'float32x3' },
+      ],
+    }],
+  },
+  fragment: {
+    module,
+    entryPoint: 'fs_main',
+    targets: [{ format }],
+  },
+  primitive: { topology: 'triangle-list', cullMode: 'back' },
+  depthStencil: {
+    format: 'depth24plus',
+    depthWriteEnabled: true,
+    depthCompare: 'less',
+  },
+});
+----
+<1> 优先用异步版本: 管线编译在后台线程完成, 不会阻塞首帧.
+<2> `'auto'` 让实现按着色器自动生成绑定布局, 适合原型; 工程代码应显式创建 `GPUBindGroupLayout`, 便于布局复用与校验.
+<3> 每个顶点的字节数, 必须与 attributes 的偏移和格式对齐.
+
+顶点数据与着色器入口的对应关系如下:
+
+[options="header",cols="2,2,2,4"]
+|===
+|shaderLocation |格式 |偏移 |含义
+
+|0
+|`float32x3`
+|0
+|位置(x, y, z)
+
+|1
+|`float32x3`
+|12
+|颜色(r, g, b)
+|===
+
+[[webgpu-hello]]
+=== 最小可运行示例
+
+下面这段代码不依赖任何引擎, 直接绘制一个三角形:
+
+[source,html]
+----
+<canvas id="gpu" width="640" height="480"></canvas>
+<script type="module">
+  const canvas = document.querySelector('#gpu');
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+
+  const context = canvas.getContext('webgpu');
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format, alphaMode: 'opaque' });   // <1>
+
+  const module = device.createShaderModule({ code: `
+    @vertex
+    fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+      var pos = array<vec2f, 3>(
+        vec2f( 0.0,  0.6),
+        vec2f(-0.6, -0.6),
+        vec2f( 0.6, -0.6),
+      );
+      return vec4f(pos[index], 0.0, 1.0);                        // <2>
+    }
+
+    @fragment
+    fn fs_main() -> @location(0) vec4f {
+      return vec4f(0.2, 0.6, 1.0, 1.0);
+    }
+  ` });
+
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: 'vs_main' },                    // <3>
+    fragment: { module, entryPoint: 'fs_main', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  function frame() {
+    const encoder = device.createCommandEncoder();                 // <4>
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),             // <5>
+        clearValue: { r: 0.05, g: 0.06, b: 0.09, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
+    });
+    pass.setPipeline(pipeline);
+    pass.draw(3);                                                 // <6>
+    pass.end();
+
+    device.queue.submit([encoder.finish()]);                      // <7>
+    requestAnimationFrame(frame);
+  }
+  frame();
+</script>
+----
+<1> 必须在绘制前 configure, 且画布的 `width`/`height` 才是绘图缓冲尺寸, CSS 尺寸只影响显示.
+<2> 不做矩阵变换时, 顶点直接落在 NDC 中, 坐标范围是 stem:[-1, 1], z 为 stem:[0, 1].
+<3> 没有顶点缓冲区时可以不写 `buffers`, 顶点由 `vertex_index` 在着色器内生成.
+<4> 命令先录制到编码器, 此时 GPU 尚未执行.
+<5> 每帧获取当前交换链纹理, 不要在循环外缓存它的视图.
+<6> 从第 0 个顶点起绘制 3 个顶点.
+<7> 提交后 GPU 才开始工作, JavaScript 立即返回, 不阻塞.
+
+[[webgpu-bind]]
+=== 资源绑定与数据上传
+
+绑定用两级索引定位: `@group(n)` 对应 `setBindGroup(n, ...)`, `@binding(m)` 对应绑定组里的 `entries`, 二者共同决定着色器变量指向哪块资源.
+
+[source,javascript]
+----
+const uniformBuffer = device.createBuffer({
+  size: 64,                                                      // <1>
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,       // <2>
+});
+
+const mvp = new Float32Array(16);                                // <3>
+device.queue.writeBuffer(uniformBuffer, 0, mvp);
+
+const bindGroup = device.createBindGroup({
+  layout: pipeline.getBindGroupLayout(0),
+  entries: [{ binding: 0, resource: { buffer: uniformBuffer } }],
+});
+
+pass.setPipeline(pipeline);
+pass.setBindGroup(0, bindGroup);
+pass.draw(3);
+----
+<1> `mat4x4f` 占 64 字节; 若结构体含多个字段, 需按 WGSL 对齐规则计算总大小.
+<2> 用途标志决定资源能被怎样使用, 缺少 `COPY_DST` 时 `writeBuffer` 会报校验错误.
+<3> `Float32Array` 必须是列主序, 与 WGSL 的矩阵乘法约定一致.
+
+缓冲区的用途标志组合规则:
+
+[options="header",cols="3,4,4"]
+|===
+|标志 |作用 |典型场景
+
+|`UNIFORM`
+|可绑定为 `var<uniform>`
+|变换矩阵, 光照参数
+
+|`STORAGE`
+|可绑定为 `var<storage, ...>`
+|大规模顶点, 计算输入输出
+
+|`VERTEX` / `INDEX`
+|可作顶点/索引缓冲
+|几何数据
+
+|`COPY_SRC` / `COPY_DST`
+|可作拷贝源/目标
+|上传与回读
+
+|`MAP_READ` / `MAP_WRITE`
+|可映射到 CPU 内存
+|结果回读, 生成数据
+
+|`INDIRECT`
+|可存放间接绘制参数
+|GPU 驱动的绘制数量
+|===
+
+映射用途是受限的: `MAP_READ` 只能与 `COPY_DST` 组合, `MAP_WRITE` 只能与 `COPY_SRC` 组合, 因此回读必须经过独立的 staging buffer, 不能直接在 storage buffer 上 `mapAsync`.
+
+两个高频陷阱:
+
+* **结构体对齐:** WGSL 中 `vec3f` 按 16 字节对齐, `struct { a: vec3f, b: f32 }` 实际占 32 字节而非 16 字节. JS 侧写入数据时若忽略填充, 会得到全 0 或错乱的数值. 实践中用 `vec4f` 或显式添加 `_pad` 字段.
+* **动态偏移对齐:** 用 `dynamicOffsets` 复用同一 uniform buffer 时, 偏移必须是 `device.limits.minUniformBufferOffsetAlignment`(默认 256)的整数倍.
+
+[[webgpu-compute]]
+=== 计算管线
+
+计算管线只有着色器一个可编程阶段, 通过 `dispatchWorkgroups` 展开为网格状的线程组. 工作组的调用数满足:
+
+stem:[N_"invocations" = n_x * n_y * n_z * "workgroup_size" ]
+
+因此覆盖 N 个元素所需的组数通常是:
+
+stem:[n_x = "ceil"(N / "workgroup_size") ]
+
+下面的着色器对数组做一次原位运算:
+
+[source,wgsl]
+----
+@group(0) @binding(0) var<storage, read_write> values: array<f32>;
+
+@compute @workgroup_size(64)                                   // <1>
+fn main(@builtin(global_invocation_id) gid: vec3u) {           // <2>
+  let i = gid.x;
+  if (i >= arrayLength(&values)) {                             // <3>
+    return;
+  }
+  values[i] = sqrt(values[i]) * 2.0;
+}
+----
+<1> 单个工作组默认最多 256 个调用, 该值由 `maxComputeInvocationsPerWorkgroup` 限制.
+<2> 每个线程拿到的全局编号, 三个维度分别独立.
+<3> 线程数通常多于元素数, 越界访问不会崩溃(实现会做边界检查), 但读到的值不可依赖, 必须自行判断.
+
+调度与回读的完整流程:
+
+[source,javascript]
+----
+const N = 1024;
+const byteSize = N * 4;
+
+const storageBuffer = device.createBuffer({
+  size: byteSize,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+});
+device.queue.writeBuffer(storageBuffer, 0, new Float32Array(N).map((_, i) => i));
+
+const stagingBuffer = device.createBuffer({
+  size: byteSize,
+  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,     // <1>
+});
+
+const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+const bindGroup = device.createBindGroup({
+  layout: pipeline.getBindGroupLayout(0),
+  entries: [{ binding: 0, resource: { buffer: storageBuffer } }],
+});
+
+const encoder = device.createCommandEncoder();
+const pass = encoder.beginComputePass();
+pass.setPipeline(pipeline);
+pass.setBindGroup(0, bindGroup);
+pass.dispatchWorkgroups(Math.ceil(N / 64));                     // <2>
+pass.end();
+encoder.copyBufferToBuffer(storageBuffer, 0, stagingBuffer, 0, byteSize);
+device.queue.submit([encoder.finish()]);
+
+await stagingBuffer.mapAsync(GPUMapMode.READ);                  // <3>
+const result = new Float32Array(stagingBuffer.getMappedRange()).slice();   // <4>
+stagingBuffer.unmap();
+----
+<1> 回读缓冲区只需要拷贝与映射能力, 避免与计算资源混用.
+<2> 16 个工作组, 共 1024 个线程, 与元素数一致.
+<3> `mapAsync` 会等到 GPU 执行完此前提交的命令, 是回读前的同步点.
+<4> `getMappedRange` 返回的是共享内存视图, 必须在 `unmap` 前拷贝出去.
+
+NOTE: 同一队列中相邻的 pass 之间由实现自动插入内存屏障, 不需要像 Vulkan 那样手写 barrier; 但单个 dispatch 内部的线程之间没有顺序保证, 跨工作组通信必须拆成多次 dispatch, 或用 `var<workgroup>` 加 `workgroupBarrier()` 在工作组内同步.
+
+[[webgpu-async]]
+=== 异步模型与错误处理
+
+WebGPU 有明确的三类异步点:
+
+* **资源获取:** `requestAdapter` 与 `requestDevice` 返回 Promise, 页面初始化必须是异步的.
+* **CPU 读写 GPU 内存:** `mapAsync` 与 `getMappedRange` 配对使用, 映射期间缓冲区不能被提交使用.
+* **执行完成:** `device.queue.onSubmittedWorkDone()` 在队列空闲时兑现, 用于测时与清理.
+
+错误**不会抛出异常**, 只能通过 error scope 或事件主动捕获:
+
+[source,javascript]
+----
+device.pushErrorScope('validation');                            // <1>
+device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.STORAGE });
+
+const error = await device.popErrorScope();                     // <2>
+if (error) {
+  console.warn('校验失败:', error.message);
+}
+----
+<1> 作用域可以嵌套, 只捕获这两次调用之间的校验错误.
+<2> 返回 `GPUValidationError` 或 `null`; 没有任何作用域捕获的错误才会触发 `uncapturederror` 事件.
+
+`validation` 作用域处理参数不合法, `out-of-memory` 处理显存不足. 设备丢失是另一类问题, 需要重建全部资源:
+
+[source,javascript]
+----
+device.lost.then((info) => {
+  if (info.reason === 'destroyed') {
+    return;                                                     // 主动 destroy, 无需恢复
+  }
+  init();                                                       // 驱动重置或 GPU 崩溃, 整体重建
+});
+----
+
+[[webgpu-perf]]
+=== 性能实践
+
+* **管线提前创建:** 尽量在初始化阶段调用 `createRenderPipelineAsync`/`createComputePipelineAsync`, 避免首帧卡顿; 同一份着色器只创建一次.
+* **复用资源:** 每帧新建 buffer 或 texture 会让内存在垃圾回收前持续增长, 应按最大尺寸预分配并复用.
+* **每帧一次提交:** 把多个绘制合并进同一个 command buffer, 一次性 `submit`, 减少与 GPU 进程的通信开销.
+* **减少录制开销:** 重复出现的绘制集合用 `GPURenderBundle` 预先录制; 相同管线与绑定只设置一次, 用 `dynamicOffsets` 切换数据.
+* **小数据用 `writeBuffer`, 大数据用映射:** `writeBuffer` 内部会做一次拷贝, 适合几百字节到几 MB 的更新; 一次性上传大网格时用 `mappedAtCreation: true` 或 staging buffer.
+* **区分 CPU 与 GPU 时间:** 用 `timestamp-query` 测量 GPU 耗时, `performance.now()` 只能反映提交耗时, 无法说明瓶颈在 CPU 还是 GPU.
+* **不要在帧循环中 await:** 回读结果应延迟若干帧处理, 或用环形缓冲排队, 否则主线程会被 GPU 拖住.
+
+[[webgpu-ecosystem]]
+=== 生态与选型
+
+[options="header",cols="3,3,6"]
+|===
+|项目 |定位 |说明
+
+|Three.js
+|通用 3D 引擎
+|`three/webgpu` 提供 `WebGPURenderer` 与 TSL 节点材质, 同一场景可切回 WebGL2
+
+|Babylon.js
+|3D 引擎
+|内置 WebGPU 引擎, 渲染与物理能力较完整
+
+|Dawn
+|实现
+|Google 维护, 是 Chrome 的后端, 也提供独立的 C/C++ 版本
+
+|wgpu
+|实现
+|Rust 实现, 被 Firefox 与 Deno 使用, 可脱离浏览器运行
+
+|Deno
+|运行时
+|内置 `navigator.gpu`, 服务端可复用同一套着色器与代码
+
+|ONNX Runtime Web
+|推理
+|提供 WebGPU 执行后端, 把模型算子映射到计算管线
+|===
+
+选型建议: 已有 Three.js 或 Babylon.js 的场景直接切换后端即可; 需要精细控制管线, 自定义后处理或计算负载时才直接用 WebGPU; 只做图表与 2D 绘制的场景, Canvas 2D 仍是成本最低的方案.
+
+浏览器覆盖仍不完整, 建议用渐进增强:
+
+* 先探测 `navigator.gpu`, 不可用时回退到 <<Web/webgl讲解.adoc#, WebGL>> 路径.
+* 只使用 `adapter.features` 中存在的特性, 并准备关闭高级特性的降级配置.
+* 对移动端按 `adapter.limits` 与 `adapter.info` 分级设置画质.
+
+[[webgpu-pitfalls]]
+=== 常见坑
+
+[options="header",cols="4,5,5"]
+|===
+|现象 |原因 |处理
+
+|画面全黑且无报错
+|画布尺寸为 0, 或未调用 `configure`
+|按 `devicePixelRatio` 设置 `canvas.width`/`height`, 初始化时 configure
+
+|报上下文格式不兼容
+|管线 `targets` 的格式与 `configure` 的 `format` 不一致
+|统一使用 `getPreferredCanvasFormat()` 的返回值
+
+|绘制报绑定布局不匹配
+|`layout: 'auto'` 生成的布局只能用于本管线
+|显式创建 `GPUBindGroupLayout`, 或在同一管线上取布局
+
+|数值错乱
+|WGSL 结构体对齐规则与 JS 写入布局不一致
+|按 16 字节对齐字段, 或用 `vec4f`/填充字段占位
+
+|`mapAsync` 报错
+|缓冲区未声明 `MAP_READ`, 或仍被提交使用
+|用独立 staging buffer, 映射期间不提交相关命令
+
+|纹理全黑
+|缺少 `COPY_DST` 用途或未调用 `writeTexture`
+|创建时声明用途, 上传后确认尺寸与格式匹配
+
+|开了深度却无遮挡
+|只设了 `depthStencil` 而未创建深度纹理
+|随画布尺寸重建 `depth24plus` 纹理并作为附件
+
+|缩窗后画面拉伸
+|只改了 CSS 尺寸
+|同步更新 `canvas.width`/`height` 并重建深度纹理
+
+|移动端创建设备失败
+|申请了超过硬件上限的值
+|先用 `adapter.limits` 查询再取 `min`
+|===
+
+[[webgpu-summary]]
+=== 总结
+
+* **心智模型:** 适配器选卡 -> 设备造资源 -> 命令编码器录制 -> 队列提交; 管线与绑定组不可变, 变更即新建.
+* **与 WebGL 的分水岭是显式与异步:** 状态在对象创建时固定, 结果在提交后才可见, 回读必须经过 `mapAsync`.
+* **WGSL 更严格:** 大多数"数据不对"源于结构体对齐与 usage 声明, 而非着色器逻辑.
+* **计算是主要增量:** 图像处理, 物理模拟, 端侧推理都可以直接复用渲染管线所在的设备与缓冲区.
+* **落地策略:** 新项目可直接以 WebGPU 为主并保留 WebGL 回退; 存量项目优先通过引擎后端切换, 避免重写渲染层.

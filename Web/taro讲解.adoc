@@ -1,0 +1,588 @@
+== taro讲解
+
+同一套业务往往需要同时交付多个小程序, H5 与 App. 各端 DSL, 组件与 API 互不通用, 独立开发意味着业务逻辑重复实现与多套回归成本. **Taro** 是京东开源的开放式跨端跨框架方案: 用 React, Preact, Vue 3 或 Solid 的语法编写页面, 由编译器与运行时共同把同一份代码输出到各端. 与 uni-app 把模板**编译**为目标平台 DSL 不同, Taro 3 之后采用**重运行时**方案, 在小程序逻辑层内实现一套 DOM 与 BOM, 从而保留前端框架的完整语义. 本文基于最新稳定版 Taro 4.3.3, 讲解其运行时架构, 编译体系, 平台差异与性能约束.
+
+参考: <<Web/uniapp讲解.adoc#, uni-app讲解>>, <<Web/node/vite原理讲解.adoc#, vite原理讲解>>
+
+[[taro-what]]
+=== Taro 是什么?
+
+**Taro**:: 开放式跨端跨框架解决方案, 支持 React, Preact, Vue 3 与 Solid, 一次编写可编译为微信, 支付宝, 百度, 字节跳动, QQ, 京东等小程序, 以及 H5, React Native 与鸿蒙应用.
+**运行时 (runtime)**:: 注入到产物中的适配层, 在逻辑层实现精简的 DOM 与 BOM, 使 React, Vue 3 等框架可以像操作浏览器一样操作小程序节点.
+**Taro DOM**:: 运行时维护的节点树, 由框架的渲染器创建, 与视图层的真实节点一一对应, 是 setData 差异计算的数据来源.
+**多端文件**:: 同名但带平台后缀的源码 (如 `index.weapp.tsx`, `index.h5.tsx`), 构建时按目标平台优先解析, 用于收口无法共享的实现.
+**CompileMode**:: Taro 4 引入的编译模式, 在构建期把 JSX 中的静态结构预处理为 WXML 模板, 减少运行期节点创建与 setData 数据量.
+
+选择它的根本原因是**框架语义完整 + 前端生态可复用**:
+
+* **框架语义完整:** Hooks, Context, 组件组合, 以及不依赖真实 DOM 的第三方库都可直接使用, 不受小程序模板能力限制
+* **双编译引擎:** 默认 webpack 5, 可切换 Vite, 配置方式与前端工程习惯一致
+* **多端一致的抽象:** 路由, 生命周期与 `Taro.*` API 语义统一, 平台差异集中到少数适配点
+* **升级路径跟随社区:** 与自有 DSL 的方案相比, 主版本升级跟随 React 与 Vue 的节奏
+
+NOTE: Taro 4 仅支持 React 18, Preact, Vue 3 与 Solid. Vue 2 支持停留在 Taro 3.6 (`@tarojs/plugin-framework-vue2` 最新版本为 3.6.37), 存量 Vue 2 项目升级 Taro 4 前必须先完成框架升级. Taro 4.3.3 要求 Node.js 不低于 18.
+
+[[taro-arch]]
+=== 整体架构
+
+Taro 的架构可以概括为**一次编写, 两层协作**: 编译层负责把源码转换为各端可运行的产物, 运行时层负责在缺乏浏览器环境的目标平台上提供框架所需的运行环境.
+
+[plantuml,"Taro 整体架构",format=png]
+----
+@startuml
+package "源码层" {
+  [React / Preact / Vue 3 / Solid 组件] as SRC
+  [app.config 与页面配置] as CONF
+  [平台后缀多端文件] as MULTI
+}
+package "编译层 (webpack 5 或 Vite)" {
+  [Babel 与 SWC 转换] as TRANS
+  [平台插件 生成模板与配置] as PLAT
+  [样式 px 换算与资源处理] as CSS
+}
+package "运行时层" {
+  [框架自定义渲染器] as RENDER
+  [Taro DOM 与事件系统] as RDOM
+  [Taro API 与路由适配] as API
+}
+package "目标产物" {
+  [小程序: wxml/wxss/js/json] as MP
+  [H5: HTML/CSS/JS] as H5
+  [RN: JS bundle] as RN
+  [鸿蒙: ArkTS 工程] as HM
+}
+
+SRC --> TRANS
+CONF --> PLAT
+MULTI --> TRANS
+TRANS --> PLAT
+TRANS --> CSS
+CSS --> MP
+CSS --> H5
+PLAT --> MP
+PLAT --> H5
+PLAT --> RN
+PLAT --> HM
+RENDER --> RDOM
+RDOM --> MP
+RDOM --> RN
+API --> H5
+@enduml
+----
+
+两层职责划分:
+
+* **编译层:** 依据 `--type` 选择平台插件 (`@tarojs/plugin-platform-weapp`, `@tarojs/plugin-platform-h5` 等), 由插件提供该平台的组件表, API 表与模板生成逻辑, 再产出 `app.json`, `project.config.json` 与 WXML 模板
+* **运行时层:** 框架渲染器 (React 使用 `react-reconciler`, Vue 3 使用 `@vue/runtime-core` 的 `createRenderer`) 把组件树渲染到 Taro DOM, 事件系统把原生事件回传给组件的 props 回调, `Taro.*` API 落到平台原生能力
+
+各端的渲染载体与接入方式差异很大, 这是运行时必须分平台适配的根本原因:
+
+[cols="2,3,3"]
+|===
+| 平台 | 渲染载体 | 框架接入方式
+
+| 小程序 | 平台原生组件, 由 WXML 模板描述 | 自定义渲染器 + Taro DOM
+| H5 | 浏览器 DOM | ReactDOM 或 Vue runtime-dom 直接渲染
+| React Native | RN 原生组件 | Taro DOM 映射为 RN 组件
+| 鸿蒙 | ArkUI 组件或 ArkWeb | ArkTS 运行时或 H5 Hybrid
+|===
+
+[[taro-runtime]]
+=== 跨端原理
+
+==== 为什么从编译时转向运行时
+
+Taro 1 与 Taro 2 是**编译时**方案: 把 JSX 静态翻译为 WXML, 逻辑与视图之间靠 `data` 绑定通信. 该路线产物更轻, 但要求模板结构在编译期确定, 动态 JSX (如 render props, 条件返回不同结构) 无法表达, 且每支持一种 DSL 都要维护一套转换器.
+
+Taro 3 起改为**运行时**方案: 逻辑层内实现 Taro DOM, 由框架自身的渲染器渲染, 再把差异同步到视图层. 框架语义因此完整保留, 编译层的职责退化为平台导入, 配置与模板生成.
+
+[cols="2,3,3"]
+|===
+| 维度 | 编译时方案 (Taro 1/2) | 运行时方案 (Taro 3/4)
+
+| 模板来源 | JSX 静态翻译为 WXML | 少量公共模板 + 节点数据
+| 动态能力 | 受模板语法限制 | 与浏览器端一致的框架语义
+| 产物体积 | 更小 | 需注入运行时, 体积更大
+| 扩展平台 | 每端维护转换器 | 新增平台只需适配层
+|===
+
+==== 一次更新在小程序端的路径
+
+小程序是双线程模型: 逻辑层执行 JS, 视图层负责渲染, 二者不共享内存. Taro 的每一次状态更新都要经过"渲染, 差异计算, 跨线程传输"三步.
+
+[plantuml,"一次状态更新的跨线程流程",format=png]
+----
+@startuml
+participant "业务组件" as Biz
+participant "框架渲染器" as Renderer
+participant "Taro 运行时 (逻辑层)" as Runtime
+participant "视图层 (WebView)" as View
+
+Biz -> Renderer: setState 或响应式数据变更
+Renderer -> Runtime: 创建或更新 Taro DOM
+Runtime -> Runtime: 计算变更节点的最小数据
+Runtime -> View: setData (序列化传输)
+View -> View: 按模板渲染节点树
+View --> Runtime: 触发事件 (统一入口 eh)
+Runtime -> Renderer: 按节点 id 分发到组件 props
+@enduml
+----
+
+由此产生四个必须先理解的结论:
+
+* **不能操作真实 DOM:** 视图层不可被业务代码触碰, 一切更新都是声明式数据驱动
+* **通信有成本:** 每次 setData 都要序列化并跨线程传输, 数据量与时序共同决定卡顿程度
+* **页面 WXML 很薄:** 页面模板只负责调用公共模板, 结构由 `root` 数据描述, 因此模板体积与业务页面数量解耦
+* **H5 是例外:** 逻辑与视图同线程, 直接渲染真实 DOM, 没有跨线程开销
+
+小程序端构建后, 页面 WXML 只保留模板引入与一次模板调用, 节点由 `root` 数据驱动:
+
+[source,html]
+----
+<import src="./base.wxml" />
+<template is="taro_tmpl" data="{{root}}" />
+----
+
+模板生成有三个关键设计:
+
+* **非递归模板:** Taro 4 为每种节点类型生成独立模板, 由 WXS 计算应调用的模板名, 避免深层递归带来的渲染开销
+* **事件收敛:** 模板上的事件统一绑定到名为 `eh` 的处理函数, 运行时按节点 id 找到组件 props 上的回调, 减少模板中的事件绑定数量
+* **节点细分:** 编译期把 `view` 按用途细分为 `static-view`, `pure-view`, `click-view`, `catch-view`, 无事件的节点不绑定事件, 降低通信量
+
+`CustomWrapper` 是 Taro 特有的性能组件: 它把子树切成独立的更新单元, 父组件更新时不会触发子树的 setData.
+
+[source,typescript]
+----
+import { View, CustomWrapper, Text } from '@tarojs/components'
+
+export default function Page () {
+  return (
+    <View>
+      <Text>页面级内容</Text>
+      <CustomWrapper>
+        <HighFrequencyChart />   {/* 高频更新被限制在独立范围内 */}
+      </CustomWrapper>
+    </View>
+  )
+}
+----
+
+==== H5 端: 标准 Web 渲染
+
+H5 端不使用 Taro DOM, React 与 Vue 直接渲染真实 DOM. 内置组件由 Web Components 实现 (Stencil 封装, 标签形如 `taro-view-core`), 以便跨框架复用并对齐小程序的组件行为, 例如事件冒泡, 表单与焦点处理. 路由由 `@tarojs/router` 接管, 用前端路由模拟页面栈.
+
+因为缺少跨线程通信, 同一份代码在 H5 上通常比小程序流畅, 但首屏资源体积与路由切换成本成为新的瓶颈.
+
+==== React Native 与鸿蒙
+
+RN 端把 Taro DOM 映射为 RN 组件 (`@tarojs/runtime-rn`), 由 Metro 打包为 JS bundle, 原生壳工程负责签名与发布. Taro 4.3.3 的模板要求 `react-native` 0.73, Expo 50 与 React 18, 原生依赖版本必须按 `peerDependencies` 对齐, 否则无法编译.
+
+鸿蒙端提供三种平台插件, 按原生化程度选择:
+
+* **ArkTS (`@tarojs/plugin-platform-harmony-ets`):** Taro 组件映射为 ArkUI 组件, 产出的 ArkTS 工程由 DevEco Studio 构建
+* **Hybrid (`@tarojs/plugin-platform-harmony-hybrid`):** 用 ArkWeb 承载 H5 产物, 迁移成本最低
+* **C-API (`@tarojs/plugin-platform-harmony-cpp`):** 面向需要直接调用鸿蒙 C-API 的场景
+
+[[taro-engine]]
+=== 编译体系
+
+==== 双构建引擎
+
+`config/index.ts` 中的 `compiler` 决定构建引擎, `framework` 决定框架插件:
+
+[source,typescript]
+----
+import { defineConfig } from '@tarojs/cli'
+import devConfig from './dev'
+import prodConfig from './prod'
+
+export default defineConfig(async (merge) => {
+  const baseConfig = {
+    projectName: 'demo',
+    framework: 'react',        // <1>
+    compiler: 'webpack5',      // <2>
+    designWidth: 750,          // <3>
+    sourceRoot: 'src',
+    outputRoot: 'dist',
+    mini: {},
+    h5: {}
+  }
+  return merge({}, baseConfig, process.env.NODE_ENV === 'development' ? devConfig : prodConfig)
+})
+----
+<1> 可选 `react`, `preact`, `vue3`, `solid`
+<2> 可选 `webpack5` 与 `vite`, 分别由 `@tarojs/webpack5-runner` 与 `@tarojs/vite-runner` 实现
+<3> 设计稿宽度, 决定 px 换算为 rpx 或 rem 的基准
+
+两个引擎共享平台插件, Babel 与 SWC 转换, 模板与配置生成, 差异只在模块图的构建与产物打包. 选型上: 依赖复杂, 需要既有 webpack 插件时用 webpack 5; 追求冷启动与配置简洁时用 Vite. 对象形式 `compiler: { type: 'webpack5', prebundle: { enable: true } }` 可开启依赖预编译.
+
+==== 编译期优化
+
+围绕"减少运行期工作量"的优化都在这一层完成:
+
+* **依赖预编译:** `prebundle` 把依赖提前打包, 缩短冷启动时间
+* **持久化缓存:** `cache.enable`, 复用上一次构建的模块结果
+* **CompileMode:** `mini.experimental.compileMode: true`, 由 Rust 实现的 SWC 插件在构建期把静态 JSX 结构转换为模板
+* **按需编译:** `taro build --type weapp --pages pages/index/index` 只编译指定页面, 大型项目可显著缩短构建时间
+* **样式换算:** `postcss-pxtransform` 按 `designWidth` 把 px 换算为小程序 rpx 与 H5 rem
+
+[source,typescript]
+----
+mini: {
+  experimental: {
+    compileMode: true   // <1>
+  }
+}
+----
+<1> 静态结构在编译期转为模板, 动态部分仍走运行时, 上线前需在真机矩阵上验证
+
+==== 多端差异的两种收口方式
+
+**条件编译**依赖构建期常量替换, 未命中的分支会被 tree shaking 删除:
+
+[source,typescript]
+----
+if (process.env.TARO_ENV === 'weapp') {
+  Taro.login()                                    // 仅微信小程序产物保留
+} else if (process.env.TARO_ENV === 'h5') {
+  window.location.href = '/login'
+}
+----
+
+`process.env.TARO_ENV` 的常用取值为 `weapp`, `alipay`, `swan`, `tt`, `qq`, `jd`, `h5`, `rn`. 需要区分运行期与编译期时: 影响产物体积与依赖的差异用条件编译, 仅影响个别参数或文案的差异用 `Taro.getEnv()` 判断.
+
+**多端文件**由 `MultiPlatformPlugin` 在模块解析阶段处理, 带平台后缀的文件优先于无后缀文件:
+
+[source,typescript]
+----
+import share from './share'   // weapp 端解析 share.weapp.ts, h5 端解析 share.h5.ts
+----
+
+TIP: 优先把差异抽象到组件或适配层, 其次才用条件编译. 平台分支越多, 维护成本越高, 且容易在新增平台时漏改.
+
+[[taro-project]]
+=== 工程结构
+
+CLI 初始化的工程结构如下:
+
+[source,text]
+----
+project/
+  config/
+    index.ts            项目配置: 框架, 编译器, 输出目录, 各端配置
+    dev.ts              开发环境覆盖配置
+    prod.ts             生产环境覆盖配置
+  src/
+    app.ts              应用入口, 注册全局逻辑
+    app.config.ts       全局配置: 页面路由, window, tabBar, 分包
+    app.css             全局样式
+    index.html          H5 入口 HTML, 仅 H5 端使用
+    pages/
+      index/
+        index.tsx       页面组件
+        index.config.ts 页面配置
+        index.css       页面样式
+  project.config.json   微信开发者工具项目配置
+  package.json
+----
+
+`app.config.ts` 是路由与窗口的唯一配置源:
+
+[source,typescript]
+----
+export default defineAppConfig({
+  pages: ['pages/index/index', 'pages/mine/index'],
+  window: {
+    navigationBarTitleText: 'Demo',
+    backgroundTextStyle: 'light'
+  },
+  tabBar: {
+    list: [
+      { pagePath: 'pages/index/index', text: '首页' },
+      { pagePath: 'pages/mine/index', text: '我的' }
+    ]
+  },
+  subPackages: [
+    { root: 'packageA', pages: ['pages/order/index'] }
+  ]
+})
+----
+
+[cols="2,3"]
+|===
+| 字段 | 作用
+
+| `pages` | 页面路径列表, 首项为启动页, 未注册的页面无法被路由访问
+| `window` | 全局窗口样式, 如导航栏, 背景色, 下拉刷新
+| `tabBar` | 底部标签栏, 声明后对应页面只能用 `switchTab` 跳转
+| `subPackages` | 分包配置, 小程序端降低主包体积
+| `preloadRule` | 分包预下载规则, 进入指定页面时提前拉取
+|===
+
+页面级配置与全局配置同构, 只影响当前页面:
+
+[source,typescript]
+----
+export default definePageConfig({
+  navigationBarTitleText: '订单详情',
+  enablePullDownRefresh: true
+})
+----
+
+NOTE: `defineAppConfig` 与 `definePageConfig` 是编译期辅助函数, 只提供类型提示并在打包时被移除, 不能在其中写运行时逻辑.
+
+[[taro-router]]
+=== 页面与路由
+
+小程序端使用平台原生页面栈, 跳转 API 与小程序一致:
+
+[cols="2,4,2"]
+|===
+| API | 语义 | 页面栈变化
+
+| `Taro.navigateTo` | 打开新页面, 可回退 | 入栈, 上限 10 层
+| `Taro.redirectTo` | 替换当前页面 | 替换栈顶
+| `Taro.reLaunch` | 关闭所有页面后打开 | 清空后入栈
+| `Taro.switchTab` | 切换到 tabBar 页面 | 清空非 tabBar 页面
+| `Taro.navigateBack` | 返回上一页或多级 | 出栈
+|===
+
+H5 端由 `@tarojs/router` 用一个页面容器模拟页面栈, 三种模式差异明显:
+
+[cols="2,3,3"]
+|===
+| 模式 | URL 形态 | 适用场景
+
+| `hash` | `/#/pages/index/index` | 静态托管, 无需服务端配置
+| `browser` | `/pages/index/index` | 需要服务端把所有路径回退到入口 HTML
+| `multi` | 每个页面一个 HTML | 多页应用, 首屏更快但页间状态不共享
+|===
+
+路由参数统一通过 `useRouter` 读取:
+
+[source,typescript]
+----
+import { View } from '@tarojs/components'
+import { useRouter } from '@tarojs/taro'
+
+export default function Detail () {
+  const { params } = useRouter()   // <1>
+  return <View>订单号: {params.id}</View>
+}
+----
+<1> 小程序端来自 `onLoad` 的 query, H5 端由路由解析, 值统一为字符串
+
+三个容易踩坑的约束:
+
+* **栈深限制:** 小程序页面栈上限为 10 层, 深层导航应改用 `redirectTo` 或自定义导航
+* **tabBar 页面不复用参数:** `switchTab` 不能携带 query, 需要数据时用全局状态或 storage
+* **页面实例长期存活:** tabBar 页面切走再切回不会重新执行 `useLoad`, 刷新逻辑必须放在 `useDidShow`
+
+[[taro-lifecycle]]
+=== 生命周期
+
+Taro 的生命周期分三类: 应用级与页面级由平台触发, 组件级沿用框架自身语义.
+
+[cols="2,2,4"]
+|===
+| 级别 | 钩子 | 触发时机
+
+| 应用 | `useLaunch` | 应用初始化完成, 全局仅一次
+| 应用 | `useDidShow`, `useDidHide` | 应用切入前台, 退到后台
+| 应用 | `usePageNotFound` | 目标页面不存在
+| 页面 | `useLoad` | 页面加载, 可取得路由参数
+| 页面 | `useReady` | 首次渲染完成, 可安全获取节点尺寸
+| 页面 | `useDidShow`, `useDidHide` | 页面显示, 隐藏
+| 页面 | `useUnload` | 页面销毁
+| 页面 | `usePullDownRefresh`, `useReachBottom` | 下拉刷新, 触底
+| 页面 | `useShareAppMessage`, `useShareTimeline` | 分享给好友, 分享到朋友圈
+| 页面 | `usePageScroll` | 页面滚动
+| 组件 | `useEffect` (React) 与 `onMounted` (Vue) | 框架自身的挂载与副作用
+|===
+
+[source,typescript]
+----
+import { View, Text } from '@tarojs/components'
+import { useLoad, useDidShow, useReachBottom } from '@tarojs/taro'
+
+export default function OrderList () {
+  useLoad(() => {
+    console.log('页面加载')
+  })
+
+  useDidShow(() => {
+    refreshList()      // <1>
+  })
+
+  useReachBottom(() => {
+    loadMore()         // <2>
+  })
+
+  return <View><Text>订单列表</Text></View>
+}
+----
+<1> 每次页面显示都会执行, 适合刷新列表
+<2> 触底加载更多, 需在页面配置中开启 `onReachBottomDistance`
+
+WARNING: `useEffect(fn, [])` 只在组件挂载时执行一次, 而页面实例在小程序中被长期保留, 因此依赖"页面可见"的逻辑必须使用 `useDidShow`, 否则切回页面时不会重新执行.
+
+[[taro-component-api]]
+=== 组件与 API
+
+内置组件是跨端公共子集, 编译到各端后映射为平台组件:
+
+[cols="2,4"]
+|===
+| 组件 | 说明
+
+| `View`, `Text` | 容器与文本, 文本必须放在 `Text` 内才能被小程序正确解析
+| `Image` | 图片, 支持 `mode` 裁剪与 `lazyLoad`
+| `ScrollView` | 局部滚动容器, 需要固定高度
+| `Swiper` | 轮播
+| `Input`, `Textarea` | 输入控件, 键盘与光标行为各端有差异
+| `Button` | 按钮, `openType` 等开放能力仅小程序端生效
+| `Navigator` | 声明式跳转
+| `CustomWrapper` | Taro 特有, 用于隔离更新范围
+| `VirtualList`, `VirtualWaterfall` | `@tarojs/components-advanced` 提供的长列表与瀑布流
+|===
+
+`Taro.*` API 统一了各端实现, 同名 API 在不同平台可能落到完全不同的底层:
+
+[source,typescript]
+----
+import Taro from '@tarojs/taro'
+
+const res = await Taro.request({
+  url: 'https://api.example.com/orders',
+  method: 'GET',
+  header: { Authorization: `Bearer ${token}` }   // <1>
+})
+console.log(res.statusCode, res.data)            // <2>
+----
+<1> 统一写法, 底层在 H5 为浏览器的 XHR 或 fetch, 小程序为平台请求 API, RN 为原生网络模块
+<2> 不传 `success`/`fail` 时返回 Promise, 也可继续使用回调风格
+
+API 使用要点:
+
+* **平台覆盖差异:** API 以微信小程序为基准, 其他平台缺失的能力需条件编译兜底
+* **域名与跨域:** H5 受同源策略约束, 小程序需配置合法域名, RN 与鸿蒙原生无此限制
+* **运行环境判断:** `Taro.getEnv()` 返回 `Taro.ENV_TYPE` 中的值, 编译期判断仍用 `process.env.TARO_ENV`
+* **页面实例:** `Taro.getCurrentInstance()` 可取当前页面的 router, 实例与生命周期方法
+* **HTML 标签兼容:** 存量 H5 项目接入 `@tarojs/plugin-html` 后可继续使用 `div`, `span` 等标签
+
+[[taro-state]]
+=== 状态管理
+
+Taro 不提供额外的状态层, React 侧直接用 Context, Zustand 或 Redux Toolkit, Vue 3 侧用 Pinia. 跨端项目真正要解决的是**跨页面共享**与**进程回收后的恢复**:
+
+[source,typescript]
+----
+import { create } from 'zustand'
+import Taro from '@tarojs/taro'
+
+interface UserState {
+  token: string
+  setToken: (token: string) => void
+}
+
+export const useUserStore = create<UserState>((set) => ({
+  token: Taro.getStorageSync('token') || '',
+  setToken: (token) => {
+    Taro.setStorageSync('token', token)
+    set({ token })
+  }
+}))
+----
+
+* **页面间传参:** 简单值走 URL, 复杂对象走全局 store, 避免多层 props 透传
+* **持久化:** 登录态, 草稿等关键数据同步写入 storage, 冷启动时回填
+* **避免全量订阅:** 大对象 store 会导致整页重渲染, 按字段选择订阅
+
+WARNING: 小程序进程可能在后台被系统回收, 内存中的 store 并非持久状态. 页面栈恢复时组件会重新挂载, store 必须能从 storage 重建初始值, 否则会出现"数据偶发丢失"的问题.
+
+[[taro-perf]]
+=== 性能优化
+
+瓶颈排序基本固定: setData 数据量 > 节点数量 > 包体积 > 首屏请求数.
+
+* **缩小更新范围:** 高频更新区域用 `CustomWrapper` 包裹, 避免把整页数据放进单个 state
+* **减少节点数量:** 长列表使用 `VirtualList` 或分页加载, 避免一次渲染上千节点
+* **降低更新频率:** 滚动与拖拽动画交给 CSS 或原生组件, 不在 `usePageScroll` 中逐帧 setState
+* **开启 CompileMode:** 静态结构在编译期转为模板, 减少运行期节点创建
+* **分包:** 用 `subPackages` 拆分非首屏页面, 配合 `preloadRule` 预下载
+* **图片资源:** 开启 `lazyLoad`, 按展示尺寸压缩, 优先使用 WebP
+* **H5 单独治理:** 路由级代码分割, 首屏关键 CSS 内联, 静态资源长缓存
+
+WARNING: `CustomWrapper` 自身也是节点, 滥用会切碎更新范围并增加层级. 只在确有必要的高频区域使用, 且避免嵌套多层.
+
+[[taro-build]]
+=== 构建与发布
+
+CLI 工程按平台区分构建脚本, 产物输出到 `dist/<platform>`:
+
+[source,shell]
+----
+npm run dev:weapp          # 微信小程序开发构建 (watch)
+npm run build:weapp        # 微信小程序生产构建
+npm run dev:h5             # H5 开发服务
+npm run build:h5           # H5 生产构建
+npm run build:alipay       # 支付宝小程序
+npm run build:rn           # React Native
+npm run build:harmony-hybrid  # 鸿蒙 Hybrid
+----
+
+构建过程分三步:
+
+. **平台能力确定:** 平台插件提供组件表, API 表与模板规则
+. **源码转换与打包:** webpack 5 或 Vite 完成模块图构建, Babel 与 SWC 处理语法
+. **产物与配置生成:** 输出 `app.json`, 页面 WXML, `base.wxml` 与运行时注入代码
+
+发布路径按平台区分:
+
+* **小程序:** 开发者工具上传, 或接入 CI 用 `miniprogram-ci` 自动上传, 再提交平台审核
+* **H5:** 部署静态资源, 注意 `publicPath` 与 history 路由的服务端回退配置
+* **RN:** Metro 打包 bundle, 原生壳工程签名后发布应用商店
+* **鸿蒙:** DevEco Studio 构建 hap 或 app 包, 按鸿蒙应用市场流程上架
+
+WARNING: 所有 `@tarojs/*` 包必须保持同一版本. 运行时与编译器版本混用会出现模板与节点数据结构不匹配, 表现为白屏或事件失效, 排查成本极高.
+
+[[taro-compare]]
+=== 与同类方案对比
+
+[cols="1,2,2,2,3"]
+|===
+| 方案 | 语法 | 小程序支持 | App 渲染 | 适用场景
+
+| Taro | React, Preact, Vue 3, Solid | 全平台 | RN 组件, 鸿蒙 | React 技术栈的多端交付
+| uni-app | Vue 3 | 全平台 | WebView 与 nvue | Vue 技术栈的多端交付
+| 原生小程序 | 各平台 DSL | 对应平台 | 不支持 | 单平台, 能力与性能优先
+| React Native | React | 不支持 | 原生组件 | 纯 App, 复用前端团队
+| Flutter | Dart | 不支持 | Skia 自绘 | 强 UI 一致性的纯 App
+|===
+
+Taro 与 uni-app 都能覆盖"小程序 + H5 + App", 差异在实现路线与框架绑定:
+
+[cols="2,3,3"]
+|===
+| 维度 | Taro | uni-app
+
+| 跨端原理 | 运行时 DOM + 公共模板 | 模板编译为 WXML + 运行时桥
+| 支持框架 | React, Preact, Vue 3, Solid | Vue 3
+| 动态能力 | 与浏览器端一致 | 受模板语法限制
+| 运行时体积 | 较大 | 较小
+| 生态组件 | NutUI, Taroify 等社区库 | uni-ui 与插件市场
+|===
+
+选型的关键在于**交付矩阵**与**技术栈**: 需要小程序且团队以 React 为主选 Taro; 以 Vue 为主选 <<Web/uniapp讲解.adoc#, uni-app>>; 只交付 App 且追求原生体验时, RN 与 Flutter 更合适.
+
+[[taro-summary]]
+=== 总结与注意事项
+
+* **重运行时决定性能模型:** 每次更新都要经过渲染, 差异计算与 setData 三段, 优化重点是数据量与节点数, 而非组件拆分粒度
+* **跨端结论不能平移:** H5 同线程直渲染, 小程序双线程通信, 同一份代码的性能结论与卡顿原因完全不同
+* **差异优先抽象:** 平台差异先收敛到组件或适配层, 再退化为条件编译与多端文件
+* **版本与依赖必须对齐:** `@tarojs/*` 同版本, Node.js 不低于 18, RN 原生依赖按模板 `peerDependencies` 对齐
+* **Taro 4 不再支持 Vue 2:** 存量项目需先升级到 Vue 3, 并同步替换仅支持 Vue 2 的插件与组件库
+* **真机回归不可省略:** 小程序基础库版本, 鸿蒙 API 版本, RN 原生依赖差异都会造成"H5 正常, 真机异常"
+
+NOTE: 跨端框架解决的是复用问题, 不是适配问题. 平台能力, 审核规则与交互规范仍需逐端确认, 上线前应准备覆盖各端与关键机型的回归清单.

@@ -1,0 +1,621 @@
+== Rust guitarpro 库讲解
+
+`guitarpro` 是 Rust 生态中用于**解析、生成与分析吉他谱文件**的开源库, 也是 scorelib 工作区的核心 crate. 它同时覆盖 Guitar Pro 的三代文件体系——GP3/GP4/GP5 的私有二进制、GP6 的 `.gpx` 压缩容器、GP7/GP8 的 `.gp` ZIP 容器——并向外延伸出 MuseScore(`.mscz`)与 MusicXML 的读写与互转能力. 本文从文件格式、模块划分、数据模型、API 用法和工程实现几个角度讲解这个库.
+
+=== 什么是 guitarpro
+
+guitarpro:: Guitar Pro 谱面文件的 Rust 读写库(crates.io 包名 `guitarpro`), 提供解析、生成、格式转换、乐谱分析和命令行工具.
+scorelib:: 作者 slundi 维护的 Rust 工作区, 包含核心库 `guitarpro`、命令行工具 `score_tool`、实验性 Web 服务 `web_server`, 以及暴露 C ABI 的 `guitarpro-ffi`.
+GPIF:: Guitar Pro Interchange Format, GP6 及之后版本使用的 XML 谱面描述, 存放在容器内的 `score.gpif` 中.
+BCFZ / BCFS:: GP6 使用的自定义位流压缩格式, 以及它解压后得到的、按 0x1000 字节扇区组织的虚拟文件系统.
+MSCZ:: MuseScore 的工程格式, 本质是内含 MSCX XML 的 ZIP 包.
+
+它的定位是**格式层与数据模型层**, 而不是渲染器: 库负责把各种谱面文件读成统一结构、做分析、再按目标格式写回; 渲染交给 alphaTab 这类前端库(这一点在 `model::optimized` 的 README 中被明确为设计目标).
+
+[cols="2*"]
+|===
+| 项目 | 值
+| crates.io 首次发布 | 2022-05-31(0.1.0)
+| 当前版本 | 0.5.0(2026-11-17)
+| 许可证 | MIT
+| 源码仓库 | `codeberg.org/slundi/scorelib`
+| 运行时依赖 | `zip`、`quick-xml`、`serde`、`thiserror`、`encoding_rs`、`fraction`
+|===
+
+=== 支持的格式
+
+[cols="2,3,2,5"]
+|===
+| 扩展名 | 容器结构 | 读写 | 说明
+
+| `.gp3` / `.gp4` / `.gp5`
+| 私有二进制, 全部小端
+| 读 / 写
+| 三代格式字段逐版本递增, 写出时可以选择目标版本(如 `(5, 1, 0)`)
+
+| `.gpx`(GP6)
+| BCFZ 压缩的 BCFS 文件系统
+| 读 / 写
+| 内含 `score.gpif`(XML); 解析时以 TuxGuitar 的实现为参考
+
+| `.gp`(GP7/GP8)
+| ZIP
+| 读 / 写
+| `Content/score.gpif`; 可含 `Content/Assets/*.mp3` 伴奏音轨
+
+| `.mscz`(MuseScore 4.x)
+| ZIP
+| 读 / 写
+| `META-INF/container.xml` 清单 + MSCX XML
+
+| `.xml` / `.musicxml`
+| XML
+| 读 / 写
+| 同时支持 score-partwise 与 score-timewise 两种组织方式
+|===
+
+[NOTE]
+====
+CLI 的输入格式除了按扩展名识别, 还会对旧版 Guitar Pro 文件探测 `FICHIER GUITAR PRO` 魔数, 对 MSCZ 探测 ZIP 魔数加 `META-INF/container.xml` 清单, 因此扩展名写错的文件依然能被正确解析. 同时设置了单文件大小上限: 旧版 GP 为 **16 MB**, MSCZ 为 **32 MB**.
+====
+
+=== 整体架构
+
+库被拆成 5 个顶层模块: `model`(数据结构)、`io`(容器与底层原语)、`convert`(格式互转)、`analysis`(乐谱分析)和 `audio`(MIDI 通道参数).
+
+[plantuml, "guitarpro 数据流", format=png]
+----
+@startuml
+actor 调用方
+participant "io (gpx / mscz / primitive)" as IO
+participant "quick-xml + serde" as XML
+participant "model::legacy::Song" as Legacy
+participant "convert" as Conv
+participant "model::optimized::Score" as Opt
+participant "analysis" as Ana
+
+调用方 -> IO: 传入字节切片与目标格式
+IO -> IO: 识别容器(二进制 / BCFZ / ZIP)
+IO -> XML: 解析 score.gpif / MSCX / MusicXML
+XML -> Legacy: 映射为统一数据模型
+Legacy -> Conv: legacy_song_to_loaded_score
+Conv -> Opt: 构建 arena 与共享时间线
+Opt -> Ana: identify_chord / guess_key / repeats_analysis
+Ana -> 调用方: 分析结果
+调用方 -> Legacy: 修改后 write / write_gpx / write_gp
+Legacy -> 调用方: 字节缓冲区
+@enduml
+----
+
+[cols="2,5"]
+|===
+| 模块 | 职责
+
+| `model::legacy`
+| 与 GP3/4/5 文件逐一对应的结构: `Song`、`Track`、`Measure`、`MeasureHeader`、`Voice`、`Beat`、`Note`、`Chord`, 以及效果、RSE、页面设置等
+
+| `model::optimized`
+| 面向渲染、播放与分析的紧凑模型 `Score`: arena 索引、共享时间线、导航事件
+
+| `model::mscz` / `model::musicxml` / `model::mnx`
+| 各序列化格式的 XML(或 JSON)结构体定义, 由 serde 驱动
+
+| `io::primitive`
+| 底层原语: byte / short / int / float / color / 三种字符串, 以及版本串识别
+
+| `io::gpx`
+| GP6/GP7 容器读写: `BCFZ` 编解码、`BCFS` 打包、ZIP 读写
+
+| `io::gpif` / `io::gpif_import` / `io::gpif_export`
+| GPIF XML 的结构定义, 以及与 `Song` 的双向映射
+
+| `io::mscz`
+| MSCZ 容器读写、MSCX 解析与安全上限
+
+| `convert`
+| 格式间转换(`legacy` / `optimized` / `mscz` / `musicxml` / `guitarpro`)与 `LossReport` 损失报告
+
+| `analysis`
+| 和弦识别、左手指法、曲式、反复与调性分析
+
+| `audio::midi`
+| 文件头部的 MIDI 通道表(乐器程序、音量、声像、合唱、混响、相位、颤音)
+|===
+
+=== GP3/GP4/GP5: 私有二进制格式
+
+==== 版本头与魔数
+
+文件以"长度 + 固定 30 字节版本域"开头: 第 1 个字节是版本串的真实长度, 之后是 30 字节的定长槽位, 不足部分补 0.
+
+[source,hex]
+----
+18 46 49 43 48 49 45 52 20 47 55 49 54 41 52 20   .FICHIER GUITAR
+50 52 4F 20 76 35 2E 31 30 00 00 00 00 00 00      PRO v5.10......
+----
+
+`0x18` 即 24, 正好是 `FICHIER GUITAR PRO v5.10` 的长度. 库内置一张 `VERSIONS` 表, 把 10 种版本串映射到 `(u8, u8, u8)` 版本号与剪贴板标志:
+
+[cols="3,2,2"]
+|===
+| 版本串 | 版本号 | 剪贴板
+
+| `FICHIER GUITAR PRO v3.00` | 3.0.0 | 否
+| `FICHIER GUITAR PRO v4.00` | 4.0.0 | 否
+| `FICHIER GUITAR PRO v4.06` | 4.0.6 | 否
+| `FICHIER GUITAR PRO v5.00` | 5.0.0 | 否
+| `FICHIER GUITAR PRO v5.10` | 5.1.0 / 5.2.0 | 否
+| `CLIPBOARD GP 5.0` / `5.1` / `5.2` | 5.x | 是
+|===
+
+(表中 `v5.10` 出现两次, 第二次是源码里标注 `sic` 的历史遗留: 早期 5.2 版本曾误写同一个字符串, 两行都保留以兼容两种真实文件.)
+
+剪贴板变体表示"编辑器内部复制出来的一段片段"而非完整曲谱, 库用 `Song.clipboard: Option<Clipboard>` 区分两者, 避免把片段当作完整歌曲处理.
+
+==== 基本类型
+
+整个格式只由少量原语拼成, 全部使用小端字节序:
+
+[cols="2,2,4"]
+|===
+| 类型 | 字节数 | 说明
+
+| `byte` | 1 | 无符号, 最常用于标志位
+| `signed byte` | 1 | 二补数, 用于调号、音符值等可能为负的字段
+| `bool` | 1 | 直接读写 0/1
+| `short` | 2 | 小端 i16, GP5 的拍扩展标志即用它
+| `int` | 4 | 小端 i32, 小节数、轨道数、时值起点等
+| `float` / `double` | 4 / 8 | IEEE-754 小端, 用于 RSE 音效参数
+| `color` | 4 | 3 字节 RGB + 1 字节填充
+|===
+
+字符串则有三种变体, 区别在长度前缀与"真实长度"的组合方式:
+
+[cols="3,4,3"]
+|===
+| 形式 | 布局 | 典型用途
+
+| byte-size-string | 1 字节长度 + 内容 | 轨道名、短名称、拍内文本
+| int-size-string | 4 字节长度 + 内容 | 速度名
+| int-byte-size-string | 4 字节长度 + 1 字节实际长度 + 内容 | 曲谱信息(标题、艺术家、专辑等)
+|===
+
+后两种形式先给出一个"槽位长度", 再给出真实内容长度, 这样原地改写文本时可以只覆盖前面几个字节而不移动后续数据. 解码时优先按 **Windows-1252** 解释(encoding_rs), 失败再回退到 UTF-8, 因此西欧语种谱面不会乱码, 同时也能容忍个别工具写入的 UTF-8 文本.
+
+==== 文件骨架
+
+以 GP5 为例, `Song::read_gp5` 的读取顺序就是文件布局本身:
+
+[source,text]
+----
+版本(1 字节长度 + 30 字节定长域)
+剪贴板信息(可选)
+曲谱信息: 标题 / 副标题 / 艺术家 / 专辑 / 歌词作者 / 作曲 / 版权 / 记谱者 / 说明
+           + 注释条数 + 注释列表
+歌词
+RSE 主音效
+页面设置
+速度名(int-size-string)
+速度(int)
+隐藏速度(bool, 仅 v5.1 及以后)
+调号(signed byte)
+八度(int, 保留字段)
+MIDI 通道表(64 个通道)
+方向记号(directions)
+主混响(int)
+小节数(int) / 轨道数(int)
+小节头 × 小节数
+轨道 × 轨道数
+小节内容(每轨的小节 → 声部 → 拍 → 音符)
+----
+
+[NOTE]
+====
+与 MIDI 文件不同, GP3/4/5 **不使用 delta-time**. 每个轨道的每个小节都是独立区块, 小节起止由前面所有拍的时值累加得出(`Measure.start` / `Beat.start` 均为 tick 值). 小节头(速度、拍号、调号、反复、段落标记)被抽出来集中存放, 轨道内的小节只保留一个 `header_index` 索引, 这样多个轨道共享同一份节拍信息.
+====
+
+==== 声部与拍
+
+GP3/4 每个小节只有 1 个声部, GP5 增加到 2 个. 每个拍以一个标志字节开头, 决定后续字段是否存在:
+
+[cols="2,2,5"]
+|===
+| 位 | 掩码 | 含义
+
+| bit0 | `0x01` | 附点
+| bit1 | `0x02` | 带和弦图, 后接和弦定义
+| bit2 | `0x04` | 带文本注释
+| bit3 | `0x08` | 带拍效果(扫弦方向、震音、推弦、slap 等)
+| bit4 | `0x10` | 带混音表变更(如哇音踏板)
+| bit5 | `0x20` | 非默认连音(tuplet), 后接 1 个整数(3/5/6/7/9……)表示连音比例
+| bit6 | `0x40` | 拍状态非 Normal, 额外跟随 1 字节状态
+| bit7 | `0x80` | 未使用
+|===
+
+随后是时值本身: 一个有符号字节, `-2` 为全音符、`-1` 为二分音符、`0` 为四分音符、`1` 为八分音符、`2` 为十六分音符、`3` 为三十二分音符. 读取时先把它平移成 `1 << (b + 2)` 的时值权重, 超出 `-2..=3` 的异常值退化为全音符, 而不是溢出.
+
+GP5 另外还有一组 16 位扩展标志, 描述谱面显示细节与八度记号:
+
+[cols="2,5"]
+|===
+| 掩码 | 含义
+
+| `0x0001` / `0x0004` | 断开符杠 / 强制符杠
+| `0x0002` / `0x0008` | 符杠方向向下 / 向上
+| `0x0010` / `0x0020` | 高八度(ottava) / 低八度(ottava bassa)
+| `0x0040` / `0x0100` | 高十五度 / 低十五度
+| `0x1000` / `0x2000` | 断开次级连音括号 / 强制连音括号
+|===
+
+==== 音符与效果
+
+每个音符的字段很少, 大部分表达能力来自效果结构:
+
+[source,rust]
+----
+pub struct Note {
+    pub value: i16,                  // 品位
+    pub velocity: i16,               // 力度
+    pub string: i8,                  // 弦号
+    pub effect: NoteEffect,          // 推弦、滑音、泛音、闷音……
+    pub duration_percent: f32,       // 与时值联动的发声比例
+    pub swap_accidentals: bool,      // 升降号互换
+    pub kind: NoteType,              // 普通音 / 死音 / 装饰音
+    pub duration: Option<i8>,
+    pub tuplet: Option<i8>,
+}
+----
+
+`NoteEffect` 覆盖了电吉他谱的核心语义: 推弦(`BendEffect` 由若干 (位置, 音高, 颤音) 折线点构成)、滑音、泛音、颤音(trill)、勾击弦(hammer-on / pull-off)、延音(let ring)、断音(staccato)、闷音(palm mute) 等. 这些在文件里都是 1 到 2 个标志字节加可选子结构, 读取时由 `SongEffectOps` 逐项解析.
+
+=== GP6(.gpx): BCFZ + BCFS 双层容器
+
+GP6 不再使用裸二进制, 而是"位流压缩 + 虚拟文件系统 + XML"三层包装:
+
+[plantuml, "guitarpro 容器结构", format=png]
+----
+@startuml
+skinparam componentStyle rectangle
+
+package "GP6 (.gpx)" {
+  component "BCFZ 位流" as BCFZ
+  component "BCFS 虚拟文件系统" as BCFS
+  component "score.gpif (XML)" as GPIF6
+  BCFZ --> BCFS
+  BCFS --> GPIF6
+}
+
+package "GP7/GP8 (.gp)" {
+  component "ZIP 容器" as ZIPGP
+  component "Content/score.gpif" as GPIF7
+  component "Content/Assets/*.mp3" as AUDIO
+  ZIPGP --> GPIF7
+  ZIPGP --> AUDIO
+}
+
+package "MuseScore (.mscz)" {
+  component "ZIP 容器" as ZIPMS
+  component "META-INF/container.xml" as MANIFEST
+  component "*.mscx (XML)" as MSCX
+  ZIPMS --> MANIFEST
+  ZIPMS --> MSCX
+}
+@enduml
+----
+
+==== BCFS 虚拟文件系统
+
+BCFS 以 4 字节魔数 `BCFS` 开头, 之后按 `0x1000` 字节划分扇区:
+
+* 扇区 0: 头部保留区
+* 扇区 1: 目录项, 依次是类型(`i32`, 文件为 2)、以 `\0` 结尾的文件名(最长 127 字节)、数据起始位置等信息
+* 扇区 2 起: 文件内容, 按扇区顺序连续存放
+
+读侧会剥掉 4 字节魔数后把余下内容视作扇区数组(TuxGuitar 的参考实现就是这样做), 再顺着目录项把文件切片出来.
+
+==== BCFZ 位流压缩
+
+BCFZ 是 LZ77 风格的位流格式:
+
+[source,hex]
+----
+42 43 46 5A            "BCFZ" 魔数
+XX XX XX XX            解压后的长度(i32, 小端)
+...                    位流
+----
+
+位流以 1 bit 标志区分两种块:
+
+* **字面量块**(标志 0): 2 bit 长度字段(1-3, LSB 先行), 随后逐字节 8 bit(MSB 先行)
+* **回溯块**(标志 1): 4 bit `word_size`, 然后 `offset` 与 `size` 各占 `word_size` 位; 拷贝时按 `source[i % offset]` 逐字节推进, 从而支持 `size > offset` 的重叠复制
+
+写侧只做"合法但低效"的编码: 全部输出字面量块, 不产生回溯引用. 这样无需实现匹配查找也能生成可被原版软件打开的 `.gpx`, 代价是压缩率接近 1. 读侧则完整实现回溯逻辑, 并对 `offset` 越界、负长度等情况返回错误而非 panic.
+
+==== 读写路径
+
+[source,rust]
+----
+// 读: BCFZ 解压 → 解析 BCFS → 找到 score.gpif → quick-xml 反序列化为 Gpif
+pub fn read_gpx(data: &[u8]) -> GpResult<Gpif>
+
+// 写: Song → GPIF XML → pack_bcfs("score.gpif", xml) → compress_bcfz
+pub fn write_gpx_bytes(song: &Song) -> GpResult<Vec<u8>>
+----
+
+如果 `score.gpif` 不存在, 错误信息里会列出容器内实际存在的文件名, 便于排查非标准的 `.gpx`.
+
+=== GP7/GP8(.gp): ZIP + GPIF XML
+
+GP7 起改为标准 ZIP 容器, 主要成员:
+
+* `Content/score.gpif`: 谱面主体(GPIF XML)
+* `Content/Assets/*.mp3`: 伴奏音轨原始字节, 读入后保存在 `Song.backing_track_audio`
+* `VERSION`、`Stylesheets/` 等辅助文件
+
+[NOTE]
+====
+ZIP 里的 `VERSION` 标记对 GP7 与 GP8 都是 `7.0`, 真实版本要看 GPIF 内的 `version` 字段(例如 GP8.1.3). 库优先采信 GPIF 的版本号, 缺失时才退回 `7.0`. 另外 GP8 新增了 `sync_points`(音频同步锚点)与结构化自动化参数, 这些在 `Song` 中都有对应字段.
+====
+
+GPIF 的结构与 GP6 一致, 关键在于它把"小节"拆成两层:
+
+[cols="2,5"]
+|===
+| 元素 | 内容
+
+| `MasterTrack` / `MasterBars`
+| 全局小节: 拍号、调号、反复记号、段落、速度自动化
+| `Tracks`
+| 每条轨道: 名称、GM 乐器、调弦、品格数、RSE 音效
+| `Bars` / `Voices` / `Beats` / `Notes`
+| 轨道内的小节 → 声部 → 拍 → 音符
+| `Rhythms`
+| 时值表, 拍通过 `RhythmRef` 引用, 相同节奏只存一份
+| `Automations` / `SyncPoints`
+| 速度、音量等自动化曲线与同步锚点
+|===
+
+"主小节与内容小节分离"加上"节奏表去重", 使 `.gp` 文件比旧版二进制更小, 也让库可以直接用 serde 反序列化——`io::gpif` 里的 `Score`、`Track`、`MasterBar`、`Bar`、`Voice`、`Beat`、`Note`、`Rhythm` 等结构一一对应这些元素.
+
+=== 数据模型: legacy 与 optimized
+
+库内部维护两套模型, 各自解决不同问题.
+
+==== legacy: 与文件同构
+
+`model::legacy::Song` 有 32 个字段, 可以按用途分组:
+
+[cols="2,5"]
+|===
+| 分组 | 字段
+
+| 元数据 | `name`、`subtitle`、`artist`、`album`、`words`、`author`、`date`、`copyright`、`writer`、`transcriber`、`instructions`、`comments`、`notice`
+| 结构 | `version`、`tracks`、`measure_headers`、`channels`、`lyrics`、`key`
+| 播放 | `tempo`、`hide_tempo`、`tempo_name`、`triplet_feel`、`master_effect`
+| 展示 | `page_setup`
+| 扩展 | `clipboard`、`sync_points`、`backing_track_audio`
+|===
+
+往下是五层结构:
+
+[cols="2,3,5"]
+|===
+| 层次 | 结构 | 关键字段
+
+| 轨道 | `Track` | `strings: Vec<(i8, i8)>`(弦号, 空弦 MIDI 音高)、`name`、`channel_index`、`fret_count`、`offset`(变调夹)、`transpose_chromatic`、`transpose_octave`、`midi_program_gpif`、`rse`
+| 小节 | `Measure` | `start`(tick)、`header_index`、`clef`、`voices`(最多 2 个)、`line_break`、`simile_mark`
+| 声部 | `Voice` | `beats`、`directions`
+| 拍 | `Beat` | `duration`、`notes`、`text`、`start`、`effect`、`octave`、`display`、`status`
+| 音符 | `Note` | `value`(品位)、`velocity`、`string`、`effect`、`kind`
+|===
+
+`Track.strings` 默认值为 `[(1, 64), (2, 59), (3, 55), (4, 50), (5, 45), (6, 40)]`, 即标准调弦 E4-B3-G3-D3-A2-E2(以 MIDI 音高表示). 改动这个数组就等于换调弦, 库不需要额外的调弦类型.
+
+==== optimized: 面向渲染与分析
+
+`model::optimized` 是另一套模型, 采用 arena + 索引的设计:
+
+[source,text]
+----
+Score
+├── metadata         艺术家、专辑、速度、调号、拍号、和弦、音阶
+├── instruments      Vec<Instrument>(InstrumentId = u8)
+├── staves           Vec<StaffDef>(StaffId = u8)
+├── tracks           Vec<Track>(TrackId = u8)
+│   └── measures     BTreeMap<MeasureIndex, MeasureData>
+│       └── voices   HashMap<u8, Voice> → beats: Vec<Beat> → notes: Vec<Note>
+├── timeline         Vec<MeasureDef>(所有轨道共享)
+│   ├── tempo / time_signature / key_signature / marker
+│   └── navigation   Vec<NavigationEvent>(反复、D.C.、D.S.、Coda)
+├── lyric_lines      Vec<LyricLine>(LyricLineId = u8)
+└── lyric_projections
+----
+
+几个设计取舍值得注意:
+
+* **索引代替指针**: `TrackId`、`MeasureIndex` 都是小整数, 结构可整体序列化, 不产生借用纠缠
+* **时间线共享**: 拍号、调号、反复、段落放在全局 `timeline`, 而不是每条轨道复制一份
+* **效果是"点事件"**: 音量、声像、混响等以 `EffectEvent` 挂在拍上, 当前状态由"向前回溯最近一个事件"得出, 这样小节中途换效果不需要拆区间, 也便于把两条吉他轨合并成一条播放轨
+* **反复分两级**: 局部反复(`%`、`%%`)按轨道存放在 `MeasureData`, 结构反复(`|:`、`D.C.`、`D.S.`、Coda)和 volta(第一、第二结尾)放在全局导航里, 由 `analysis::repeats::apply_repeats` 展开成实际播放序列
+* **歌词与显示分离**: 音节存在全局 `lyric_lines`, 再通过 `lyric_projections` 决定显示在哪条轨道上方, 因此可以在吉他谱上方显示人声轨的歌词
+
+这套模型的持久化格式是 postcard 二进制: `.msor`(谱面)与 `.msorlayout`(显示提示, 内嵌谱面校验和以防失步), 首个字段固定为 `SCORE_FORMAT_VERSION`, 便于在解码其余部分之前拒绝不兼容的存档.
+
+=== Rust API 使用
+
+因为 `read_*` 方法都是 `&mut self`, 常见写法是先构造一个默认 `Song` 再填充:
+
+[source,rust]
+----
+use guitarpro::Song;
+
+fn main() -> guitarpro::GpResult<()> {
+    let bytes = std::fs::read("demo.gp5").expect("读取文件");
+
+    let mut song = Song::default();
+    song.read_gp5(&bytes)?;
+
+    println!("{} - {}", song.artist, song.name);
+    println!("{} 个轨道, {} 个小节", song.tracks.len(), song.measure_headers.len());
+
+    let track = &song.tracks[0];
+    println!("轨道 1: {} ({} 弦)", track.name, track.strings.len());
+
+    for (index, measure) in track.measures.iter().enumerate() {
+        let notes: usize = measure
+            .voices
+            .iter()
+            .flat_map(|voice| &voice.beats)
+            .map(|beat| beat.notes.len())
+            .sum();
+        println!("第 {} 小节: {} 个音符", index + 1, notes);
+    }
+    Ok(())
+}
+----
+
+按扩展名分发时, 五个入口一一对应五种容器:
+
+[source,rust]
+----
+fn read_any(path: &str) -> guitarpro::GpResult<Song> {
+    let bytes = std::fs::read(path).expect("读取文件");
+    let mut song = Song::default();
+    match path.rsplit('.').next().unwrap_or_default() {
+        "gp3" => song.read_gp3(&bytes)?,
+        "gp4" => song.read_gp4(&bytes)?,
+        "gp5" => song.read_gp5(&bytes)?,
+        "gpx" => song.read_gpx(&bytes)?,
+        "gp" => song.read_gp(&bytes)?,
+        other => panic!("不支持的扩展名: {other}"),
+    }
+    Ok(song)
+}
+----
+
+写出同样简单, 返回值都是 `Vec<u8>`, 便于写入文件或数据库:
+
+[source,rust]
+----
+let gp5 = song.write((5, 1, 0), None)?; // 指定版本, 非剪贴板
+let gpx = song.write_gpx()?;            // GP6
+let gp = song.write_gp()?;              // GP7/GP8
+
+std::fs::write("out.gp5", gp5).expect("写出文件");
+std::fs::write("out.gpx", gpx).expect("写出文件");
+std::fs::write("out.gp", gp).expect("写出文件");
+----
+
+与 MusicXML 的互转由 `convert::musicxml` 提供:
+
+[source,rust]
+----
+use guitarpro::convert::guitarpro::musicxml_to_legacy_song_with_losses;
+use guitarpro::convert::musicxml::song_to_score_partwise;
+
+// Song → MusicXML 文档(可再用 quick-xml 序列化为字符串)
+let partwise = song_to_score_partwise(&song);
+
+// MusicXML 文档 → Song, 同时拿到丢失特性清单
+let (converted, losses) = musicxml_to_legacy_song_with_losses(&partwise);
+println!("丢失 {} 处特性", losses.total());
+----
+
+=== 有损转换: LossReport
+
+只要涉及格式降级(例如把 GP7 的内容写成 GP3), 就必然有信息丢失. 库不静默丢弃, 而是提供两类显式报告:
+
+* `Song::write_losses(version)`: 写出前预判哪些内容目标版本放不下
+* `LossReport`: 转换器实际遇到但未表达的特性("名称 → 次数"的计数字典), 支持 `note`、`note_n`、`total`、`distinct`、`get`、`iter` 等方法, `iter` 按名称排序, 便于断言与展示
+
+`write_losses` 目前明确报告的情况:
+
+[cols="2,5"]
+|===
+| 目标版本 | 无法保留的内容
+
+| GP3 / GP4
+| 多个结尾(第 1、3 段走向同一个区段之前的那一类 volta)、所有方向记号(旧格式没有该概念)
+| GP5
+| 方向记号中超出实际存储小节的部分、超出该版本声部数(2 个)的音符
+|===
+
+CLI 的 `convert` 子命令在写出旧版格式前会打印这份报告, 因此"导出成功"和"内容无损"是两个可以分开判断的结论.
+
+=== 乐谱分析能力
+
+`analysis` 模块在 optimized 模型上工作, 覆盖了吉他谱玩家最常用的几类分析:
+
+[cols="2,4"]
+|===
+| 子模块 | 能力
+
+| `chords` | `identify_chord` 识别和弦名与性质(`ChordName`、`ChordQuality`、`PitchClass`)
+| `fingering` | `suggest_fingering` 计算左手把位与指法分配(`FingerAssignment`、`FingerRole`)
+| `form` | `detect_form` 推断曲式结构(前奏、主歌、副歌、桥段……)
+| `repeats` | `detect_repeats`、`apply_repeats`、`simile_runs` 分析反复与 `%` 记号, 产出可播放序列
+| `scales` | `guess_key`、`detect_key_changes` 猜测调性与转调位置
+|===
+
+=== 命令行工具: score_tool
+
+CLI 基于 `bpaf` 构建, 二进制名为 `score_tool`, 子命令覆盖"看、转、拆、找、析"五类操作:
+
+[cols="2,5"]
+|===
+| 子命令 | 作用
+
+| `info` | 打印元数据、轨道与时间线
+| `convert` | 在 gp3 / gp4 / gp5 / gpx / gp / musicxml / mscz 之间转换
+| `extract` | 从多轨曲谱中抽出指定轨道, 生成新谱
+| `duplicates` | 在目录中查找近似重复的谱面文件
+| `repeats` | 分析反复结构与 `%` 记号
+| `form` | 检测曲式(主歌/副歌/桥段……)
+| `fingering` | 计算左手指法
+| `mscz list / extract / thumbnail` | 查看、解包、导出 MSCZ 封面
+|===
+
+[source,bash]
+----
+cargo run -p cli -- info -i path/to/file.gp5
+cargo run -p cli -- convert -i song.mscz -o song.musicxml
+cargo run -p cli -- convert -i song.gp5  -o song.mscz
+cargo run -p cli -- repeats -i song.gp5
+cargo run -p cli -- mscz thumbnail -i song.mscz --out cover.png
+----
+
+工作区还包含一个 C ABI 绑定 `guitarpro-ffi`: 编译产物为 `libguitarpro_ffi.{so,a}` 并生成 `guitarpro.h`, 于是 C、C++、Swift、Kotlin 或 Python 的 `ctypes` 都能复用同一套解析与转换逻辑.
+
+=== 工程实现要点
+
+在 Rust 里实现一个"解析来自野外的二进制格式"的库, 难点集中在健壮性. 这个库的做法值得借鉴:
+
+* **游标式解析**: 所有读取都基于 `&[u8]` 加 `&mut usize` 游标, 不依赖 `std::io::Seek`, 因此可以直接解析内存中的字节切片, 也能在 WASM 等无文件系统环境使用
+* **越界即错误**: 每次读取前检查剩余长度, 不足则返回 `GpError::UnexpectedEof { offset, needed }`, 始终不会 panic
+* **错误类型收敛**: `GpError` 覆盖 `UnexpectedEof`、`InvalidValue`、`StringDecode`、`TypeConversion`、`MissingState`、`MsczUnsupported` 等情形, 统一别名为 `GpResult<T>`
+* **计数先夹逼**: 读到"小节数""轨道数""注释条数"这类外部可控计数时, 先 `clamp` 到合理上限(如 100_000 / 10_000)再分配, 避免损坏文件触发巨额内存分配
+* **容器设上限**: MSCZ 限制单文件 32 MiB、条目数 256; 旧版 GP 限制 16 MiB, 防止解压炸弹
+* **写出即字节**: 所有 `write_*` 返回 `Vec<u8>`, 由调用方决定落盘还是入库, 库本身不接触文件路径(除 MSCZ 的 `write_mscz_to_path` 便利函数)
+
+=== 与其他方案对比
+
+[cols="2,2,3,4"]
+|===
+| 方案 | 语言 | 覆盖格式 | 定位
+
+| guitarpro(scorelib) | Rust | GP3/4/5、GPX、GP、MSCZ、MusicXML | 解析 + 转换 + 分析 + CLI + C ABI
+| alphaTab | TypeScript / C# / Java / Kotlin | Guitar Pro 系列、MusicXML、alphaTex | 浏览器与移动端渲染、播放
+| PyGuitarPro | Python | GP3/4/5 | 脚本化读写与分析
+| TuxGuitar | Java | GP3/4/5 | 桌面编辑器(本库解析 GPX 时的参考实现)
+|===
+
+定位差异很明显: alphaTab 强在"画出来、放出来", 而 guitarpro 强在"读进来、转出去、算出来", 两者可以通过 optimized 模型对接(该模型的 README 明确以 alphaTab 作为渲染目标).
+
+=== 总结
+
+* `guitarpro` 是 Rust 生态里少见的**全覆盖**谱面格式库, 一个 `Song` 结构同时承载 GP3/4/5、GPX、GP、MSCZ 与 MusicXML
+* 旧版二进制格式的三大特征: 小端定长原语、三种长度前缀字符串、Windows-1252 编码; 版本靠首部 30 字节魔数识别, 还需区分剪贴板片段
+* GP6 用 `BCFZ`(LZ77 位流)+ `BCFS`(0x1000 扇区文件系统)两层包装 XML; GP7 换成标准 ZIP, 并引入"主小节 + 节奏表去重"的 GPIF 结构
+* 双模型设计: `legacy` 与文件同构、适合读写; `optimized` 用 arena 与共享时间线, 适合渲染、播放与和弦/指法/曲式分析
+* 转换不静默丢数据: `write_losses(version)` 预判、`LossReport` 事后统计, 让"降级导出"变成可度量、可测试的行为
+* 解析全程游标 + 边界检查 + 计数夹逼 + 容器上限, 是处理不可信输入的典型 Rust 写法

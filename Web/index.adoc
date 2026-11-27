@@ -1,5 +1,17 @@
 = Web
 
+include::webgpu讲解.adoc[]
+
+include::webgl讲解.adoc[]
+
+include::Javascript defineProperty方法讲解.adoc[]
+
+include::Monaco Editor讲解.adoc[]
+
+include::taro讲解.adoc[]
+
+include::uniapp讲解.adoc[]
+
 include::web应用时区最佳实践.adoc[]
 
 include::JWS讲解.adoc[]
